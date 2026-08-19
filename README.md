@@ -51,7 +51,9 @@ A head start to compound, not a wall.
 
 ## Go-to-market
 
-Sequenced by reach:
+**Step zero:** dogfood on the founder's own Hermes (Nous Research) deployment — it already loads MCP servers via `mcp_servers.<name>` in `config.yaml`. Zero new infra, fastest feedback loop. Get the MCP handshake right from day one: a prior misconfigured MCP server on that same setup (no `initialize` handler, no JSON-RPC envelope, wrong schema key) cost 60s per agent init before anyone noticed.
+
+Then, sequenced by public reach:
 
 1. **MCP server** — framework-agnostic, reaches Claude Code, Cursor, LangChain (via its MCP adapter) at once; the most honest test of the price/latency claim against Tenderly's real product.
 2. **ElizaOS plugin** — 17,600+ stars, 200+ plugins, the largest existing on-chain-agent audience. A `plugin-forkyard` next to the existing `plugin-evm`.

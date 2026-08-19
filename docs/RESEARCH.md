@@ -59,7 +59,9 @@ A head start to compound, not a wall.
 
 ## Integration path
 
-Ranked by reach, not by how open the lane is (Tenderly's own MCP server means the protocol-level channel is already contested):
+**Step zero, before any public reach — dogfood on Hermes.** Gabriel's own Nous Research Hermes deployment (EC2, `hermes-gateway`) already loads MCP servers via `mcp_servers.<name>` blocks in `config.yaml` — the same mechanism Claude Code and Cursor use. The moment the fork-engine MCP server exists, point Hermes at it, restart `hermes-gateway`, confirm via the `MCP: registered N tool(s)` log line. Zero new infra, fastest possible feedback loop. Real gotcha already hit once on this exact setup: a broken handshake (missing `initialize` handler, no JSON-RPC envelope, wrong `inputSchema` key instead of MCP's required key) cost 60 seconds per agent init and 1,593 failed connects before anyone noticed — get the protocol handshake right from day one, or this is the first thing that breaks.
+
+Ranked by public reach, not by how open the lane is (Tenderly's own MCP server means the protocol-level channel is already contested):
 
 1. **MCP server** (protocol-level) — framework-agnostic, reaches Claude Code, Cursor, LangChain (via its MCP adapter) at once. Widest reach per unit of effort, and the most honest test of the price/latency claim against Tenderly's real product.
 2. **ElizaOS plugin** (largest audience) — 17,600+ stars, 5,300+ forks, 200+ plugins, the closest thing to a standard for on-chain agents. A `plugin-forkyard` next to the existing `plugin-evm`.
