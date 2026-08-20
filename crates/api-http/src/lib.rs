@@ -7,30 +7,60 @@
 //! This is what lets N callers share one warm cache instead of each paying
 //! for their own, the way the earlier per-agent-fork example did.
 //!
-//! Deliberately narrow: `eth_chainId`, `eth_blockNumber` (stubbed),
-//! `eth_getBalance`, `eth_getTransactionCount`, and `eth_sendRawTransaction`
-//! for legacy transactions only — exactly enough to repeat the
-//! fork/transfer/assert-balances/discard flow over RPC. Not the production
-//! MCP/SDK surface (that's `api-mcp`, which stays in-process and therefore
-//! doesn't pay this crate's JSON/HTTP serialization cost).
+//! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
+//! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
+//! `eth_sendRawTransaction` (legacy transactions only), and
+//! `eth_getTransactionReceipt` — enough for a real client library
+//! (`web3.py`'s standard sign-locally-then-send flow, `wait_for_transaction_receipt`
+//! included) to work against a session, not just enough to repeat one
+//! scripted example. Not the production MCP/SDK surface (that's `api-mcp`,
+//! which stays in-process and therefore doesn't pay this crate's JSON/HTTP
+//! serialization cost).
+//!
+//! `eth_gasPrice` is a fixed placeholder (there's no real fee market to
+//! simulate), and each session's "block number" is just a per-session
+//! counter incremented on every successful `eth_sendRawTransaction` — a
+//! progress indicator, not a real block. Receipts and that counter live
+//! in this crate's own state, keyed by session id; they are *not* evicted
+//! when a session's TTL expires (`SessionManager` doesn't expose an
+//! eviction hook yet), so they leak for the life of the server today —
+//! a known, deliberately-deferred gap, not an oversight.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, Bytes, B256};
 use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use forkyard_session::{Fallback, SessionError, SessionId, SessionManager};
+use revm::context::result::ExecutionResult;
 use revm::context::TxEnv;
+use revm::primitives::{TxKind, U256};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+
+/// Fixed placeholder — there's no real fee market here to simulate.
+const GAS_PRICE_WEI: u64 = 20_000_000_000;
+
+/// Generous cap for `eth_estimateGas`'s dry-run — the maximum revm allows
+/// per transaction (EIP-7825), not an arbitrary round number. A higher
+/// value fails validation before the call is even attempted, which is
+/// exactly the bug this constant used to have (30M vs. the real 16.7M cap).
+const ESTIMATE_GAS_LIMIT: u64 = 16_777_216;
+
+#[derive(Default)]
+struct SessionRpcState {
+    receipts: HashMap<String, Value>,
+    block_number: u64,
+}
 
 struct AppState<F: Fallback>
 where
@@ -38,6 +68,7 @@ where
 {
     manager: SessionManager<F>,
     chain_id: u64,
+    rpc_state: Mutex<HashMap<SessionId, SessionRpcState>>,
 }
 
 #[derive(Deserialize)]
@@ -58,7 +89,7 @@ struct RpcResponse {
     error: Option<RpcErrorObj>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct RpcErrorObj {
     code: i64,
     message: String,
@@ -103,6 +134,66 @@ fn parse_raw_tx(params: &[Value], idx: usize) -> Result<Vec<u8>, RpcErrorObj> {
     alloy_primitives::hex::decode(s).map_err(RpcErrorObj::invalid_params)
 }
 
+fn parse_u256_hex_str(s: &str) -> Result<U256, RpcErrorObj> {
+    U256::from_str_radix(s.trim_start_matches("0x"), 16).map_err(RpcErrorObj::invalid_params)
+}
+
+/// Reads an optional hex field (`"from"`, `"to"`, `"value"`, `"data"`, ...)
+/// out of an `eth_estimateGas`-style call object.
+fn field_str<'a>(call: &'a Value, key: &str) -> Option<&'a str> {
+    call.get(key).and_then(Value::as_str)
+}
+
+/// Builds a standard-shaped JSON-RPC transaction receipt. `block_number`
+/// and `block_hash` are this session's own placeholder progress counter,
+/// not a real chain block — see the module-level doc comment.
+fn build_receipt(
+    tx_hash: B256,
+    from: Address,
+    to: TxKind,
+    result: &ExecutionResult,
+    block_number: u64,
+) -> Value {
+    let block_hash = format!("0x{block_number:064x}");
+    let logs: Vec<Value> = result
+        .logs()
+        .iter()
+        .enumerate()
+        .map(|(i, log)| {
+            json!({
+                "address": format!("{:#x}", log.address),
+                "topics": log.data.topics().iter().map(|t| format!("{t:#x}")).collect::<Vec<_>>(),
+                "data": format!("0x{}", alloy_primitives::hex::encode(log.data.data.as_ref())),
+                "blockNumber": format!("0x{block_number:x}"),
+                "transactionHash": format!("{tx_hash:#x}"),
+                "transactionIndex": "0x0",
+                "blockHash": block_hash,
+                "logIndex": format!("0x{i:x}"),
+                "removed": false,
+            })
+        })
+        .collect();
+
+    json!({
+        "transactionHash": format!("{tx_hash:#x}"),
+        "transactionIndex": "0x0",
+        "blockHash": block_hash,
+        "blockNumber": format!("0x{block_number:x}"),
+        "from": format!("{from:#x}"),
+        "to": match to {
+            TxKind::Call(addr) => Value::String(format!("{addr:#x}")),
+            TxKind::Create => Value::Null,
+        },
+        "cumulativeGasUsed": format!("0x{:x}", result.tx_gas_used()),
+        "gasUsed": format!("0x{:x}", result.tx_gas_used()),
+        "contractAddress": result.created_address().map(|a| format!("{a:#x}")),
+        "logs": logs,
+        "logsBloom": format!("0x{}", "00".repeat(256)),
+        "status": if result.is_success() { "0x1" } else { "0x0" },
+        "type": "0x0",
+    })
+}
+
 /// Handles one JSON-RPC call against `session_id`'s session on the shared
 /// manager. Every real read/write goes through `SessionManager`, which
 /// routes it to whichever worker thread owns that session — nothing here
@@ -119,10 +210,15 @@ where
     match method {
         "eth_chainId" => Ok(json!(format!("0x{:x}", state.chain_id))),
 
-        // TODO: track the fork's real pinned block number instead of a
-        // constant, once `forkyard-ingest` (or the fork's own metadata) is
-        // wired through to this layer.
-        "eth_blockNumber" => Ok(json!("0x0")),
+        // This session's own progress counter (see module doc) — not a
+        // real chain block number.
+        "eth_blockNumber" => {
+            let block_number = state.rpc_state.lock().unwrap().get(&session_id).map(|s| s.block_number).unwrap_or(0);
+            Ok(json!(format!("0x{block_number:x}")))
+        }
+
+        // Fixed placeholder — see module doc.
+        "eth_gasPrice" => Ok(json!(format!("0x{GAS_PRICE_WEI:x}"))),
 
         "eth_getBalance" => {
             let address = parse_address(params, 0)?;
@@ -153,9 +249,7 @@ where
         // whale's private key.
         "forkyard_setBalance" => {
             let address = parse_address(params, 0)?;
-            let balance_hex = param_str(params, 1)?;
-            let balance = alloy_primitives::U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
-                .map_err(RpcErrorObj::invalid_params)?;
+            let balance = parse_u256_hex_str(param_str(params, 1)?)?;
 
             let mut info = state.manager.basic(session_id, address).await?.unwrap_or_default();
             info.balance = balance;
@@ -185,8 +279,70 @@ where
                 .chain_id(tx.chain_id)
                 .build_fill();
 
-            state.manager.advance(session_id, tx_env).await?;
+            let result = state.manager.advance(session_id, tx_env).await?;
+
+            // Advance this session's own block counter and store a
+            // receipt for it — this is what makes `eth_getTransactionReceipt`
+            // (and so `web3.py`'s `wait_for_transaction_receipt`) work.
+            let mut guard = state.rpc_state.lock().unwrap();
+            let entry = guard.entry(session_id).or_default();
+            entry.block_number += 1;
+            let receipt = build_receipt(tx_hash, sender, tx.to, &result, entry.block_number);
+            entry.receipts.insert(format!("{tx_hash:#x}"), receipt);
+
             Ok(json!(format!("{tx_hash:#x}")))
+        }
+
+        "eth_getTransactionReceipt" => {
+            let hash = param_str(params, 0)?.to_lowercase();
+            let receipt = state
+                .rpc_state
+                .lock()
+                .unwrap()
+                .get(&session_id)
+                .and_then(|s| s.receipts.get(&hash))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(receipt)
+        }
+
+        // Dry-runs the call via `simulate` (no commit) with a generous gas
+        // cap and reports the actual gas used — real estimation, not a
+        // fixed constant, since we already have the machinery for it.
+        "eth_estimateGas" => {
+            let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
+            let from = field_str(call, "from").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?.unwrap_or_default();
+            let to = field_str(call, "to").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?;
+            let value = field_str(call, "value").map(parse_u256_hex_str).transpose()?.unwrap_or_default();
+            let data = field_str(call, "data")
+                .map(alloy_primitives::hex::decode)
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?
+                .unwrap_or_default();
+            let nonce = state.manager.basic(session_id, from).await?.map(|i| i.nonce).unwrap_or_default();
+
+            let kind = match to {
+                Some(addr) => TxKind::Call(addr),
+                None => TxKind::Create,
+            };
+            let tx_env = TxEnv::builder()
+                .caller(from)
+                .kind(kind)
+                .value(value)
+                .data(Bytes::from(data))
+                .gas_limit(ESTIMATE_GAS_LIMIT)
+                .gas_price(0) // don't require balance for the estimate itself
+                .nonce(nonce)
+                .build_fill();
+
+            let result = state.manager.simulate(session_id, tx_env).await?;
+            if !result.is_success() {
+                return Err(RpcErrorObj::execution(format!(
+                    "call would fail: {}",
+                    if result.is_halt() { "halted" } else { "reverted" }
+                )));
+            }
+            Ok(json!(format!("0x{:x}", result.tx_gas_used())))
         }
 
         other => Err(RpcErrorObj::method_not_found(other)),
@@ -243,7 +399,7 @@ pub async fn serve<F: Fallback>(bind_addr: &str, manager: SessionManager<F>, cha
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    let state = Arc::new(AppState { manager, chain_id });
+    let state = Arc::new(AppState { manager, chain_id, rpc_state: Mutex::new(HashMap::new()) });
     let app = Router::new()
         .route("/session", post(open_session_handler))
         .route("/session/{id}", post(rpc_handler))
@@ -265,4 +421,153 @@ where
         shutdown_tx: Some(shutdown_tx),
         join,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_network::TxSignerSync;
+    use alloy_signer_local::PrivateKeySigner;
+    use revm::database_interface::{DBErrorMarker, DatabaseRef};
+    use revm::state::{AccountInfo, Bytecode};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct TestFallback;
+
+    #[derive(Debug)]
+    struct TestFallbackError;
+    impl fmt::Display for TestFallbackError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "test fallback has no real data")
+        }
+    }
+    impl std::error::Error for TestFallbackError {}
+    impl DBErrorMarker for TestFallbackError {}
+
+    impl DatabaseRef for TestFallback {
+        type Error = TestFallbackError;
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(Some(AccountInfo::default()))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    fn test_state() -> AppState<TestFallback> {
+        AppState {
+            manager: SessionManager::new(TestFallback, 1, Duration::from_secs(60)),
+            chain_id: 1,
+            rpc_state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Builds a signed legacy transfer's raw `0x`-prefixed hex — the exact
+    /// shape `eth_sendRawTransaction` expects — reused across tests instead
+    /// of repeating the signing dance each time.
+    fn signed_transfer_hex(signer: &PrivateKeySigner, to: Address, value: u64, gas_price: u128) -> String {
+        let mut tx = TxLegacy {
+            chain_id: Some(1),
+            nonce: 0,
+            gas_price,
+            gas_limit: 21_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Default::default(),
+        };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        let signed = tx.into_signed(signature);
+        let raw = alloy_eips::eip2718::Encodable2718::encoded_2718(&signed);
+        format!("0x{}", alloy_primitives::hex::encode(&raw))
+    }
+
+    #[tokio::test]
+    async fn gas_price_is_fixed() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let result = dispatch(&state, id, "eth_gasPrice", &[]).await.unwrap();
+        assert_eq!(result, json!(format!("0x{GAS_PRICE_WEI:x}")));
+    }
+
+    #[tokio::test]
+    async fn estimate_gas_reports_real_gas_used_for_a_transfer() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let from = Address::from([1u8; 20]);
+        let to = Address::from([2u8; 20]);
+        dispatch(&state, id, "forkyard_setBalance", &[json!(from.to_string()), json!("0x64")])
+            .await
+            .unwrap();
+
+        let call = json!({ "from": from.to_string(), "to": to.to_string(), "value": "0x1" });
+        let result = dispatch(&state, id, "eth_estimateGas", &[call]).await.unwrap();
+        assert_eq!(result, json!("0x5208")); // 21000, a plain transfer's real cost
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_populates_a_fetchable_receipt() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        let sender = PrivateKeySigner::random();
+        let recipient = PrivateKeySigner::random().address();
+        dispatch(
+            &state,
+            id,
+            "forkyard_setBalance",
+            &[json!(sender.address().to_string()), json!("0xde0b6b3a7640000")], // 1 ETH
+        )
+        .await
+        .unwrap();
+
+        let raw_hex = signed_transfer_hex(&sender, recipient, 100, 20_000_000_000);
+        let tx_hash = dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+
+        let receipt = dispatch(&state, id, "eth_getTransactionReceipt", &[tx_hash]).await.unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+        assert_eq!(receipt["gasUsed"], json!("0x5208"));
+        assert_eq!(receipt["blockNumber"], json!("0x1"));
+    }
+
+    #[tokio::test]
+    async fn unknown_receipt_returns_null_not_an_error() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let result = dispatch(&state, id, "eth_getTransactionReceipt", &[json!("0xdeadbeef")])
+            .await
+            .unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[tokio::test]
+    async fn block_number_increments_per_session_independently() {
+        let state = test_state();
+        let a = state.manager.fork().await.unwrap();
+        let b = state.manager.fork().await.unwrap();
+        assert_eq!(dispatch(&state, a, "eth_blockNumber", &[]).await.unwrap(), json!("0x0"));
+
+        let sender = PrivateKeySigner::random();
+        dispatch(
+            &state,
+            a,
+            "forkyard_setBalance",
+            &[json!(sender.address().to_string()), json!("0xde0b6b3a7640000")],
+        )
+        .await
+        .unwrap();
+        let raw_hex = signed_transfer_hex(&sender, Address::from([9u8; 20]), 1, 0);
+        dispatch(&state, a, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+
+        assert_eq!(dispatch(&state, a, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
+        // session b never sent anything — its own counter must be untouched.
+        assert_eq!(dispatch(&state, b, "eth_blockNumber", &[]).await.unwrap(), json!("0x0"));
+    }
 }

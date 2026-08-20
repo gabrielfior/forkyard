@@ -13,10 +13,11 @@ then, from this directory:
 Reads the server's base URL from FORKYARD_URL (default matches
 serve_demo.rs's default port, http://127.0.0.1:8555).
 
-This intentionally stays within the RPC methods the server already
-implements today (no eth_gasPrice / eth_estimateGas / eth_getTransactionReceipt
-yet) — gas and gas price are hardcoded, and success is confirmed by reading
-balances back rather than waiting on a transaction receipt.
+Uses the full idiomatic web3.py flow now that the server implements it:
+gas price via `w3.eth.gas_price`, gas via `w3.eth.estimate_gas` (a real
+dry-run through `eth_estimateGas`, not a hardcoded constant), and success
+confirmed via `w3.eth.wait_for_transaction_receipt` rather than only
+re-reading balances.
 """
 
 import logging
@@ -36,8 +37,6 @@ log = logging.getLogger("transfer_demo")
 
 ONE_ETH = 10**18
 TRANSFER_VALUE = ONE_ETH // 10  # 0.1 ETH
-GAS_LIMIT = 21_000
-GAS_PRICE = 20_000_000_000  # 20 gwei
 
 
 def timed(label: str, fn):
@@ -64,7 +63,7 @@ def main() -> None:
     # own endpoint — this is the actual point of this script.
     w3 = Web3(Web3.HTTPProvider(session_url))
     chain_id = w3.eth.chain_id
-    log.info("connected, chain_id=%s", chain_id)
+    log.info("connected, chain_id=%s, block_number=%s", chain_id, w3.eth.block_number)
 
     # Fund a freshly generated signer via the test-only cheatcode RPC
     # method, same as the Rust examples — nothing here touches the real
@@ -85,21 +84,30 @@ def main() -> None:
     )
     log.info("sender_before=%s recipient_before=%s", sender_before, recipient_before)
 
-    # 3. Build and sign a real transfer transaction, locally, with
+    # 3. Ask the server what this would actually cost — real gas
+    # estimation and gas price, not hardcoded constants.
+    gas_price = timed("fetched gas price", lambda: w3.eth.gas_price)
+    gas = timed(
+        "estimated gas",
+        lambda: w3.eth.estimate_gas({"from": sender.address, "to": recipient.address, "value": TRANSFER_VALUE}),
+    )
+    log.info("gas_price=%s gas=%s", gas_price, gas)
+
+    # 4. Build and sign a real transfer transaction, locally, with
     # eth_account — the same as any real web3.py-based script would.
     nonce = w3.eth.get_transaction_count(sender.address)
     tx = {
         "chainId": chain_id,
         "nonce": nonce,
-        "gas": GAS_LIMIT,
-        "gasPrice": GAS_PRICE,
+        "gas": gas,
+        "gasPrice": gas_price,
         "to": recipient.address,
         "value": TRANSFER_VALUE,
         "data": b"",
     }
     signed = timed("signed transfer transaction", lambda: Account.sign_transaction(tx, sender.key))
 
-    # 4. Send it — eth_sendRawTransaction, executed synchronously against
+    # 5. Send it — eth_sendRawTransaction, executed synchronously against
     # the fork and committed into this session's private overlay.
     tx_hash = timed(
         "sent + executed transfer over RPC",
@@ -107,7 +115,16 @@ def main() -> None:
     )
     log.info("tx_hash=%s", tx_hash.to_0x_hex())
 
-    # 5. Assert balances actually changed.
+    # 6. Confirm via a real receipt — the idiomatic web3.py way to know a
+    # transaction landed, rather than just re-reading balances. Since
+    # execution is synchronous server-side, this resolves immediately;
+    # it's still a real eth_getTransactionReceipt round trip, not a
+    # local assumption.
+    receipt = timed("waited for transaction receipt", lambda: w3.eth.wait_for_transaction_receipt(tx_hash, timeout=10))
+    log.info("receipt: status=%s gasUsed=%s blockNumber=%s", receipt.status, receipt.gasUsed, receipt.blockNumber)
+    assert receipt.status == 1, "transaction receipt reports failure"
+
+    # 7. Assert balances actually changed too.
     sender_after, recipient_after = timed(
         "fetched post-transfer balances",
         lambda: (w3.eth.get_balance(sender.address), w3.eth.get_balance(recipient.address)),
