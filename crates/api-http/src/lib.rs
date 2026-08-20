@@ -1,9 +1,11 @@
-//! A minimal Ethereum JSON-RPC server in front of one `forkyard-engine`
-//! `Session`. This is the piece that was missing from the original
-//! `mainnet_transfer` example: that example called `Session` directly,
-//! in-process — this crate is what lets an *external* client (`cast`,
-//! `alloy`'s own HTTP provider, MetaMask, anything that speaks Ethereum
-//! JSON-RPC) talk to a fork over the wire instead.
+//! A minimal Ethereum JSON-RPC server in front of a `forkyard-session`
+//! `SessionManager` — many sessions, sharing one base and one fetch
+//! fallback, reachable over the wire.
+//!
+//! `POST /session` opens a new session and returns its id; `POST
+//! /session/{id}` carries the actual JSON-RPC calls against that session.
+//! This is what lets N callers share one warm cache instead of each paying
+//! for their own, the way the earlier per-agent-fork example did.
 //!
 //! Deliberately narrow: `eth_chainId`, `eth_blockNumber` (stubbed),
 //! `eth_getBalance`, `eth_getTransactionCount`, and `eth_sendRawTransaction`
@@ -12,27 +14,29 @@
 //! MCP/SDK surface (that's `api-mcp`, which stays in-process and therefore
 //! doesn't pay this crate's JSON/HTTP serialization cost).
 
+use std::fmt;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use alloy_consensus::transaction::SignerRecoverable;
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::Address;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
-use forkyard_engine::{BaseSnapshot, Session};
-use forkyard_fetch::Fork;
+use forkyard_session::{Fallback, SessionError, SessionId, SessionManager};
 use revm::context::TxEnv;
-use revm::{Database, ExecuteCommitEvm, MainBuilder, MainContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-struct AppState {
-    session: Mutex<Session<Fork>>,
+struct AppState<F: Fallback>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    manager: SessionManager<F>,
     chain_id: u64,
 }
 
@@ -61,14 +65,23 @@ struct RpcErrorObj {
 }
 
 impl RpcErrorObj {
-    fn invalid_params(message: impl std::fmt::Display) -> Self {
+    fn invalid_params(message: impl fmt::Display) -> Self {
         Self { code: -32602, message: message.to_string() }
     }
     fn method_not_found(method: &str) -> Self {
         Self { code: -32601, message: format!("method not found: {method}") }
     }
-    fn execution(message: impl std::fmt::Display) -> Self {
+    fn execution(message: impl fmt::Display) -> Self {
         Self { code: -32000, message: message.to_string() }
+    }
+}
+
+impl From<SessionError> for RpcErrorObj {
+    fn from(e: SessionError) -> Self {
+        match e {
+            SessionError::Unknown(id) => Self { code: -32001, message: format!("unknown or expired session {id}") },
+            other => RpcErrorObj::execution(other),
+        }
     }
 }
 
@@ -90,10 +103,19 @@ fn parse_raw_tx(params: &[Value], idx: usize) -> Result<Vec<u8>, RpcErrorObj> {
     alloy_primitives::hex::decode(s).map_err(RpcErrorObj::invalid_params)
 }
 
-/// Handles one JSON-RPC call against the shared session. Locking is
-/// synchronous and held only across the (in-memory, non-blocking) call —
-/// nothing here awaits while the lock is live.
-fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, RpcErrorObj> {
+/// Handles one JSON-RPC call against `session_id`'s session on the shared
+/// manager. Every real read/write goes through `SessionManager`, which
+/// routes it to whichever worker thread owns that session — nothing here
+/// touches `Session` or revm's execution machinery directly.
+async fn dispatch<F: Fallback>(
+    state: &AppState<F>,
+    session_id: SessionId,
+    method: &str,
+    params: &[Value],
+) -> Result<Value, RpcErrorObj>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
     match method {
         "eth_chainId" => Ok(json!(format!("0x{:x}", state.chain_id))),
 
@@ -104,10 +126,10 @@ fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, R
 
         "eth_getBalance" => {
             let address = parse_address(params, 0)?;
-            let mut session = state.session.lock().unwrap();
-            let balance = session
-                .basic(address)
-                .map_err(RpcErrorObj::execution)?
+            let balance = state
+                .manager
+                .basic(session_id, address)
+                .await?
                 .map(|info| info.balance)
                 .unwrap_or_default();
             Ok(json!(format!("0x{balance:x}")))
@@ -115,10 +137,10 @@ fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, R
 
         "eth_getTransactionCount" => {
             let address = parse_address(params, 0)?;
-            let mut session = state.session.lock().unwrap();
-            let nonce = session
-                .basic(address)
-                .map_err(RpcErrorObj::execution)?
+            let nonce = state
+                .manager
+                .basic(session_id, address)
+                .await?
                 .map(|info| info.nonce)
                 .unwrap_or_default();
             Ok(json!(format!("0x{nonce:x}")))
@@ -132,27 +154,20 @@ fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, R
         "forkyard_setBalance" => {
             let address = parse_address(params, 0)?;
             let balance_hex = param_str(params, 1)?;
-            let balance = alloy_primitives::U256::from_str_radix(
-                balance_hex.trim_start_matches("0x"),
-                16,
-            )
-            .map_err(RpcErrorObj::invalid_params)?;
+            let balance = alloy_primitives::U256::from_str_radix(balance_hex.trim_start_matches("0x"), 16)
+                .map_err(RpcErrorObj::invalid_params)?;
 
-            let mut session = state.session.lock().unwrap();
-            let mut info = session.basic(address).map_err(RpcErrorObj::execution)?.unwrap_or_default();
+            let mut info = state.manager.basic(session_id, address).await?.unwrap_or_default();
             info.balance = balance;
-            session.set_account(address, info);
+            state.manager.set_account(session_id, address, info).await?;
             Ok(json!(true))
         }
 
         "eth_sendRawTransaction" => {
             let raw = parse_raw_tx(params, 0)?;
-            let envelope = TxEnvelope::decode_2718(&mut raw.as_slice())
-                .map_err(RpcErrorObj::invalid_params)?;
+            let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
             let TxEnvelope::Legacy(signed) = &envelope else {
-                return Err(RpcErrorObj::invalid_params(
-                    "only legacy transactions are supported for now",
-                ));
+                return Err(RpcErrorObj::invalid_params("only legacy transactions are supported for now"));
             };
             let tx = signed.tx();
             let sender = envelope
@@ -170,13 +185,7 @@ fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, R
                 .chain_id(tx.chain_id)
                 .build_fill();
 
-            let mut session = state.session.lock().unwrap();
-            revm::Context::mainnet()
-                .with_db(&mut *session)
-                .build_mainnet()
-                .transact_commit(tx_env)
-                .map_err(RpcErrorObj::execution)?;
-
+            state.manager.advance(session_id, tx_env).await?;
             Ok(json!(format!("{tx_hash:#x}")))
         }
 
@@ -184,26 +193,33 @@ fn dispatch(state: &AppState, method: &str, params: &[Value]) -> Result<Value, R
     }
 }
 
-async fn rpc_handler(State(state): State<Arc<AppState>>, Json(req): Json<RpcRequest>) -> Json<RpcResponse> {
-    match dispatch(&state, &req.method, &req.params) {
-        Ok(result) => Json(RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: Some(result),
-            error: None,
-        }),
-        Err(error) => Json(RpcResponse {
-            jsonrpc: "2.0",
-            id: req.id,
-            result: None,
-            error: Some(error),
-        }),
+async fn open_session_handler<F: Fallback>(State(state): State<Arc<AppState<F>>>) -> Json<Value>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    match state.manager.fork().await {
+        Ok(id) => Json(json!({ "session_id": id })),
+        Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+async fn rpc_handler<F: Fallback>(
+    State(state): State<Arc<AppState<F>>>,
+    Path(session_id): Path<SessionId>,
+    Json(req): Json<RpcRequest>,
+) -> Json<RpcResponse>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    match dispatch(&state, session_id, &req.method, &req.params).await {
+        Ok(result) => Json(RpcResponse { jsonrpc: "2.0", id: req.id, result: Some(result), error: None }),
+        Err(error) => Json(RpcResponse { jsonrpc: "2.0", id: req.id, result: None, error: Some(error) }),
     }
 }
 
 /// A running server. Drop it — or call `shutdown`, equivalent — to tear
-/// down the listener and the underlying fork's background fetch thread,
-/// same "discard" semantics as dropping a `Session` directly.
+/// down the listener. Sessions themselves keep expiring on their own TTL
+/// regardless; this only stops the HTTP surface in front of them.
 pub struct Handle {
     pub addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -220,14 +236,18 @@ impl Handle {
 }
 
 /// Binds a JSON-RPC server at `bind_addr` (use `"127.0.0.1:0"` for an
-/// ephemeral port) fronting a single fork/session built from `fork`.
-pub async fn serve(bind_addr: &str, fork: Fork, chain_id: u64) -> eyre::Result<Handle> {
-    let session = Session::fork(Arc::new(BaseSnapshot::default()), fork);
-    let state = Arc::new(AppState {
-        session: Mutex::new(session),
-        chain_id,
-    });
-    let app = Router::new().route("/", post(rpc_handler)).with_state(state);
+/// ephemeral port) fronting `manager`. Many callers can each open their
+/// own session against the same manager — and therefore the same warm
+/// base and fetch cache — via `POST /session`.
+pub async fn serve<F: Fallback>(bind_addr: &str, manager: SessionManager<F>, chain_id: u64) -> eyre::Result<Handle>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    let state = Arc::new(AppState { manager, chain_id });
+    let app = Router::new()
+        .route("/session", post(open_session_handler))
+        .route("/session/{id}", post(rpc_handler))
+        .with_state(state);
 
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;

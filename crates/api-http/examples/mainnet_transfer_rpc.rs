@@ -1,25 +1,32 @@
-//! `N` agents, each independently forking Ethereum mainnet, opening their
-//! own RPC-backed session, and running a signed transfer — concurrently,
-//! not sequentially. Each agent's fork, server, and session are entirely
-//! its own; the only thing they share is the same upstream RPC provider.
+//! `N` agents sharing *one* fork of Ethereum mainnet, through *one*
+//! `forkyard-session` `SessionManager`, behind *one* `forkyard-api-http`
+//! server — each agent only opens its own session on top of that shared
+//! base and shared fetch cache, then runs a signed transfer concurrently
+//! with the others.
 //!
-//! This is the concurrency case the whole design is supposed to make
-//! cheap: forking is meant to be fast enough that N of them happening at
-//! once isn't N times slower than one. Every log line is tagged with its
-//! `agent_id` (via a `tracing` span) so the interleaved concurrent output
-//! stays readable, and each agent's total wall-clock time is reported at
-//! the end alongside the overall wall-clock time for all of them together.
+//! This is the thing the previous version of this example didn't
+//! exercise: there, each agent got its own independent fork with its own
+//! independent cache — three unrelated sandboxes running side by side.
+//! Here they share the one thing that actually matters for the "faster
+//! than Tenderly" pitch: a warm cache that gets more valuable as more
+//! sessions hit it, not three cold ones paying separately for the same
+//! network round trips.
+//!
+//! Every log line is tagged with its `agent_id` (via a `tracing` span);
+//! each agent's total wall-clock time is reported at the end alongside
+//! the overall wall-clock time for all of them together.
 //!
 //! Requires `RPC_URL` (an Ethereum mainnet endpoint) in the environment or
 //! a `.env` file at the workspace root. Run with:
 //!   cargo run -p forkyard-api-http --example mainnet_transfer_rpc
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_primitives::{TxKind, B256, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
+use forkyard_session::SessionManager;
 use tracing::info;
 
 const AGENT_COUNT: usize = 3;
@@ -36,34 +43,39 @@ macro_rules! timed {
 
 struct AgentReport {
     agent_id: usize,
+    session_id: u64,
     tx_hash: B256,
     total_ms: u128,
 }
 
-/// One agent's full fork -> transfer -> assert -> discard flow, entirely
-/// independent of every other agent: its own `forkyard_fetch::fork`, its
-/// own `forkyard_api_http` server on its own ephemeral port, its own
-/// session. `#[instrument]` tags every log line below with `agent_id`,
-/// which is what keeps three interleaved concurrent runs legible.
-#[tracing::instrument(skip(rpc_url))]
-async fn run_agent(agent_id: usize, rpc_url: String) -> eyre::Result<AgentReport> {
+/// One agent's full open-session -> transfer -> assert flow, running
+/// against a `SessionManager` it shares with every other agent. Its own
+/// session is private (its own overlay); the base and the fetch fallback
+/// underneath are not.
+#[tracing::instrument(skip(base_url, http))]
+async fn run_agent(agent_id: usize, base_url: String, http: reqwest::Client) -> eyre::Result<AgentReport> {
     let agent_start = Instant::now();
     info!("agent starting");
 
-    // 1. Fork Ethereum mainnet.
-    let fork = timed!("forked mainnet", forkyard_fetch::fork(&rpc_url)?);
+    // Open a session on the *shared* manager — not a fork of its own.
+    let session_id: u64 = timed!("opened session on shared manager", {
+        let resp: serde_json::Value = http
+            .post(format!("{base_url}/session"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        resp["session_id"]
+            .as_u64()
+            .ok_or_else(|| eyre::eyre!("no session_id in response: {resp}"))?
+    });
 
-    // 2. Start this agent's own JSON-RPC server, and connect to it.
-    let handle = timed!(
-        "started RPC server",
-        forkyard_api_http::serve("127.0.0.1:0", fork, 1).await?
-    );
-    let local_rpc = format!("http://{}", handle.addr);
-    info!(addr = %local_rpc, "forkyard RPC listening");
-    let provider = ProviderBuilder::new().connect_http(local_rpc.parse()?);
+    let session_url = format!("{base_url}/session/{session_id}");
+    info!(%session_url, "session ready");
+    let provider = ProviderBuilder::new().connect_http(session_url.parse()?);
 
     // Fund a freshly generated signer via the test-only cheatcode RPC
-    // method. Nothing here touches the real chain.
+    // method — scoped to this agent's own session/overlay only.
     let sender = PrivateKeySigner::random();
     let sender_addr = sender.address();
     let one_eth = U256::from(10).pow(U256::from(18));
@@ -82,7 +94,6 @@ async fn run_agent(agent_id: usize, rpc_url: String) -> eyre::Result<AgentReport
     let transfer_value = one_eth / U256::from(10); // 0.1 ETH
     info!(sender = %sender_addr, recipient = %recipient_addr, value = %transfer_value, "signer + recipient ready");
 
-    // 3. Build and sign a real transfer transaction.
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce: 0,
@@ -107,9 +118,6 @@ async fn run_agent(agent_id: usize, rpc_url: String) -> eyre::Result<AgentReport
     );
     info!(%sender_before, %recipient_before);
 
-    // 4. Send it over RPC — executed against this agent's own fork and
-    // committed into this agent's own session, isolated from the other
-    // two agents entirely.
     let pending = timed!(
         "sent + executed transfer over RPC",
         provider.send_raw_transaction(&raw).await?
@@ -117,7 +125,6 @@ async fn run_agent(agent_id: usize, rpc_url: String) -> eyre::Result<AgentReport
     let tx_hash = *pending.tx_hash();
     info!(%tx_hash, "transaction hash");
 
-    // 5. Assert balances actually changed.
     let (sender_after, recipient_after) = timed!(
         "fetched post-transfer balances",
         (
@@ -134,12 +141,9 @@ async fn run_agent(agent_id: usize, rpc_url: String) -> eyre::Result<AgentReport
         "balances confirmed"
     );
 
-    // 6. Discard this agent's fork — its own server, its own session.
-    timed!("shut down server + discarded fork", handle.shutdown().await);
-
     let total_ms = agent_start.elapsed().as_millis();
     info!(total_ms, "agent finished");
-    Ok(AgentReport { agent_id, tx_hash, total_ms })
+    Ok(AgentReport { agent_id, session_id, tx_hash, total_ms })
 }
 
 #[tokio::main]
@@ -152,14 +156,27 @@ async fn main() -> eyre::Result<()> {
     let rpc_url = std::env::var("RPC_URL")
         .expect("set RPC_URL to an Ethereum mainnet RPC endpoint (see .env.example)");
 
+    // Fork Ethereum mainnet exactly once...
+    let fork = timed!("forked mainnet (once, shared)", forkyard_fetch::fork(&rpc_url)?);
+
+    // ...and build one SessionManager on top of it, sharded across 4
+    // worker threads. Every agent below opens a session on *this* manager
+    // instead of forking its own — the actual thing this example exists
+    // to demonstrate.
+    let manager = SessionManager::new(fork, 4, Duration::from_secs(60));
+    let handle = timed!(
+        "started shared RPC server",
+        forkyard_api_http::serve("127.0.0.1:0", manager, 1).await?
+    );
+    let base_url = format!("http://{}", handle.addr);
+    info!(addr = %base_url, "forkyard RPC listening — shared across all agents");
+
     info!(agents = AGENT_COUNT, "launching agents concurrently");
+    let http = reqwest::Client::new();
     let overall_start = Instant::now();
 
-    // Spawned, not just joined on a shared future — each agent genuinely
-    // runs on its own tokio task, so this measures real concurrency, not
-    // cooperative interleaving on one task.
     let tasks: Vec<_> = (0..AGENT_COUNT)
-        .map(|id| tokio::spawn(run_agent(id, rpc_url.clone())))
+        .map(|id| tokio::spawn(run_agent(id, base_url.clone(), http.clone())))
         .collect();
 
     let mut reports = Vec::with_capacity(AGENT_COUNT);
@@ -170,14 +187,17 @@ async fn main() -> eyre::Result<()> {
     let overall_ms = overall_start.elapsed().as_millis();
     info!(overall_ms, "all agents finished");
 
+    // One shutdown, for the one shared server — not per agent.
+    handle.shutdown().await;
+
     println!();
-    println!("{:<9} {:<10} {:<66}", "agent", "total_ms", "tx_hash");
+    println!("{:<9} {:<12} {:<10} {:<66}", "agent", "session_id", "total_ms", "tx_hash");
     for r in &reports {
-        println!("{:<9} {:<10} {:<66}", r.agent_id, r.total_ms, r.tx_hash);
+        println!("{:<9} {:<12} {:<10} {:<66}", r.agent_id, r.session_id, r.total_ms, r.tx_hash);
     }
     println!();
     println!(
-        "wall-clock for all {AGENT_COUNT} agents: {overall_ms}ms (sum of their individual totals: {}ms)",
+        "wall-clock for all {AGENT_COUNT} agents sharing one fork: {overall_ms}ms (sum of their individual totals: {}ms)",
         reports.iter().map(|r| r.total_ms).sum::<u128>()
     );
 

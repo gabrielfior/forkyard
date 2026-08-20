@@ -26,18 +26,25 @@ use forkyard_engine::{BaseSnapshot, Session};
 use revm::context::result::ExecutionResult;
 use revm::context::TxEnv;
 use revm::database_interface::DatabaseRef;
-use revm::{ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
+use revm::primitives::Address;
+use revm::state::AccountInfo;
+use revm::{Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::oneshot;
 
 pub type SessionId = u64;
 
 /// Bound every fetch fallback in this crate needs to satisfy — the same
 /// one `forkyard_engine::Session<F>` already requires, spelled out once
-/// here since it has to be repeated at every generic site below.
-pub trait Fallback: DatabaseRef + Clone + Send + 'static {}
+/// here since it has to be repeated at every generic site below. `Sync` is
+/// needed on top of what `Session<F>` itself requires because `F` lives
+/// inside `SessionManager`, which is shared (via `Arc`) across axum
+/// handlers running on genuinely concurrent OS threads — not just
+/// interleaved on one, the way `#[tokio::test]`'s default single-threaded
+/// runtime would have let a missing bound here slip by unnoticed.
+pub trait Fallback: DatabaseRef + Clone + Send + Sync + 'static {}
 impl<F> Fallback for F
 where
-    F: DatabaseRef + Clone + Send + 'static,
+    F: DatabaseRef + Clone + Send + Sync + 'static,
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
 }
@@ -84,6 +91,17 @@ enum Job<F> {
         id: SessionId,
         reply: oneshot::Sender<()>,
     },
+    Basic {
+        id: SessionId,
+        address: Address,
+        reply: oneshot::Sender<Result<Option<AccountInfo>, SessionError>>,
+    },
+    SetAccount {
+        id: SessionId,
+        address: Address,
+        info: AccountInfo,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
 }
 
 /// A registry of sessions sharing `fallback` and `base`, sharded across
@@ -127,9 +145,13 @@ where
         }
     }
 
-    fn worker_for(&self, id: SessionId) -> &std_mpsc::Sender<Job<F>> {
+    /// A cloned `Sender`, not a borrowed one — `Sender::clone` is a cheap
+    /// refcount bump, and cloning sidesteps ever needing `Sender: Sync`
+    /// for concurrent callers (several axum handlers on several real OS
+    /// threads, not just interleaved on one).
+    fn worker_for(&self, id: SessionId) -> std_mpsc::Sender<Job<F>> {
         let idx = (id as usize) % self.workers.len();
-        &self.workers[idx]
+        self.workers[idx].clone()
     }
 
     /// Fork a new session off the shared base and the shared fallback —
@@ -148,6 +170,28 @@ where
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
         Ok(id)
+    }
+
+    /// Read-only account lookup — overlay, then base, then fallback,
+    /// exactly `Session::basic`'s own resolution order. Doesn't touch
+    /// revm's execution machinery at all.
+    pub async fn basic(&self, id: SessionId, address: Address) -> Result<Option<AccountInfo>, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Basic { id, address, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
+    /// Override an account directly in `id`'s private overlay — the
+    /// test-only cheatcode role, never touching the shared base or the
+    /// real chain. See `Session::set_account`.
+    pub async fn set_account(&self, id: SessionId, address: Address, info: AccountInfo) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::SetAccount { id, address, info, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
     }
 
     /// Run `tx` read-only against `id`'s session — no commit, nothing
@@ -264,6 +308,27 @@ where
         Job::Discard { id, reply } => {
             sessions.remove(&id);
             let _ = reply.send(());
+        }
+        Job::Basic { id, address, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    Database::basic(session, address).map_err(|e| SessionError::Execution(format!("{e}")))
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
+        }
+        Job::SetAccount { id, address, info, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    session.set_account(address, info);
+                    Ok(())
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
         }
     }
 }
