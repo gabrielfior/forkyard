@@ -92,17 +92,19 @@ us-east-1, on-demand, Linux/x86, at a placeholder sizing of 4 vCPU / 16 GiB per 
 
 ### Phasing — resolved
 
-This is a hobby project for now, not production — original budget ceiling **$10/mo**, deliberately exceeded (~$30/mo) to stay on one cloud provider rather than run Hetzner now and migrate to AWS twice. The ECS Fargate design above is still the target once this actually scales; it isn't overturned, just sequenced for later. Nothing about the software changes between phases: same binary, same one-process-per-chain design, same crate layout, no cloud-specific coupling anywhere in it — this phase-0 AWS box moves to the Fargate fleet by redeploy, not rewrite.
+This is a hobby project for now, not production. Nothing about the software changes across phases: same binary, same one-process-per-chain design, same crate layout, no cloud-specific coupling anywhere in it — each phase moves to the next by redeploy, not rewrite. Supabase's actual fit is the control plane (auth, per-second usage/billing records) — *not* the fork engine. Its Edge Functions are stateless and Deno-based, the same fundamental mismatch that ruled out Lambda.
 
-**Supabase's actual fit is the control plane** (auth, per-second usage/billing records) — *not* the fork engine. Its Edge Functions are stateless and Deno-based, the same fundamental mismatch that ruled out Lambda: no persistent in-memory `Arc`-shared cache across invocations.
+**Phase −1, now — local, $0:** run the Rust binary directly on the dev machine. No inbound networking needed — the chain-tip follower only opens outbound websocket connections to the upstream RPC provider, and for local testing the MCP server runs over stdio, launched as a subprocess directly by Claude Code or Cursor — no port, no TLS, no cloud account. Secrets in a local `.env`, same pattern production uses. This is the actual next step, ahead of any deployment decision.
 
-**Phase 0 plan, ~$30/mo, AWS:**
+**Phase 0, when ready to deploy somewhere reachable — AWS, ~$30/mo:**
 - `t4g.medium` (2 vCPU / 4 GiB, ARM) — $24.53/mo. The compute host, all three chain processes as systemd units.
 - EBS root, ~20GB gp3 — ~$1.60/mo.
 - One public IPv4 — $3.65/mo, mandatory AWS fee with no equivalent on Hetzner.
 - No NAT Gateway, no ALB — public subnet + security group instead.
 
-About 6x Hetzner's ~$5/mo equivalent (higher baseline EC2 rate, plus the public-IPv4 fee Hetzner doesn't charge) and 3x the original $10/mo ceiling — accepted deliberately to avoid a second provider migration on top of the later Fargate move. (Hetzner CAX11 at $4.99/mo and Oracle's Always Free tier, noted earlier, remain valid cheaper options if the single-provider preference changes.)
+Total ~$30/mo, about 6x Hetzner's ~$5/mo equivalent, accepted for single-provider consolidation into the already-chosen ECS Fargate design.
+
+**Hetzner — stored, not discarded.** The CAX11 plan (2 vCPU / 4 GiB ARM, $4.99/mo, 20TB traffic included) stays on record for a future phase, not as a rejected alternative — a reserved one. Same binary, no cloud-specific coupling, so standing it up later is a redeploy whenever it's actually wanted.
 
 Honest caveat: Fargate's usual justification is elastic, scale-to-zero workloads. These replicas are long-lived and stateful instead, so the premium buys only "no host to patch" — a narrower slice of Fargate's value than typical, but the specific thing wanted here. **Decision: Fargate**, given the maintenance priority outweighs a ~15% compute premium at this scale.
 
