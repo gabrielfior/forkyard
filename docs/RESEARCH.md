@@ -92,15 +92,17 @@ us-east-1, on-demand, Linux/x86, at a placeholder sizing of 4 vCPU / 16 GiB per 
 
 ### Phasing — resolved
 
-This is a hobby project for now, not production — budget ceiling **$10/mo**, not necessarily AWS. The ECS Fargate design above is still the target once this actually scales; it isn't overturned, just sequenced for later. Nothing about the software changes between phases: same binary, same one-process-per-chain design, same crate layout, no cloud-specific coupling anywhere in it — moving providers later is a redeploy, not a rewrite.
+This is a hobby project for now, not production — original budget ceiling **$10/mo**, deliberately exceeded (~$30/mo) to stay on one cloud provider rather than run Hetzner now and migrate to AWS twice. The ECS Fargate design above is still the target once this actually scales; it isn't overturned, just sequenced for later. Nothing about the software changes between phases: same binary, same one-process-per-chain design, same crate layout, no cloud-specific coupling anywhere in it — this phase-0 AWS box moves to the Fargate fleet by redeploy, not rewrite.
 
 **Supabase's actual fit is the control plane** (auth, per-second usage/billing records) — *not* the fork engine. Its Edge Functions are stateless and Deno-based, the same fundamental mismatch that ruled out Lambda: no persistent in-memory `Arc`-shared cache across invocations.
 
-**Phase 0 plan, ~$5/mo:**
-- Hetzner CAX11 (2 vCPU / 4 GiB, ARM) — $4.99/mo, 20TB traffic included. The compute host, all three chain processes as systemd units, same architecture as the AWS version.
-- Supabase, free tier — $0/mo, control plane only. Free-tier projects auto-pause after a week of inactivity — fine for a low-traffic control plane, not something to build the engine's hot path on.
+**Phase 0 plan, ~$30/mo, AWS:**
+- `t4g.medium` (2 vCPU / 4 GiB, ARM) — $24.53/mo. The compute host, all three chain processes as systemd units.
+- EBS root, ~20GB gp3 — ~$1.60/mo.
+- One public IPv4 — $3.65/mo, mandatory AWS fee with no equivalent on Hetzner.
+- No NAT Gateway, no ALB — public subnet + security group instead.
 
-**The $0 option, and why it isn't the primary pick:** Oracle Cloud's Always Free tier offers a 2 OCPU / 12 GiB ARM pool at genuinely $0/mo — roomier than the Hetzner box. But Oracle quietly halved this exact allowance in 2026 with no announcement (users found out when instances were shut down), and "out of capacity" provisioning failures are common in popular regions. Same silent-policy-change failure shape as the model-provider chain dying quietly with nothing alerting on it before. Fine to experiment with at zero cost, not the primary plan given that history.
+About 6x Hetzner's ~$5/mo equivalent (higher baseline EC2 rate, plus the public-IPv4 fee Hetzner doesn't charge) and 3x the original $10/mo ceiling — accepted deliberately to avoid a second provider migration on top of the later Fargate move. (Hetzner CAX11 at $4.99/mo and Oracle's Always Free tier, noted earlier, remain valid cheaper options if the single-provider preference changes.)
 
 Honest caveat: Fargate's usual justification is elastic, scale-to-zero workloads. These replicas are long-lived and stateful instead, so the premium buys only "no host to patch" — a narrower slice of Fargate's value than typical, but the specific thing wanted here. **Decision: Fargate**, given the maintenance priority outweighs a ~15% compute premium at this scale.
 

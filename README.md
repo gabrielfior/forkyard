@@ -80,7 +80,7 @@ Then, sequenced by public reach:
 
 Three production designs considered (full detail in `docs/RESEARCH.md`): bare VMs + systemd, **ECS Fargate** (chosen for least maintenance, ~15.6% cost premium over EC2 at a 6-replica fleet — worth it for no OS to patch), and Kubernetes (likely premature at this scale). Non-negotiable in any of them: single-sourced secrets, readiness checks that verify the chain-tip ingestion feed is actually live (not just "process up"), and leaning on the static-binary deploy story Rust already gives for free.
 
-**Right now, though, this is a hobby project, not production** — budget ceiling $10/mo. Phase 0: **Hetzner CAX11** (2 vCPU/4 GiB ARM, $4.99/mo) running all three chain processes as systemd units, plus **Supabase free tier** ($0/mo) for the control plane only (auth, usage records) — Supabase Edge Functions don't fit the engine itself, same reason Lambda didn't. Total ~$5/mo. Scaling to the Fargate design later is a redeploy, not a rewrite — nothing in the software is cloud-specific.
+**Right now, though, this is a hobby project, not production** — original budget ceiling $10/mo. Phase 0, revised to stay on AWS: `t4g.medium` (2 vCPU/4 GiB ARM, $24.53/mo) + ~20GB EBS ($1.60/mo) + one public IPv4 ($3.65/mo, mandatory), no NAT Gateway/no ALB, running all three chain processes as systemd units — **~$30/mo**, about 6x a Hetzner-equivalent (~$5/mo) but avoiding a second provider migration on top of the later Fargate move. **Supabase free tier** ($0/mo) still covers the control plane only (auth, usage records) — its Edge Functions don't fit the engine itself, same reason Lambda didn't. Scaling to the Fargate design later is a redeploy, not a rewrite — nothing in the software is cloud-specific.
 
 ## Docs
 
