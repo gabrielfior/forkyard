@@ -49,6 +49,10 @@ Rust all the way — fork engine and API layer both. One Cargo workspace:
 
 **Scaling topology:** one instance (or small replica set) per chain — Ethereum mainnet, Base, Arbitrum each independent, since their caches don't share anything anyway. Within a chain, start with a single vertically-scaled instance to maximize the shared-cache benefit; split only once memory or cores actually bottleneck, not before.
 
+**Compute model:** long-running Rust processes, not Lambda — a stateless invocation can't hold the `Arc` the whole speed advantage depends on. "Not a single EC2" is solved by a fleet of replicas behind a load balancer instead.
+
+**Cross-replica caching:** local memory only for v1, no Redis on the hot path. An in-process read (~10–100ns) beats even same-host Redis (~0.1–1ms) by three-plus orders of magnitude, and revm does dozens to hundreds of reads per transaction — routing them through Redis would cost more latency than the speed differentiator can afford. Redis as a write-through warm-start feed for cold replicas is a reasonable later optimization, not a v1 need.
+
 Launch chains: Ethereum mainnet, Base, Arbitrum.
 
 ## Competitive position & moat
