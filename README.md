@@ -15,6 +15,15 @@ cargo run -p forkyard-fetch --example mainnet_transfer
 cargo run -p forkyard-api-http --example mainnet_transfer_rpc
 ```
 
+**From a non-Rust client:** start a server that just keeps running (`cd crates/api-http && RPC_URL=... cargo run --example serve_demo`, default `http://127.0.0.1:8555`), then, from a separate terminal:
+
+```bash
+cd python/examples
+uv run transfer_demo.py   # same flow, from a real web3.py client
+```
+
+`python/examples` is a standalone `uv` project — proof the RPC surface isn't Rust-specific, for anyone building a client (Python or otherwise) against a running forkyard server.
+
 ## Problem
 
 Agents acting on-chain need to simulate a transaction before committing gas or capital. What exists today:
