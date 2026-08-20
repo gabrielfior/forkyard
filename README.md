@@ -30,12 +30,24 @@ fork(chain, block?) → simulate(tx) → advance(tx) [repeat] → discard() / TT
 
 ## Architecture
 
-1. **Chain-tip ingestion** — subscribes to `newHeads` via a single upstream RPC provider (configured via `.env`; target 2–3 providers with failover once volume justifies it), keeps one warm base snapshot per chain current to the latest block.
-2. **Persistent state map** — a bounded working-set cache, not a chain mirror. Only touched accounts/storage live here; anything else is fetched live via `eth_getProof` and cached, exactly like Anvil's fork mode. Immutable and structurally shared, so forking a session is a pointer copy — O(1).
-3. **Execution: revm, embedded directly** — not Anvil-as-a-process. Anvil *is* revm wrapped in a single-process node; spawning one Anvil per session loses the shared warm cache (the real cost advantage) and, at scale, means managing thousands of OS processes with none of the benefit. We embed revm's own `CacheDB` primitive — the same one Anvil's fork mode already uses — inside a thin custom node layer instead.
-4. **Lazy remote fetch** — cache misses pulled live from the upstream RPC, cached into the shared base for the next fork.
-5. **Session lifecycle** — TTL-keyed sessions, sharded across a fixed pool of worker processes (one per core) rather than one process per session. revm's own sandboxing is the correctness boundary within a worker; sharding bounds a crash's blast radius to a fraction of active sessions instead of all of them or exactly one. (Chosen after a prior process-per-fork attempt broke on exactly this: thousands of processes to manage, `--dump-state` hard to track, and spawn latency on every fork.)
-6. **Edge API + MCP server** — auth, per-fork-second metering (Modal-style: metered by wall-clock seconds a session stays alive, no idle charge beyond the TTL window), a thin TS/Python SDK, and an MCP tool definition so agent frameworks call it directly.
+Rust all the way — fork engine and API layer both. One Cargo workspace:
+
+- `engine` — the persistent state map (`im`/`imbl`, structural sharing), session overlay, revm wiring, per-chain hardfork config.
+- `fetch` — lazy remote fetch, built on `foundry-fork-db` (the crate Anvil/Forge actually depend on) rather than reinvented: its `SharedBackend` already bridges revm's synchronous execution with an async fetch task over channels. Our own code adds what it doesn't have — many sessions cheaply branching off one shared base.
+- `ingest` — chain-tip follower, keeps the shared base snapshot current to the latest block.
+- `session` — TTL lifecycle, thread-pool sharding. The only crate the API layer is allowed to call into.
+- `api-mcp` — built on `rmcp`, the official Rust MCP SDK (async on tokio, spec-conformant, derives `inputSchema` from typed structs) — chosen specifically to foreclose the handshake bug that broke a prior MCP server on the Hermes dogfood target.
+- `api-http` — a thin `axum` REST surface for the SDK case.
+- `bin` — wires it together, loads `.env`.
+
+1. **Chain-tip ingestion** — subscribes to `newHeads` via a single upstream RPC provider (configured via `.env`; target 2–3 providers with failover once volume justifies it).
+2. **Persistent state map** — a bounded working-set cache, not a chain mirror. Only touched accounts/storage live here; anything else is fetched live and cached. Immutable and structurally shared, so forking a session is a pointer copy — O(1).
+3. **Execution: revm, embedded directly** — not Anvil-as-a-process. Anvil *is* revm wrapped in a single-process node; spawning one per session loses the shared warm cache (the real cost advantage) and, at scale, means managing thousands of OS processes with none of the benefit.
+4. **Lazy remote fetch** — via `foundry-fork-db`'s `SharedBackend`, cached into the shared base for the next fork.
+5. **Session lifecycle & isolation** — TTL-keyed sessions, sharded across a fixed pool of worker **threads** (not processes) within one process. Corrected from an earlier pass that said "processes": OS processes don't share an address space, and the O(1)-fork trick depends on every worker holding the same `Arc` to the shared state map — threads share that for free, processes would force duplicating the cache per worker. Blast radius is handled by `catch_unwind` around every job (safe — revm has no unsafe/FFI in its hot path) plus per-session gas/time ceilings; a genuine process crash is covered by running multiple replicas per chain for capacity anyway, not by artificial process-per-worker isolation.
+6. **Edge API + MCP server** — per-fork-second metering (Modal-style), `rmcp` for MCP, `axum` for HTTP.
+
+**Scaling topology:** one instance (or small replica set) per chain — Ethereum mainnet, Base, Arbitrum each independent, since their caches don't share anything anyway. Within a chain, start with a single vertically-scaled instance to maximize the shared-cache benefit; split only once memory or cores actually bottleneck, not before.
 
 Launch chains: Ethereum mainnet, Base, Arbitrum.
 
