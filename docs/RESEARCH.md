@@ -78,9 +78,31 @@ Sequence: MCP server first, then ElizaOS. GOAT and AgentKit follow once one of t
 
 These differ in how much operational machinery gets taken on for what's currently one stateful Rust process per chain — not in cloud provider.
 
-1. **Bare VMs + systemd** — *fits current scale.* One systemd-managed Rust binary per chain-shard instance, a small fixed fleet (say two per chain) behind a basic load balancer for availability, not cache-sharing — each instance's warm cache is independent. Deploy is: build the binary, restart the service. Ops model: the same pattern already running the Hermes deployment on EC2 — systemd unit, SSH to debug, nothing new to learn. Downside: scaling past a handful of instances per chain becomes real toil, fine today, not indefinitely.
-2. **Managed container platform** (Fly.io / ECS Fargate) — a minimal container image (static Rust binary, distroless base) on a platform handling rolling deploys, health checks, and secrets without owning a Kubernetes control plane. Downside: a new platform's abstractions to learn, less transparent to debug than one process over SSH.
+1. **Bare VMs + systemd** — one systemd-managed Rust binary per chain-shard instance, a small fixed fleet (say two per chain) behind a basic load balancer for availability, not cache-sharing — each instance's warm cache is independent. Deploy is: build the binary, restart the service. Ops model: the same pattern already running the Hermes deployment on EC2 — systemd unit, SSH to debug, nothing new to learn. Downside: scaling past a handful of instances per chain becomes real toil, and every OS patch/AMI rebuild is on you.
+2. **Managed container platform — ECS Fargate** — *chosen, for least maintenance.* A minimal container image (static Rust binary, distroless base) on a platform handling rolling deploys, health checks, and secrets, with AWS managing the underlying host entirely — no OS to patch, no AMI to rebuild. Downside: less transparent to debug than one process over SSH; ECS on EC2 (no Fargate premium, still no raw systemd) is a middle option if the premium starts to bother.
 3. **Kubernetes** (EKS/GKE) — full container orchestration, HPA per chain-service. The standard shape once this grows into many services around the core engine (billing, dashboard, multi-region). Downside: real overhead (upgrades, RBAC, networking policy) a handful of stateful instances per chain doesn't yet justify — likely premature today.
+
+### AWS cost comparison: EC2 (1) vs. ECS Fargate (2)
+
+us-east-1, on-demand, Linux/x86, at a placeholder sizing of 4 vCPU / 16 GiB per replica (needs real load-testing to confirm) across the scaling topology's fleet — 2 replicas × 3 chains (Ethereum mainnet, Base, Arbitrum) = 6 always-on instances:
+
+- EC2 `m7i.xlarge`: $0.2016/hr → $147.17/mo × 6 = **~$883/mo** compute, ~$915/mo including small EBS root volumes.
+- Fargate, equivalent task: (4 × $0.04048) + (16 × $0.004445) = $0.23304/hr → $170.12/mo × 6 = **~$1,021/mo**, ~$1,040/mo total.
+- **Premium: ~15.6%, roughly $125–150/mo (~$1,500–1,800/year)** at this fleet size — persists proportionally under a 1-year Compute Savings Plan too, since that discount applies to both EC2 and Fargate.
+
+### Phasing — resolved
+
+This is a hobby project for now, not production — budget ceiling **$10/mo**, not necessarily AWS. The ECS Fargate design above is still the target once this actually scales; it isn't overturned, just sequenced for later. Nothing about the software changes between phases: same binary, same one-process-per-chain design, same crate layout, no cloud-specific coupling anywhere in it — moving providers later is a redeploy, not a rewrite.
+
+**Supabase's actual fit is the control plane** (auth, per-second usage/billing records) — *not* the fork engine. Its Edge Functions are stateless and Deno-based, the same fundamental mismatch that ruled out Lambda: no persistent in-memory `Arc`-shared cache across invocations.
+
+**Phase 0 plan, ~$5/mo:**
+- Hetzner CAX11 (2 vCPU / 4 GiB, ARM) — $4.99/mo, 20TB traffic included. The compute host, all three chain processes as systemd units, same architecture as the AWS version.
+- Supabase, free tier — $0/mo, control plane only. Free-tier projects auto-pause after a week of inactivity — fine for a low-traffic control plane, not something to build the engine's hot path on.
+
+**The $0 option, and why it isn't the primary pick:** Oracle Cloud's Always Free tier offers a 2 OCPU / 12 GiB ARM pool at genuinely $0/mo — roomier than the Hetzner box. But Oracle quietly halved this exact allowance in 2026 with no announcement (users found out when instances were shut down), and "out of capacity" provisioning failures are common in popular regions. Same silent-policy-change failure shape as the model-provider chain dying quietly with nothing alerting on it before. Fine to experiment with at zero cost, not the primary plan given that history.
+
+Honest caveat: Fargate's usual justification is elastic, scale-to-zero workloads. These replicas are long-lived and stateful instead, so the premium buys only "no host to patch" — a narrower slice of Fargate's value than typical, but the specific thing wanted here. **Decision: Fargate**, given the maintenance priority outweighs a ~15% compute premium at this scale.
 
 **Non-negotiable regardless of which design:**
 - Secrets single-sourced — one place for the RPC provider key, referenced everywhere else, not duplicated across config files (exactly how a token got leaked into a transcript and left in backup files on the Hermes box before).

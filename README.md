@@ -78,7 +78,9 @@ Then, sequenced by public reach:
 
 ## Cloud & deployment
 
-Three designs to pick from (full detail in `docs/RESEARCH.md`): **bare VMs + systemd** (matches the founder's existing Hermes-on-EC2 pattern, fits current scale — recommended for now), **a managed container platform** (Fly.io / ECS Fargate, less manual than VMs without Kubernetes' overhead), or **Kubernetes** (most standard, but likely premature for a handful of stateful instances per chain). Non-negotiable in any of them: single-sourced secrets, readiness checks that verify the chain-tip ingestion feed is actually live (not just "process up"), and leaning on the static-binary deploy story Rust already gives for free.
+Three production designs considered (full detail in `docs/RESEARCH.md`): bare VMs + systemd, **ECS Fargate** (chosen for least maintenance, ~15.6% cost premium over EC2 at a 6-replica fleet — worth it for no OS to patch), and Kubernetes (likely premature at this scale). Non-negotiable in any of them: single-sourced secrets, readiness checks that verify the chain-tip ingestion feed is actually live (not just "process up"), and leaning on the static-binary deploy story Rust already gives for free.
+
+**Right now, though, this is a hobby project, not production** — budget ceiling $10/mo. Phase 0: **Hetzner CAX11** (2 vCPU/4 GiB ARM, $4.99/mo) running all three chain processes as systemd units, plus **Supabase free tier** ($0/mo) for the control plane only (auth, usage records) — Supabase Edge Functions don't fit the engine itself, same reason Lambda didn't. Total ~$5/mo. Scaling to the Fargate design later is a redeploy, not a rewrite — nothing in the software is cloud-specific.
 
 ## Docs
 
