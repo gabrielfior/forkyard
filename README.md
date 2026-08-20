@@ -72,6 +72,10 @@ Then, sequenced by public reach:
 3. **GOAT SDK plugin** — ~1k stars, provider-agnostic tool catalog, examples already ship for LangChain and OpenAI's Agents SDK.
 4. **Coinbase AgentKit action provider** — 1.3k stars, official backing, direct line to CDP wallet users.
 
+## Cloud & deployment
+
+Three designs to pick from (full detail in `docs/RESEARCH.md`): **bare VMs + systemd** (matches the founder's existing Hermes-on-EC2 pattern, fits current scale — recommended for now), **a managed container platform** (Fly.io / ECS Fargate, less manual than VMs without Kubernetes' overhead), or **Kubernetes** (most standard, but likely premature for a handful of stateful instances per chain). Non-negotiable in any of them: single-sourced secrets, readiness checks that verify the chain-tip ingestion feed is actually live (not just "process up"), and leaning on the static-binary deploy story Rust already gives for free.
+
 ## Docs
 
 - [`docs/RESEARCH.md`](docs/RESEARCH.md) — full market research: landscape, gaps, EVM-vs-Solana decision, sources.

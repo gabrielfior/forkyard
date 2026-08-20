@@ -72,6 +72,19 @@ Ranked by public reach, not by how open the lane is (Tenderly's own MCP server m
 
 Sequence: MCP server first, then ElizaOS. GOAT and AgentKit follow once one of the first two proves the economics work.
 
+## Cloud & deployment: three designs
+
+These differ in how much operational machinery gets taken on for what's currently one stateful Rust process per chain — not in cloud provider.
+
+1. **Bare VMs + systemd** — *fits current scale.* One systemd-managed Rust binary per chain-shard instance, a small fixed fleet (say two per chain) behind a basic load balancer for availability, not cache-sharing — each instance's warm cache is independent. Deploy is: build the binary, restart the service. Ops model: the same pattern already running the Hermes deployment on EC2 — systemd unit, SSH to debug, nothing new to learn. Downside: scaling past a handful of instances per chain becomes real toil, fine today, not indefinitely.
+2. **Managed container platform** (Fly.io / ECS Fargate) — a minimal container image (static Rust binary, distroless base) on a platform handling rolling deploys, health checks, and secrets without owning a Kubernetes control plane. Downside: a new platform's abstractions to learn, less transparent to debug than one process over SSH.
+3. **Kubernetes** (EKS/GKE) — full container orchestration, HPA per chain-service. The standard shape once this grows into many services around the core engine (billing, dashboard, multi-region). Downside: real overhead (upgrades, RBAC, networking policy) a handful of stateful instances per chain doesn't yet justify — likely premature today.
+
+**Non-negotiable regardless of which design:**
+- Secrets single-sourced — one place for the RPC provider key, referenced everywhere else, not duplicated across config files (exactly how a token got leaked into a transcript and left in backup files on the Hermes box before).
+- Readiness checks that verify the chain-tip ingestion websocket is actually connected and current, not just "process is up" — an instance can look healthy while silently serving increasingly stale forks, the same failure shape as a model-provider chain dying quietly with nothing alerting on it.
+- A static Rust binary means no interpreter/virtualenv drift — none of the "an upgrade silently reverted my patch" or "python3 vs the venv" class of deploy failure.
+
 ## Sources
 
 - [Tenderly Virtual TestNet pricing](https://docs.tenderly.co/virtual-testnets/pricing) · [Tenderly pricing](https://tenderly.co/pricing)
