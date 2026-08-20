@@ -1,0 +1,11 @@
+[package]
+name = "forkyard-session"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dashmap = "6.2.1"
+forkyard-engine = { version = "0.1.0", path = "../engine" }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }

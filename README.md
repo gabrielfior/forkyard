@@ -2,6 +2,19 @@
 
 Instant, disposable forks of live EVM chain state, priced per second, built for AI agents that need to simulate before they act.
 
+## Try it
+
+Requires `RPC_URL` set to an Ethereum mainnet RPC endpoint (copy `.env.example` to `.env`, or export it).
+
+```bash
+# In-process: fork mainnet, fund a signer, sign+execute a transfer, assert balances, discard. No server.
+cargo run -p forkyard-fetch --example mainnet_transfer
+
+# Same flow, but over real JSON-RPC — starts a server, connects with an
+# alloy HTTP provider exactly as `cast` or a wallet would, then tears it down.
+cargo run -p forkyard-api-http --example mainnet_transfer_rpc
+```
+
 ## Problem
 
 Agents acting on-chain need to simulate a transaction before committing gas or capital. What exists today:
@@ -37,7 +50,7 @@ Rust all the way — fork engine and API layer both. One Cargo workspace:
 - `ingest` — chain-tip follower, keeps the shared base snapshot current to the latest block.
 - `session` — TTL lifecycle, thread-pool sharding. The only crate the API layer is allowed to call into.
 - `api-mcp` — built on `rmcp`, the official Rust MCP SDK (async on tokio, spec-conformant, derives `inputSchema` from typed structs) — chosen specifically to foreclose the handshake bug that broke a prior MCP server on the Hermes dogfood target.
-- `api-http` — a thin `axum` REST surface for the SDK case.
+- `api-http` — a minimal Ethereum JSON-RPC server (`axum`) fronting one session: `eth_chainId`, `eth_getBalance`, `eth_getTransactionCount`, `eth_sendRawTransaction` (legacy txs), plus a test-only `forkyard_setBalance` cheatcode. Lets an external client (`cast`, `alloy`, a wallet) talk to a fork over the wire — the production MCP/SDK path stays in-process instead, to avoid paying this crate's JSON/HTTP cost on the hot path.
 - `bin` — wires it together, loads `.env`.
 
 1. **Chain-tip ingestion** — subscribes to `newHeads` via a single upstream RPC provider (configured via `.env`; target 2–3 providers with failover once volume justifies it).
