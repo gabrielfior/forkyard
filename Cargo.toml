@@ -6,3 +6,12 @@ members = ["crates/*"]
 edition = "2021"
 license = "UNLICENSED"
 publish = false
+
+# Pinned here once so every crate that needs revm gets the exact same
+# version — foundry-fork-db pins revm ^41.0.0 internally, and a mismatch
+# between that and a crate's own direct `revm` dependency means two
+# incompatible copies of revm's Database/DatabaseRef traits in one build.
+# Hit this three times scaffolding by hand; pin it centrally instead of
+# relying on remembering to match versions on every new crate.
+[workspace.dependencies]
+revm = "41.0.0"

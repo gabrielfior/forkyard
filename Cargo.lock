@@ -2025,7 +2025,10 @@ version = "0.1.0"
 dependencies = [
  "dashmap",
  "forkyard-engine",
+ "forkyard-fetch",
+ "revm",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
