@@ -77,6 +77,7 @@ impl DatabaseRef for NoFallback {
 pub struct Session<F: DatabaseRef = NoFallback> {
     base: Arc<BaseSnapshot>,
     fallback: F,
+    block_env: revm::context::BlockEnv,
     overlay_accounts: HashMap<Address, AccountInfo>,
     overlay_code: HashMap<B256, Bytecode>,
     overlay_storage: HashMap<(Address, StorageKey), StorageValue>,
@@ -84,15 +85,28 @@ pub struct Session<F: DatabaseRef = NoFallback> {
 
 impl<F: DatabaseRef> Session<F> {
     /// Fork a session from a shared base snapshot — an `Arc` clone, O(1) —
-    /// with `fallback` resolving whatever the base hasn't cached yet.
-    pub fn fork(base: Arc<BaseSnapshot>, fallback: F) -> Self {
+    /// with `fallback` resolving whatever the base hasn't cached yet, and
+    /// `block_env` the real block (number, timestamp, base fee) this
+    /// session's fork is pinned to. Every sibling session forked from the
+    /// same base shares the identical `block_env` — they're all forked
+    /// from the same block.
+    pub fn fork(base: Arc<BaseSnapshot>, fallback: F, block_env: revm::context::BlockEnv) -> Self {
         Self {
             base,
             fallback,
+            block_env,
             overlay_accounts: HashMap::new(),
             overlay_code: HashMap::new(),
             overlay_storage: HashMap::new(),
         }
+    }
+
+    /// The real block this session's fork is pinned to — what
+    /// `forkyard_fetch::fork` actually fetched, not `BlockEnv::default()`.
+    /// Callers building a revm `Context` for this session should seed its
+    /// block from this, e.g. via `Context::mainnet().with_block(session.block_env().clone())`.
+    pub fn block_env(&self) -> &revm::context::BlockEnv {
+        &self.block_env
     }
 
     /// Override an account directly in this session's private overlay —
@@ -219,8 +233,8 @@ mod tests {
     #[test]
     fn fork_is_a_pointer_copy_not_a_clone_of_state() {
         let base = Arc::new(BaseSnapshot::default());
-        let a = Session::fork(Arc::clone(&base), NoFallback);
-        let b = Session::fork(Arc::clone(&base), NoFallback);
+        let a = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let b = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
         assert_eq!(Arc::strong_count(&base), 3); // base + a + b
         drop(a);
         drop(b);
@@ -230,7 +244,7 @@ mod tests {
     #[test]
     fn overlay_override_is_session_private() {
         let base = Arc::new(BaseSnapshot::default());
-        let mut a = Session::fork(Arc::clone(&base), NoFallback);
+        let mut a = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
         let addr = Address::ZERO;
         a.set_account(
             addr,
@@ -241,7 +255,7 @@ mod tests {
         );
         assert_eq!(a.basic(addr).unwrap().unwrap().balance, revm::primitives::U256::from(100u64));
 
-        let mut b = Session::fork(Arc::clone(&base), NoFallback);
+        let mut b = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
         assert!(b.basic(addr).is_err(), "sibling session must not see a's overlay");
     }
 }

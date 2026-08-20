@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use forkyard_engine::{BaseSnapshot, Session};
 use revm::context::result::ExecutionResult;
-use revm::context::TxEnv;
+use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
 use revm::primitives::Address;
 use revm::state::AccountInfo;
@@ -75,11 +75,13 @@ enum Job<F> {
         id: SessionId,
         base: Arc<BaseSnapshot>,
         fallback: F,
+        block_env: BlockEnv,
         reply: oneshot::Sender<()>,
     },
     Simulate {
         id: SessionId,
         tx: Box<TxEnv>,
+        disable_checks: bool,
         reply: oneshot::Sender<Result<ExecutionResult, SessionError>>,
     },
     Advance {
@@ -114,6 +116,7 @@ where
 {
     fallback: F,
     base: Arc<BaseSnapshot>,
+    block_env: BlockEnv,
     workers: Vec<std_mpsc::Sender<Job<F>>>,
     counts: Vec<Arc<AtomicUsize>>,
     next_id: AtomicU64,
@@ -126,8 +129,11 @@ where
     /// `num_workers` sessions-sharding threads, each reaping its own
     /// sessions idle past `ttl`. `base` starts empty; advancing it as the
     /// chain moves is `forkyard-ingest`'s job, not this crate's — every
-    /// session here still reads through to `fallback` on a miss.
-    pub fn new(fallback: F, num_workers: usize, ttl: Duration) -> Self {
+    /// session here still reads through to `fallback` on a miss. `block_env`
+    /// is the real block (number, timestamp, base fee) every session forked
+    /// from this manager is pinned to — e.g. what `forkyard_fetch::fork`
+    /// returns alongside the fork itself.
+    pub fn new(fallback: F, block_env: BlockEnv, num_workers: usize, ttl: Duration) -> Self {
         let num_workers = num_workers.max(1);
         let mut workers = Vec::with_capacity(num_workers);
         let mut counts = Vec::with_capacity(num_workers);
@@ -139,10 +145,16 @@ where
         Self {
             fallback,
             base: Arc::new(BaseSnapshot::default()),
+            block_env,
             workers,
             counts,
             next_id: AtomicU64::new(0),
         }
+    }
+
+    /// The real block every session from this manager is pinned to.
+    pub fn block_env(&self) -> &BlockEnv {
+        &self.block_env
     }
 
     /// A cloned `Sender`, not a borrowed one — `Sender::clone` is a cheap
@@ -165,6 +177,7 @@ where
                 id,
                 base: Arc::clone(&self.base),
                 fallback: self.fallback.clone(),
+                block_env: self.block_env.clone(),
                 reply,
             })
             .map_err(|_| SessionError::WorkerGone)?;
@@ -195,15 +208,26 @@ where
     }
 
     /// Run `tx` read-only against `id`'s session — no commit, nothing
-    /// persists. See docs/RESEARCH.md, "what simulate / advance actually do".
+    /// persists — with balance and base-fee checks enforced, same as
+    /// `advance`. Answers "would this really work right now." See
+    /// docs/RESEARCH.md, "what simulate / advance actually do".
     pub async fn simulate(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
-        self.dispatch(id, tx, false).await
+        self.dispatch(id, tx, false, false).await
     }
 
     /// Run `tx` against `id`'s session and commit the diff into that
     /// session's private overlay only.
     pub async fn advance(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
-        self.dispatch(id, tx, true).await
+        self.dispatch(id, tx, true, false).await
+    }
+
+    /// Dry-run `tx` for a gas estimate, the same way real Ethereum nodes'
+    /// `eth_estimateGas` does: balance-sufficiency and base-fee checks are
+    /// disabled, since the point is "how much gas would this need," not
+    /// "does the caller currently hold funds for the price they'll
+    /// actually send at." Never commits.
+    pub async fn estimate_gas(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
+        self.dispatch(id, tx, false, true).await
     }
 
     async fn dispatch(
@@ -211,12 +235,13 @@ where
         id: SessionId,
         tx: TxEnv,
         commit: bool,
+        disable_checks: bool,
     ) -> Result<ExecutionResult, SessionError> {
         let (reply, rx) = oneshot::channel();
         let job = if commit {
             Job::Advance { id, tx: Box::new(tx), reply }
         } else {
-            Job::Simulate { id, tx: Box::new(tx), reply }
+            Job::Simulate { id, tx: Box::new(tx), disable_checks, reply }
         };
         self.worker_for(id).send(job).map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?
@@ -293,16 +318,16 @@ where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     match job {
-        Job::Fork { id, base, fallback, reply } => {
-            sessions.insert(id, (Session::fork(base, fallback), Instant::now()));
+        Job::Fork { id, base, fallback, block_env, reply } => {
+            sessions.insert(id, (Session::fork(base, fallback, block_env), Instant::now()));
             let _ = reply.send(());
         }
-        Job::Simulate { id, tx, reply } => {
-            let result = run(sessions, id, *tx, false);
+        Job::Simulate { id, tx, disable_checks, reply } => {
+            let result = run(sessions, id, *tx, false, disable_checks);
             let _ = reply.send(result);
         }
         Job::Advance { id, tx, reply } => {
-            let result = run(sessions, id, *tx, true);
+            let result = run(sessions, id, *tx, true, false);
             let _ = reply.send(result);
         }
         Job::Discard { id, reply } => {
@@ -338,13 +363,28 @@ fn run<F: Fallback>(
     id: SessionId,
     tx: TxEnv,
     commit: bool,
+    disable_checks: bool,
 ) -> Result<ExecutionResult, SessionError>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let (session, touched) = sessions.get_mut(&id).ok_or(SessionError::Unknown(id))?;
     *touched = Instant::now();
-    let mut evm = revm::Context::mainnet().with_db(session).build_mainnet();
+    let block_env = session.block_env().clone();
+    let ctx = revm::Context::mainnet().with_db(session).with_block(block_env);
+    // Real nodes' eth_estimateGas disables balance/base-fee checks too —
+    // the point of an estimate is "how much gas," not "does the caller
+    // hold funds for the price they'll actually send at." simulate/advance
+    // never take this path — they answer "would this really work."
+    let ctx = if disable_checks {
+        ctx.modify_cfg_chained(|cfg| {
+            cfg.disable_balance_check = true;
+            cfg.disable_base_fee = true;
+        })
+    } else {
+        ctx
+    };
+    let mut evm = ctx.build_mainnet();
     if commit {
         evm.transact_commit(tx).map_err(|e| SessionError::Execution(format!("{e:?}")))
     } else {
@@ -398,7 +438,7 @@ mod tests {
     }
 
     fn manager() -> SessionManager<FundedFallback> {
-        SessionManager::new(FundedFallback, 2, Duration::from_millis(200))
+        SessionManager::new(FundedFallback, BlockEnv::default(), 2, Duration::from_millis(200))
     }
 
     fn spend_funded_balance(recipient: Address) -> TxEnv {

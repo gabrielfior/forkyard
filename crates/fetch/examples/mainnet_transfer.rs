@@ -16,20 +16,22 @@ use revm::context::TxEnv;
 use revm::state::AccountInfo;
 use revm::{Database, ExecuteCommitEvm, MainBuilder, MainContext};
 
-fn main() -> eyre::Result<()> {
+#[tokio::main]
+async fn main() -> eyre::Result<()> {
     dotenvy::dotenv().ok();
     let rpc_url = std::env::var("RPC_URL")
         .expect("set RPC_URL to an Ethereum mainnet RPC endpoint (see .env.example)");
 
-    // 1. Fork Ethereum mainnet.
-    let fork = forkyard_fetch::fork(&rpc_url)?;
+    // 1. Fork Ethereum mainnet — `block_env` is the real block (number,
+    // timestamp, base fee) this fork is pinned to.
+    let (fork, block_env) = forkyard_fetch::fork(&rpc_url).await?;
 
     // 2. "Connect to the forked RPC" — by design, there is no RPC server
     // to connect to. The fork is used directly in-process (that's the
     // whole cost/latency advantage; see docs/RESEARCH.md, "why this is
     // cheap"). `Session` is that direct handle: real mainnet state via
     // `fork` as its fallback, layered under a private overlay.
-    let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fork);
+    let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fork, block_env);
 
     // Fund a freshly generated signer on top of real forked state — the
     // same role Anvil's `anvil_setBalance` cheatcode plays. Nothing here
@@ -86,8 +88,10 @@ fn main() -> eyre::Result<()> {
         .chain_id(Some(1))
         .build_fill();
 
+    let block_env = session.block_env().clone();
     revm::Context::mainnet()
         .with_db(&mut session)
+        .with_block(block_env)
         .build_mainnet()
         .transact_commit(tx_env)?;
 

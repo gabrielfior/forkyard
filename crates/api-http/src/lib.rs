@@ -17,14 +17,19 @@
 //! which stays in-process and therefore doesn't pay this crate's JSON/HTTP
 //! serialization cost).
 //!
-//! `eth_gasPrice` is a fixed placeholder (there's no real fee market to
-//! simulate), and each session's "block number" is just a per-session
-//! counter incremented on every successful `eth_sendRawTransaction` — a
-//! progress indicator, not a real block. Receipts and that counter live
-//! in this crate's own state, keyed by session id; they are *not* evicted
-//! when a session's TTL expires (`SessionManager` doesn't expose an
-//! eviction hook yet), so they leak for the life of the server today —
-//! a known, deliberately-deferred gap, not an oversight.
+//! `eth_gasPrice` is the fork's real base fee (from `SessionManager::block_env`,
+//! itself `forkyard_fetch::fork`'s actual fetched block) plus a fixed
+//! priority-fee margin — not a made-up constant, but it's still a snapshot
+//! from whenever the fork was taken, not a live-updating fee market (that
+//! needs `forkyard-ingest` to exist first). `eth_blockNumber` is that same
+//! real starting block number plus a per-session counter incremented on
+//! every successful `eth_sendRawTransaction` — a real starting point, but
+//! progress from there is still synthetic, not real chain advancement.
+//! Receipts and that counter live in this crate's own state, keyed by
+//! session id; they are *not* evicted when a session's TTL expires
+//! (`SessionManager` doesn't expose an eviction hook yet), so they leak for
+//! the life of the server today — a known, deliberately-deferred gap, not
+//! an oversight.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -47,8 +52,10 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
-/// Fixed placeholder — there's no real fee market here to simulate.
-const GAS_PRICE_WEI: u64 = 20_000_000_000;
+/// Priority fee added on top of the fork's real base fee to build a legacy
+/// `eth_gasPrice` figure — a common wallet-default "tip" (1.5 gwei), not
+/// derived from anything; the base fee underneath it is real.
+const PRIORITY_FEE_WEI: u64 = 1_500_000_000;
 
 /// Generous cap for `eth_estimateGas`'s dry-run — the maximum revm allows
 /// per transaction (EIP-7825), not an arbitrary round number. A higher
@@ -144,9 +151,19 @@ fn field_str<'a>(call: &'a Value, key: &str) -> Option<&'a str> {
     call.get(key).and_then(Value::as_str)
 }
 
+/// The fork's real starting block number plus `session_id`'s own
+/// send-count so far — see the module-level doc comment.
+fn real_block_number<F: Fallback>(state: &AppState<F>, session_id: SessionId) -> u64
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    let local = state.rpc_state.lock().unwrap().get(&session_id).map(|s| s.block_number).unwrap_or(0);
+    state.manager.block_env().number.to::<u64>() + local
+}
+
 /// Builds a standard-shaped JSON-RPC transaction receipt. `block_number`
-/// and `block_hash` are this session's own placeholder progress counter,
-/// not a real chain block — see the module-level doc comment.
+/// here should be `real_block_number`'s value at send time, not this
+/// session's raw local counter — see the module-level doc comment.
 fn build_receipt(
     tx_hash: B256,
     from: Address,
@@ -210,15 +227,16 @@ where
     match method {
         "eth_chainId" => Ok(json!(format!("0x{:x}", state.chain_id))),
 
-        // This session's own progress counter (see module doc) — not a
-        // real chain block number.
-        "eth_blockNumber" => {
-            let block_number = state.rpc_state.lock().unwrap().get(&session_id).map(|s| s.block_number).unwrap_or(0);
-            Ok(json!(format!("0x{block_number:x}")))
-        }
+        // The fork's real starting block number plus this session's own
+        // send-count — see module doc.
+        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id)))),
 
-        // Fixed placeholder — see module doc.
-        "eth_gasPrice" => Ok(json!(format!("0x{GAS_PRICE_WEI:x}"))),
+        // Real base fee (from the fork's actual block) plus a fixed
+        // priority-fee margin — see module doc.
+        "eth_gasPrice" => {
+            let gas_price = state.manager.block_env().basefee as u64 + PRIORITY_FEE_WEI;
+            Ok(json!(format!("0x{gas_price:x}")))
+        }
 
         "eth_getBalance" => {
             let address = parse_address(params, 0)?;
@@ -284,10 +302,11 @@ where
             // Advance this session's own block counter and store a
             // receipt for it — this is what makes `eth_getTransactionReceipt`
             // (and so `web3.py`'s `wait_for_transaction_receipt`) work.
+            let real_start = state.manager.block_env().number.to::<u64>();
             let mut guard = state.rpc_state.lock().unwrap();
             let entry = guard.entry(session_id).or_default();
             entry.block_number += 1;
-            let receipt = build_receipt(tx_hash, sender, tx.to, &result, entry.block_number);
+            let receipt = build_receipt(tx_hash, sender, tx.to, &result, real_start + entry.block_number);
             entry.receipts.insert(format!("{tx_hash:#x}"), receipt);
 
             Ok(json!(format!("{tx_hash:#x}")))
@@ -335,7 +354,7 @@ where
                 .nonce(nonce)
                 .build_fill();
 
-            let result = state.manager.simulate(session_id, tx_env).await?;
+            let result = state.manager.estimate_gas(session_id, tx_env).await?;
             if !result.is_success() {
                 return Err(RpcErrorObj::execution(format!(
                     "call would fail: {}",
@@ -463,8 +482,12 @@ mod tests {
     }
 
     fn test_state() -> AppState<TestFallback> {
+        test_state_with_block_env(revm::context::BlockEnv::default())
+    }
+
+    fn test_state_with_block_env(block_env: revm::context::BlockEnv) -> AppState<TestFallback> {
         AppState {
-            manager: SessionManager::new(TestFallback, 1, Duration::from_secs(60)),
+            manager: SessionManager::new(TestFallback, block_env, 1, Duration::from_secs(60)),
             chain_id: 1,
             rpc_state: Mutex::new(HashMap::new()),
         }
@@ -490,11 +513,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gas_price_is_fixed() {
-        let state = test_state();
+    async fn gas_price_is_the_forks_real_base_fee_plus_the_priority_margin() {
+        let block_env = revm::context::BlockEnv { basefee: 12_000_000_000, ..Default::default() };
+        let state = test_state_with_block_env(block_env);
         let id = state.manager.fork().await.unwrap();
         let result = dispatch(&state, id, "eth_gasPrice", &[]).await.unwrap();
-        assert_eq!(result, json!(format!("0x{GAS_PRICE_WEI:x}")));
+        assert_eq!(result, json!(format!("0x{:x}", 12_000_000_000u64 + PRIORITY_FEE_WEI)));
     }
 
     #[tokio::test]
@@ -510,6 +534,25 @@ mod tests {
         let call = json!({ "from": from.to_string(), "to": to.to_string(), "value": "0x1" });
         let result = dispatch(&state, id, "eth_estimateGas", &[call]).await.unwrap();
         assert_eq!(result, json!("0x5208")); // 21000, a plain transfer's real cost
+    }
+
+    /// Regression test for a real bug caught live: once the fork's real
+    /// base fee is non-zero, a naive gas_price=0 estimate call fails
+    /// revm's `GasPriceLessThanBasefee` check before the estimate even
+    /// runs — exactly the class of bug `disable_base_fee` exists to avoid,
+    /// same as real nodes' `eth_estimateGas`. Also proves estimation works
+    /// with zero balance, matching "how much gas, not do you have funds."
+    #[tokio::test]
+    async fn estimate_gas_works_against_a_real_nonzero_base_fee_with_no_balance() {
+        let block_env = revm::context::BlockEnv { basefee: 12_000_000_000, ..Default::default() };
+        let state = test_state_with_block_env(block_env);
+        let id = state.manager.fork().await.unwrap();
+        let from = Address::from([1u8; 20]); // never funded
+        let to = Address::from([2u8; 20]);
+
+        let call = json!({ "from": from.to_string(), "to": to.to_string(), "value": "0x1" });
+        let result = dispatch(&state, id, "eth_estimateGas", &[call]).await.unwrap();
+        assert_eq!(result, json!("0x5208"));
     }
 
     #[tokio::test]
@@ -569,5 +612,31 @@ mod tests {
         assert_eq!(dispatch(&state, a, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
         // session b never sent anything — its own counter must be untouched.
         assert_eq!(dispatch(&state, b, "eth_blockNumber", &[]).await.unwrap(), json!("0x0"));
+    }
+
+    #[tokio::test]
+    async fn block_number_starts_from_the_forks_real_number_not_zero() {
+        let block_env = revm::context::BlockEnv { number: U256::from(20_000_000u64), ..Default::default() };
+        let state = test_state_with_block_env(block_env);
+        let id = state.manager.fork().await.unwrap();
+
+        // Fresh session, no sends yet — should report the fork's real
+        // number directly, not a counter starting at zero.
+        assert_eq!(dispatch(&state, id, "eth_blockNumber", &[]).await.unwrap(), json!("0x1312d00"));
+
+        let sender = PrivateKeySigner::random();
+        dispatch(
+            &state,
+            id,
+            "forkyard_setBalance",
+            &[json!(sender.address().to_string()), json!("0xde0b6b3a7640000")],
+        )
+        .await
+        .unwrap();
+        let raw_hex = signed_transfer_hex(&sender, Address::from([9u8; 20]), 1, 0);
+        dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+
+        // One send later: real number + 1, and the receipt agrees.
+        assert_eq!(dispatch(&state, id, "eth_blockNumber", &[]).await.unwrap(), json!("0x1312d01"));
     }
 }

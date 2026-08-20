@@ -157,13 +157,13 @@ async fn main() -> eyre::Result<()> {
         .expect("set RPC_URL to an Ethereum mainnet RPC endpoint (see .env.example)");
 
     // Fork Ethereum mainnet exactly once...
-    let fork = timed!("forked mainnet (once, shared)", forkyard_fetch::fork(&rpc_url)?);
+    let (fork, block_env) = timed!("forked mainnet (once, shared)", forkyard_fetch::fork(&rpc_url).await?);
 
     // ...and build one SessionManager on top of it, sharded across 4
     // worker threads. Every agent below opens a session on *this* manager
     // instead of forking its own — the actual thing this example exists
     // to demonstrate.
-    let manager = SessionManager::new(fork, 4, Duration::from_secs(60));
+    let manager = SessionManager::new(fork, block_env, 4, Duration::from_secs(60));
     let handle = timed!(
         "started shared RPC server",
         forkyard_api_http::serve("127.0.0.1:0", manager, 1).await?

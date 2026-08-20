@@ -11,12 +11,10 @@
 //!   curl -X POST http://127.0.0.1:8555/session
 //!   curl -X POST http://127.0.0.1:8555/session/0 -d '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
 //!
-//! Known gap if you point a real wallet at a session URL: balance reads
-//! work (`eth_chainId`, `eth_getBalance`, `eth_getTransactionCount`), but
-//! the send-transaction confirmation flow calls `eth_estimateGas` and gas
-//! fee methods first, which aren't implemented here yet — sending through
-//! a wallet's own UI will stall at that step even though `eth_sendRawTransaction`
-//! itself works fine if you construct the signed transaction yourself.
+//! `eth_gasPrice`, `eth_estimateGas`, and `eth_getTransactionReceipt` are
+//! all implemented now, backed by the fork's real base fee/block number —
+//! a real wallet's send-transaction flow (gas estimate, gas price, send,
+//! wait for receipt) should work end to end against a session URL.
 use std::time::Duration;
 
 use forkyard_session::SessionManager;
@@ -31,8 +29,8 @@ async fn main() -> eyre::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(8555);
 
-    let fork = forkyard_fetch::fork(&rpc_url)?;
-    let manager = SessionManager::new(fork, 4, Duration::from_secs(3600));
+    let (fork, block_env) = forkyard_fetch::fork(&rpc_url).await?;
+    let manager = SessionManager::new(fork, block_env, 4, Duration::from_secs(3600));
     let handle = forkyard_api_http::serve(&format!("127.0.0.1:{port}"), manager, 1).await?;
 
     println!("forkyard RPC listening at http://{}", handle.addr);

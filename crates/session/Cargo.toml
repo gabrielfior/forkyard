@@ -9,6 +9,6 @@ publish.workspace = true
 dashmap = "6.2.1"
 forkyard-engine = { version = "0.1.0", path = "../engine" }
 forkyard-fetch = { version = "0.1.0", path = "../fetch" }
-revm.workspace = true
+revm = { workspace = true, features = ["optional_balance_check", "optional_no_base_fee"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1.44"

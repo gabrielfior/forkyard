@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 alloy-network = "=2.3.0"
 alloy-provider = { version = "=2.3.0", features = ["reqwest"] }
+alloy-rpc-types = "=2.3.0"
 eyre = "0.6.14"
 foundry-fork-db = "0.27.0"
 revm.workspace = true

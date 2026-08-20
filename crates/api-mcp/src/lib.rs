@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_expected_tools_and_round_trips_fork_set_balance_and_advance() {
-        let manager = SessionManager::new(TestFallback, 1, Duration::from_secs(60));
+        let manager = SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60));
         let server = ForkyardMcpServer::new(manager);
 
         let (server_io, client_io) = tokio::io::duplex(4096);
