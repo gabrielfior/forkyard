@@ -23,15 +23,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Native runners for every target on purpose — no cross-compile
-          # toolchain to maintain, at the cost of one job per platform.
+          # Deliberately just the two "-latest" runner images, not every
+          # OS/arch combination GitHub hosts: macos-13 (Intel) sat queued
+          # for 9+ minutes waiting for a runner while every other job in
+          # the same run finished in under 3 — not worth the wait for a
+          # release pipeline. macos-latest is Apple Silicon today, which
+          # is also just the more relevant target now.
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-          - os: macos-13
-            target: x86_64-apple-darwin
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
