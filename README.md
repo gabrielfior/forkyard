@@ -8,7 +8,7 @@ Instant, disposable forks of live EVM chain state, priced per second, built for 
 curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash
 ```
 
-Downloads a prebuilt `forkyard` binary for your platform (macOS/Linux, x86_64/arm64) from
+Downloads a prebuilt `forkyard` binary for your platform (x86_64 Linux or arm64 macOS) from
 [GitHub Releases](https://github.com/gabrielfior/forkyard/releases) into `~/.forkyard/bin` —
 no Rust toolchain required. Built by `.github/workflows/release.yml` on every `v*.*.*` tag; see
 `docs/RELEASE_PLAN.md` for the rest of the distribution plan. No releases published yet? Build

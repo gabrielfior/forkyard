@@ -49,7 +49,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 
 if ! curl -fsSL "$url" -o "$tmp_dir/${asset}"; then
   echo "forkyard: no release build found at ${url}" >&2
-  echo "forkyard: supported targets are x86_64/aarch64 on Linux and macOS" >&2
+  echo "forkyard: supported targets are x86_64 Linux and arm64 macOS (see .github/workflows/release.yml)" >&2
   exit 1
 fi
 
