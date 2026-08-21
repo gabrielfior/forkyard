@@ -12,6 +12,7 @@
 //! hand-writing one.
 
 use std::fmt;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use forkyard_session::{Fallback, SessionId, SessionManager};
@@ -20,8 +21,12 @@ use revm::primitives::{Address, TxKind, U256};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData, ServerHandler};
 use serde::Deserialize;
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 fn tool_err(e: impl fmt::Display) -> ErrorData {
     ErrorData::internal_error(e.to_string(), None)
@@ -109,6 +114,57 @@ where
         use rmcp::ServiceExt;
         self.serve(rmcp::transport::io::stdio()).await?.waiting().await?;
         Ok(())
+    }
+
+    /// Serves the same tool surface over MCP's Streamable HTTP transport at
+    /// `http://{bind_addr}/mcp` — for any client that isn't launching this
+    /// as a subprocess over stdio (a browser-based agent, a teammate's
+    /// mcp-cli pointed at a `"url"` config entry, a client on another
+    /// machine). Each HTTP client gets its own `ForkyardMcpServer` instance
+    /// (rmcp's per-session factory model) sharing the same underlying
+    /// `manager` — cheap, since a fresh instance here is just another `Arc`
+    /// clone plus a tool-router rebuild, not a new session-manager.
+    pub async fn serve_http(manager: Arc<SessionManager<F>>, bind_addr: &str) -> eyre::Result<Handle>
+    where
+        F: 'static,
+    {
+        let service = StreamableHttpService::new(
+            move || Ok(Self::new(Arc::clone(&manager))),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig::default(),
+        );
+        let app = axum::Router::new().nest_service("/mcp", service);
+
+        let listener = TcpListener::bind(bind_addr).await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        Ok(Handle { addr, shutdown_tx: Some(shutdown_tx), join })
+    }
+}
+
+/// Handle to a running `serve_http` server — mirrors `forkyard-api-http`'s
+/// own `Handle` shape, since both surfaces get shut down the same way from
+/// `forkyard-bin`.
+pub struct Handle {
+    pub addr: SocketAddr,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl Handle {
+    pub async fn shutdown(mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        let _ = self.join.await;
     }
 }
 
@@ -313,5 +369,69 @@ mod tests {
 
         client.cancel().await.expect("client should cancel");
         server_task.await.expect("server task").expect("server");
+    }
+
+    #[tokio::test]
+    async fn same_tool_surface_round_trips_over_streamable_http() {
+        use rmcp::transport::StreamableHttpClientTransport;
+
+        let manager = Arc::new(SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60)));
+        let handle = ForkyardMcpServer::serve_http(manager, "127.0.0.1:0").await.expect("serve_http should bind");
+        let url = format!("http://{}/mcp", handle.addr);
+
+        let client = NullClient
+            .serve(StreamableHttpClientTransport::from_uri(url))
+            .await
+            .expect("client should connect over HTTP");
+
+        let tools = client.list_tools(None).await.expect("tools/list should succeed");
+        let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+        for expected in ["fork", "get_balance", "set_balance", "simulate", "advance", "discard"] {
+            assert!(names.contains(&expected), "missing tool {expected:?}, got {names:?}");
+        }
+
+        // Same fork -> set_balance -> advance -> get_balance round trip as
+        // the stdio test, this time over a real TCP connection — proves
+        // the HTTP transport isn't just reachable, it drives the exact same
+        // SessionManager correctly.
+        let fork_result = client.call_tool(call("fork", serde_json::json!({}))).await.expect("fork");
+        let session_id: u64 = text_of(&fork_result).parse().unwrap();
+
+        let sender = Address::from([9u8; 20]);
+        let recipient = Address::from([10u8; 20]);
+        client
+            .call_tool(call(
+                "set_balance",
+                serde_json::json!({ "session_id": session_id, "address": sender.to_string(), "balance": "0x64" }),
+            ))
+            .await
+            .expect("set_balance");
+
+        let advance_result = client
+            .call_tool(call(
+                "advance",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "from": sender.to_string(),
+                    "to": recipient.to_string(),
+                    "value": "0x64",
+                    "gas_price": 0,
+                }),
+            ))
+            .await
+            .expect("advance");
+        assert!(text_of(&advance_result).contains("\"success\":true"));
+
+        let balance_result = client
+            .call_tool(call(
+                "get_balance",
+                serde_json::json!({ "session_id": session_id, "address": recipient.to_string() }),
+            ))
+            .await
+            .expect("get_balance");
+        assert!(text_of(&balance_result).contains("\"balance\":\"0x64\""));
+
+        client.cancel().await.expect("client should cancel");
+        handle.shutdown().await;
     }
 }
