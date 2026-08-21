@@ -114,7 +114,7 @@ pub struct SessionManager<F: Fallback>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    fallback: F,
+    fallback: Arc<RwLock<F>>,
     base: Arc<BaseSnapshot>,
     block_env: Arc<RwLock<BlockEnv>>,
     workers: Vec<std_mpsc::Sender<Job<F>>>,
@@ -143,7 +143,7 @@ where
             counts.push(count);
         }
         Self {
-            fallback,
+            fallback: Arc::new(RwLock::new(fallback)),
             base: Arc::new(BaseSnapshot::default()),
             block_env: Arc::new(RwLock::new(block_env)),
             workers,
@@ -160,12 +160,30 @@ where
         self.block_env.read().unwrap().clone()
     }
 
-    /// Swap the block context new sessions are forked against. Existing
-    /// sessions are unaffected — each already has its own `BlockEnv` pinned
-    /// at fork time. This is `forkyard-ingest`'s only write path into a
-    /// `SessionManager`; see its module doc for what it does and does not
-    /// keep fresh.
+    /// Swap the block context new sessions are forked against, on its own,
+    /// with no change to the underlying fallback. Existing sessions are
+    /// unaffected — each already has its own `BlockEnv` pinned at fork
+    /// time. Prefer `refresh_fallback` when the fallback itself also needs
+    /// to move to a new block — this alone leaves cached account/storage
+    /// reads on the old fallback in place.
     pub fn set_block_env(&self, block_env: BlockEnv) {
+        *self.block_env.write().unwrap() = block_env;
+    }
+
+    /// Swap in a completely fresh fallback (e.g. a new `forkyard_fetch::Fork`
+    /// re-forked at the latest block) alongside the `BlockEnv` it was forked
+    /// at. This is what actually keeps new sessions' account/storage reads
+    /// from going stale: `set_block_env` alone only changes the
+    /// number/timestamp/base fee new forks see, while old cached
+    /// balances/nonces/storage/code on the previous fallback would
+    /// otherwise still be served forever. Existing sessions are unaffected
+    /// — each already holds its own clone of the *old* fallback from fork
+    /// time, and keeps reading through that until it's discarded or its TTL
+    /// expires (at which point the old fallback's background thread tears
+    /// down once nothing references it anymore). Only sessions forked after
+    /// this call see the new one.
+    pub fn refresh_fallback(&self, fallback: F, block_env: BlockEnv) {
+        *self.fallback.write().unwrap() = fallback;
         *self.block_env.write().unwrap() = block_env;
     }
 
@@ -188,7 +206,7 @@ where
             .send(Job::Fork {
                 id,
                 base: Arc::clone(&self.base),
-                fallback: self.fallback.clone(),
+                fallback: self.fallback.read().unwrap().clone(),
                 block_env: self.block_env(),
                 reply,
             })
@@ -453,6 +471,32 @@ mod tests {
         SessionManager::new(FundedFallback, BlockEnv::default(), 2, Duration::from_millis(200))
     }
 
+    /// A fallback whose reported balance for `WATCHED` is whatever it was
+    /// constructed with — stands in for "the chain moved, the same address
+    /// now has a different real balance," so `refresh_fallback` has
+    /// something observable to swap between.
+    #[derive(Clone)]
+    struct ValueFallback(u64);
+
+    impl DatabaseRef for ValueFallback {
+        type Error = FundedFallbackError;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            let balance = if address == WATCHED { U256::from(self.0) } else { U256::ZERO };
+            Ok(Some(AccountInfo { balance, ..Default::default() }))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    const WATCHED: Address = Address::new([7u8; 20]);
+
     fn spend_funded_balance(recipient: Address) -> TxEnv {
         TxEnv::builder()
             .caller(FUNDED)
@@ -517,5 +561,29 @@ mod tests {
         assert_eq!(mgr.active_session_count(), 0, "idle session should have been reaped");
         let tx = TxEnv::builder().build_fill();
         assert!(matches!(mgr.simulate(id, tx).await, Err(SessionError::Unknown(_))));
+    }
+
+    #[tokio::test]
+    async fn refresh_fallback_only_reaches_sessions_forked_afterward() {
+        let mgr = SessionManager::new(ValueFallback(100), BlockEnv::default(), 2, Duration::from_secs(60));
+
+        let before = mgr.fork().await.unwrap();
+        assert_eq!(mgr.basic(before, WATCHED).await.unwrap().unwrap().balance, U256::from(100));
+
+        // The chain "moved": a fresh fallback reports a different real
+        // balance for the same address.
+        mgr.refresh_fallback(ValueFallback(999), BlockEnv::default());
+
+        let after = mgr.fork().await.unwrap();
+        assert_eq!(
+            mgr.basic(after, WATCHED).await.unwrap().unwrap().balance,
+            U256::from(999),
+            "a session forked after refresh_fallback must read through the new fallback"
+        );
+        assert_eq!(
+            mgr.basic(before, WATCHED).await.unwrap().unwrap().balance,
+            U256::from(100),
+            "a session forked before refresh_fallback must keep reading its own old fallback, unaffected"
+        );
     }
 }

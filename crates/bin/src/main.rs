@@ -53,8 +53,9 @@ async fn main() -> eyre::Result<()> {
     ));
     tracing::info!(num_workers, ttl_secs, "forked upstream chain, session manager ready");
 
-    // Background chain-tip follower — see forkyard-ingest's module doc for
-    // the v1 scope limitation (block context only, no cache invalidation).
+    // Background chain-tip follower — re-forks a fresh fallback whenever
+    // the chain actually advances, not just the block number label; see
+    // forkyard-ingest's module doc for exactly what stays bounded-stale.
     let (ingest_stop_tx, ingest_stop_rx) = tokio::sync::oneshot::channel();
     let ingest_manager = Arc::clone(&manager);
     let ingest_task = tokio::spawn(async move {
