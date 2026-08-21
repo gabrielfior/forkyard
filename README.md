@@ -37,6 +37,12 @@ That starts all three surfaces on one shared cache:
 
 The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, but only into that session's own private overlay) → `discard()` or let the TTL expire. The real chain and the shared cache are never written to.
 
+## Gotchas
+
+- **`gas_price` vs the fork's real basefee** — `advance`/`simulate` reject any `gas_price` below the forked block's current basefee, the same check a real node enforces. The tool schema's `gas_price` default is `0`, which will fail on almost any live chain. Check the fork's real basefee via `eth_gasPrice` on the JSON-RPC surface (it already includes a small priority-fee margin, so it's directly usable as `gas_price`) — there's no `eth_getBlockByNumber` on this surface to check it another way.
+- **Nonces aren't tracked for you** — `advance`'s `nonce` also defaults to `0` and isn't auto-incremented between calls. Each successful `advance` from a sender bumps its nonce by 1 in that session; the next call from that same sender needs `nonce` set to match, or it fails with `NonceTooLow`. Check with `get_balance` (it returns `nonce` alongside `balance`) if you're unsure, or `fork` a fresh session to reset to 0.
+- **Balances aren't zeroed by default** — any address you haven't called `set_balance` on reflects its *real* balance on the forked chain, not zero. For deterministic tests, explicitly `set_balance` every address you use — sender and receiver — rather than assuming an arbitrary address starts empty. This also means a post-transfer `get_balance` on a real, already-funded address shows real balance *plus* whatever you sent, not just the transferred amount in isolation.
+
 ## Build from source
 
 ```bash
