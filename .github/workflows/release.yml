@@ -9,6 +9,11 @@ on:
       - "v*.*.*"
   workflow_dispatch:
 
+# This repo's default GITHUB_TOKEN permissions are read-only; the release
+# step needs contents:write to create a release and attach assets to it.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
