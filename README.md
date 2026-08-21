@@ -1,6 +1,8 @@
 # Forkyard
 
-Instant, disposable forks of live EVM chain state, priced per second, built for AI agents that need to simulate before they act.
+Instant, disposable forks of live EVM chain state — for AI agents that need to simulate a transaction before committing gas or capital.
+
+For a single agent, [Anvil](https://book.getfoundry.sh/anvil/) is simpler and already enough — use it. Forkyard is for once there's more than one concurrent agent/session: one process, one shared warm cache across many isolated sessions, with an MCP (stdio) and a JSON-RPC (HTTP) surface running side by side out of the box.
 
 ## Install
 
@@ -8,127 +10,39 @@ Instant, disposable forks of live EVM chain state, priced per second, built for 
 curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash
 ```
 
-Downloads a prebuilt `forkyard` binary for your platform (x86_64 Linux or arm64 macOS) from
-[GitHub Releases](https://github.com/gabrielfior/forkyard/releases) into `~/.forkyard/bin` —
-no Rust toolchain required. Built by `.github/workflows/release.yml` on every `v*.*.*` tag; see
-`docs/RELEASE_PLAN.md` for the rest of the distribution plan. No releases published yet? Build
-from source below.
+Installs a prebuilt `forkyard` binary (x86_64 Linux or arm64 macOS) into `~/.forkyard/bin` — no Rust toolchain required. No release for your platform yet? [Build from source](#build-from-source) below.
 
-## Try it
+## Get started
 
-Requires `RPC_URL` set to an Ethereum mainnet RPC endpoint (copy `.env.example` to `.env`, or export it).
+Set an RPC endpoint and run it:
 
 ```bash
-# In-process: fork mainnet, fund a signer, sign+execute a transfer, assert balances, discard. No server.
-cargo run -p forkyard-fetch --example mainnet_transfer
-
-# Same flow, but over real JSON-RPC — starts a server, connects with an
-# alloy HTTP provider exactly as `cast` or a wallet would, then tears it down.
-cargo run -p forkyard-api-http --example mainnet_transfer_rpc
+export RPC_URL=https://your-mainnet-rpc
+forkyard
 ```
 
-**From a non-Rust client:** start a server that just keeps running (`cd crates/api-http && RPC_URL=... cargo run --example serve_demo`, default `http://127.0.0.1:8555`), then, from a separate terminal:
+That starts both surfaces on one shared cache:
+
+- **MCP over stdio** — point your agent framework at the `forkyard` binary, e.g.:
+  ```json
+  { "mcpServers": { "forkyard": { "command": "forkyard", "env": { "RPC_URL": "https://your-mainnet-rpc" } } } }
+  ```
+  Tools: `fork`, `simulate`, `advance`, `get_balance`, `set_balance`, `discard`.
+- **HTTP JSON-RPC**, default `http://127.0.0.1:8555` (`FORKYARD_PORT` to change it) — `POST /session` opens a session, then `POST /session/{id}` speaks normal Ethereum JSON-RPC (`eth_call`, `eth_sendRawTransaction`, etc.) against it. Works with `cast`, `alloy`, `web3.py`, or any wallet/client — see `python/examples` for a working `web3.py` demo.
+
+The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, but only into that session's own private overlay) → `discard()` or let the TTL expire. The real chain and the shared cache are never written to.
+
+## Build from source
 
 ```bash
-cd python/examples
-uv run transfer_demo.py   # same flow, from a real web3.py client
-```
-
-`python/examples` is a standalone `uv` project — proof the RPC surface isn't Rust-specific, for anyone building a client (Python or otherwise) against a running forkyard server.
-
-**The real thing — one binary, both surfaces at once:**
-
-```bash
+git clone https://github.com/gabrielfior/forkyard
+cd forkyard
 RPC_URL=... cargo run -p forkyard
 ```
 
-Starts the HTTP JSON-RPC server (default `http://127.0.0.1:8555`) and the MCP-over-stdio server against one shared `SessionManager`, plus the background chain-tip follower — which now does a real full refresh (a fresh fallback backend, not just a relabeled block number) whenever the chain actually advances. This is what an agent harness should actually launch (over stdio) — see the `bin` entry under Architecture for config env vars and the ingest crate's docs for exactly what stays bounded-stale.
-
-## Problem
-
-Agents acting on-chain need to simulate a transaction before committing gas or capital. What exists today:
-
-- **RPC bolt-ons** (Alchemy `eth_simulateV1`, QuickNode) — cheap, but shallow: single-transaction only, no sequential multi-tx bundle support against moving state.
-- **Dedicated platforms** (Tenderly) — deep, but enterprise-sales-gated with opaque pricing, and built as persistent per-customer environments, not a cheap per-call primitive.
-- **Wallet-native** (MetaMask Agent Wallet, Coinbase AgentKit/Agentic Wallets) — simulation bundled into a closed custody stack you don't control.
-
-Nobody sells a cheap, transparent, disposable fork built for a machine calling it hundreds of times an hour mid-reasoning-loop.
-
-## Why EVM, not Solana
-
-Solana carries far more raw agent transaction volume (65–77% of on-chain agent payment volume via x402), but its sub-penny fees cap what anyone can charge per simulation call, and the fork/simulation gap there is already covered by Surfpool (free, Solana Foundation-backed) and RPC Fast (paid, ~20ms, already selling to AI agents). EVM's higher gas costs are exactly why Tenderly is a real, paying business — and why this is too.
-
-## Solution
-
-Sub-second, disposable, copy-on-write forks of EVM state:
-
-```
-fork(chain, block?) → simulate(tx) → advance(tx) [repeat] → discard() / TTL expiry
-```
-
-- `simulate` runs a transaction through revm read-only — nothing persists.
-- `advance` runs it and writes the resulting diff into that session's *private* overlay only — the shared base cache and the real network are never touched. Broadcasting the real transaction is always a separate step the caller does with their own wallet.
-- Every response reports the exact block it ran against. Staleness (the real chain moving past the forked block, or an invisible pending mempool tx) is an inherent limit of any simulate-then-broadcast pattern — not something engineering can fully close, only shrink via short TTLs and re-simulating right before a real broadcast.
-
-## Architecture
-
-Rust all the way — fork engine and API layer both. One Cargo workspace:
-
-- `engine` — the persistent state map (`im`/`imbl`, structural sharing), session overlay, revm wiring, per-chain hardfork config.
-- `fetch` — lazy remote fetch, built on `foundry-fork-db` (the crate Anvil/Forge actually depend on) rather than reinvented: its `SharedBackend` already bridges revm's synchronous execution with an async fetch task over channels. Our own code adds what it doesn't have — many sessions cheaply branching off one shared base.
-- `ingest` — `ChainTipFollower` polls the upstream RPC on a fixed interval (`FORKYARD_INGEST_POLL_SECS`, default 12s) with a cheap `eth_getBlockByNumber` check, and only when the block number has actually advanced does it re-fork (`forkyard_fetch::fork`) an entirely fresh fallback backend — its own new `SharedBackend`, its own empty cache, pinned to that new block — and swap it into `SessionManager` via `refresh_fallback`. That's a real full update: every account balance, nonce, storage slot, and piece of code a *newly forked* session reads afterward comes from the new block, not whatever the previous fallback had cached. What's still bounded rather than eliminated: staleness for new forks is bounded by the poll interval, and a session already forked before a refresh keeps reading through its own old fallback for its whole lifetime (the same "in-flight session is a frozen snapshot" rule `SessionManager` already applies everywhere else) — not "always exactly the tip," but no longer "grows unboundedly stale for the life of the process."
-- `session` — TTL lifecycle, thread-pool sharding. The only crate the API layer is allowed to call into.
-- `api-mcp` — built on `rmcp`, the official Rust MCP SDK (async on tokio, spec-conformant, derives `inputSchema` from typed structs) — chosen specifically to foreclose the handshake bug that broke a prior MCP server on the Hermes dogfood target. Exposes `fork`/`get_balance`/`set_balance`/`simulate`/`advance`/`discard` as tools over one `SessionManager`, in-process via stdio — this is the path an agent framework actually calls. Verified with an in-process protocol test (real MCP `tools/list` + `tools/call`, not just type-checked).
-- `api-http` — a minimal Ethereum JSON-RPC server (`axum`) fronting a `SessionManager`: `POST /session` opens a session, `POST /session/{id}` carries `eth_chainId`, `eth_blockNumber`, `eth_gasPrice`, `eth_getBalance`, `eth_getTransactionCount`, `eth_estimateGas`, `eth_sendRawTransaction` (legacy txs), `eth_getTransactionReceipt`, plus a test-only `forkyard_setBalance` cheatcode. Lets external clients (`cast`, `alloy`, `web3.py`, a wallet) share one warm cache over the wire — the production MCP/SDK path (`api-mcp`) stays in-process instead, to avoid paying this crate's JSON/HTTP cost on the hot path.
-
-  **One server, many URLs, not one URL.** The base address (`http://host:port`) is the shared fork/cache; each session's actual endpoint is `http://host:port/session/{id}`, and those are genuinely isolated — verified live: funding the same address with different balances in two sessions and reading it back via each session's own URL returns the two different values.
-
-  `eth_gasPrice` is the fork's real base fee (fetched once at fork time into a real `BlockEnv` — `forkyard_fetch::fork` returns it alongside the fork itself, and every session's revm execution is actually seeded with it; it used to silently default to zero) plus a fixed priority-fee margin. `eth_blockNumber` is that same real starting block number plus a per-session send-counter. `eth_estimateGas` is a real dry-run through a dedicated `SessionManager::estimate_gas` (not `simulate`) that disables balance/base-fee checks the same way real nodes' `eth_estimateGas` does — without that, a real non-zero base fee makes every zero-gas-price estimate fail before it even runs, a bug caught live while wiring this up. `eth_getTransactionReceipt` (and so `web3.py`'s `wait_for_transaction_receipt`) works, backed by a receipt store keyed per session — not yet evicted when a session's TTL expires, a known gap. All of this reflects the fork's real, moving state when run via `forkyard-bin` (`forkyard-ingest` keeps `eth_gasPrice`/`eth_blockNumber`'s base current, and now the underlying account/storage cache too, for every session forked after a refresh — see the `ingest` bullet above for the exact bound); run as a bare `api-http` server with no ingest task, it's still just a snapshot from whenever the fork was taken. `crates/api-http/examples/serve_demo.rs` runs a session server indefinitely for manual `curl`/wallet/client poking.
-- `bin` — the single binary: one shared `SessionManager`, `api-http` and `api-mcp` served *simultaneously* against it (not one-or-the-other, so the same process can be launched by an agent harness over stdio while also being reachable over the network), plus a background `forkyard-ingest` task. stdout is left untouched for MCP's JSON-RPC framing; every log line goes to stderr instead. Config via env/`.env`: `RPC_URL` (required), `FORKYARD_PORT` (default 8555), `FORKYARD_NUM_WORKERS` (default 4), `FORKYARD_SESSION_TTL_SECS` (default 3600), `FORKYARD_INGEST_POLL_SECS` (default 12), `FORKYARD_CHAIN_ID` (default 1). Run with `RPC_URL=... cargo run -p forkyard`. Live-verified: HTTP and MCP-stdio sessions opened concurrently against the same process stay isolated from each other while sharing one warm fetch cache, and the ingest task visibly advanced the shared block number across real mainnet blocks during a running process.
-
-1. **Chain-tip ingestion** — `forkyard-ingest` polls the upstream RPC for its latest block on a fixed interval and, whenever it's actually advanced, re-forks a fresh fallback backend and block context for new sessions (see the `ingest` bullet above for exactly what stays bounded-stale rather than eliminated).
-2. **Persistent state map** — a bounded working-set cache, not a chain mirror. Only touched accounts/storage live here; anything else is fetched live and cached. Immutable and structurally shared, so forking a session is a pointer copy — O(1).
-3. **Execution: revm, embedded directly** — not Anvil-as-a-process. Anvil *is* revm wrapped in a single-process node; spawning one per session loses the shared warm cache (the real cost advantage) and, at scale, means managing thousands of OS processes with none of the benefit.
-4. **Lazy remote fetch** — via `foundry-fork-db`'s `SharedBackend`, cached into the shared base for the next fork.
-5. **Session lifecycle & isolation** — TTL-keyed sessions, sharded across a fixed pool of worker **threads** (not processes) within one process. Corrected from an earlier pass that said "processes": OS processes don't share an address space, and the O(1)-fork trick depends on every worker holding the same `Arc` to the shared state map — threads share that for free, processes would force duplicating the cache per worker. Blast radius is handled by `catch_unwind` around every job (safe — revm has no unsafe/FFI in its hot path) plus per-session gas/time ceilings; a genuine process crash is covered by running multiple replicas per chain for capacity anyway, not by artificial process-per-worker isolation.
-6. **Edge API + MCP server** — per-fork-second metering (Modal-style), `rmcp` for MCP, `axum` for HTTP.
-
-**Scaling topology:** one instance (or small replica set) per chain — Ethereum mainnet, Base, Arbitrum each independent, since their caches don't share anything anyway. Within a chain, start with a single vertically-scaled instance to maximize the shared-cache benefit; split only once memory or cores actually bottleneck, not before.
-
-**Compute model:** long-running Rust processes, not Lambda — a stateless invocation can't hold the `Arc` the whole speed advantage depends on. "Not a single EC2" is solved by a fleet of replicas behind a load balancer instead.
-
-**Cross-replica caching:** local memory only for v1, no Redis on the hot path. An in-process read (~10–100ns) beats even same-host Redis (~0.1–1ms) by three-plus orders of magnitude, and revm does dozens to hundreds of reads per transaction — routing them through Redis would cost more latency than the speed differentiator can afford. Redis as a write-through warm-start feed for cold replicas is a reasonable later optimization, not a v1 need.
-
-Launch chains: Ethereum mainnet, Base, Arbitrum.
-
-## Competitive position & moat
-
-Tenderly already ships an MCP server with 43 tools — including fork/branch, snapshot/revert, and simulate/send. Architecture alone isn't a moat; they could rebuild a shared-cache engine. What's actually defensible:
-
-- A cross-tenant warm cache that gets cheaper as aggregate traffic grows — structurally awkward for a product built around siloed per-customer environments (real, but unproven against their internals).
-- An enterprise/TU pricing model that structurally disincentivizes the incumbent from chasing a cheap, self-serve, transparent segment even if they technically can build it.
-- Being simpler and cheaper specifically for the throwaway-many-forks-per-turn pattern their dashboard-first product wasn't built around.
-
-A head start to compound, not a wall.
-
-## Go-to-market
-
-**Step zero:** dogfood on the founder's own Hermes (Nous Research) deployment — it already loads MCP servers via `mcp_servers.<name>` in `config.yaml`. Zero new infra, fastest feedback loop. Get the MCP handshake right from day one: a prior misconfigured MCP server on that same setup (no `initialize` handler, no JSON-RPC envelope, wrong schema key) cost 60s per agent init before anyone noticed.
-
-Then, sequenced by public reach:
-
-1. **MCP server** — framework-agnostic, reaches Claude Code, Cursor, LangChain (via its MCP adapter) at once; the most honest test of the price/latency claim against Tenderly's real product.
-2. **ElizaOS plugin** — 17,600+ stars, 200+ plugins, the largest existing on-chain-agent audience. A `plugin-forkyard` next to the existing `plugin-evm`.
-3. **GOAT SDK plugin** — ~1k stars, provider-agnostic tool catalog, examples already ship for LangChain and OpenAI's Agents SDK.
-4. **Coinbase AgentKit action provider** — 1.3k stars, official backing, direct line to CDP wallet users.
-
-## Cloud & deployment
-
-Three production designs considered (full detail in `docs/RESEARCH.md`): bare VMs + systemd, **ECS Fargate** (chosen for least maintenance, ~15.6% cost premium over EC2 at a 6-replica fleet — worth it for no OS to patch), and Kubernetes (likely premature at this scale). Non-negotiable in any of them: single-sourced secrets, readiness checks that verify the chain-tip ingestion feed is actually live (not just "process up"), and leaning on the static-binary deploy story Rust already gives for free.
-
-**Right now, though, this is a hobby project, not production.** Phase −1, now: run the Rust binary locally, no cloud at all — the MCP server over stdio, launched directly by Claude Code or Cursor, no port or TLS needed since the chain-tip follower only makes outbound calls. Phase 0, once ready to deploy somewhere reachable: AWS `t4g.medium` (2 vCPU/4 GiB ARM, $24.53/mo) + ~20GB EBS ($1.60/mo) + one public IPv4 ($3.65/mo, mandatory), no NAT Gateway/no ALB, all three chain processes as systemd units — **~$30/mo**, chosen over a cheaper Hetzner equivalent (~$5/mo) for single-provider consolidation into the later Fargate move. Hetzner's CAX11 plan stays on record for a future phase, not discarded. **Supabase free tier** ($0/mo) still covers the control plane only (auth, usage records) — its Edge Functions don't fit the engine itself, same reason Lambda didn't.
-
 ## Docs
 
-- [`docs/RESEARCH.md`](docs/RESEARCH.md) — full market research: landscape, gaps, EVM-vs-Solana decision, sources.
-- [`docs/PITCH_OUTLINE.md`](docs/PITCH_OUTLINE.md) — slide-by-slide pitch deck outline.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate-by-crate design.
+- [`docs/RESEARCH.md`](docs/RESEARCH.md) — market landscape, competitive position, cloud/deployment options.
+- [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) — GTM and distribution plan.
+- [`docs/PITCH_OUTLINE.md`](docs/PITCH_OUTLINE.md) — pitch deck outline.
