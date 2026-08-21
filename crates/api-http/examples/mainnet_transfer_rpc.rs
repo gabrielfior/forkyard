@@ -19,6 +19,7 @@
 //! Requires `RPC_URL` (an Ethereum mainnet endpoint) in the environment or
 //! a `.env` file at the workspace root. Run with:
 //!   cargo run -p forkyard-api-http --example mainnet_transfer_rpc
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
@@ -163,7 +164,7 @@ async fn main() -> eyre::Result<()> {
     // worker threads. Every agent below opens a session on *this* manager
     // instead of forking its own — the actual thing this example exists
     // to demonstrate.
-    let manager = SessionManager::new(fork, block_env, 4, Duration::from_secs(60));
+    let manager = Arc::new(SessionManager::new(fork, block_env, 4, Duration::from_secs(60)));
     let handle = timed!(
         "started shared RPC server",
         forkyard_api_http::serve("127.0.0.1:0", manager, 1).await?

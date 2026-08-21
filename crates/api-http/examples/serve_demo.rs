@@ -15,6 +15,7 @@
 //! all implemented now, backed by the fork's real base fee/block number —
 //! a real wallet's send-transaction flow (gas estimate, gas price, send,
 //! wait for receipt) should work end to end against a session URL.
+use std::sync::Arc;
 use std::time::Duration;
 
 use forkyard_session::SessionManager;
@@ -30,7 +31,7 @@ async fn main() -> eyre::Result<()> {
         .unwrap_or(8555);
 
     let (fork, block_env) = forkyard_fetch::fork(&rpc_url).await?;
-    let manager = SessionManager::new(fork, block_env, 4, Duration::from_secs(3600));
+    let manager = Arc::new(SessionManager::new(fork, block_env, 4, Duration::from_secs(3600)));
     let handle = forkyard_api_http::serve(&format!("127.0.0.1:{port}"), manager, 1).await?;
 
     println!("forkyard RPC listening at http://{}", handle.addr);

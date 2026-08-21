@@ -73,7 +73,7 @@ struct AppState<F: Fallback>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    manager: SessionManager<F>,
+    manager: Arc<SessionManager<F>>,
     chain_id: u64,
     rpc_state: Mutex<HashMap<SessionId, SessionRpcState>>,
 }
@@ -413,8 +413,10 @@ impl Handle {
 /// Binds a JSON-RPC server at `bind_addr` (use `"127.0.0.1:0"` for an
 /// ephemeral port) fronting `manager`. Many callers can each open their
 /// own session against the same manager — and therefore the same warm
-/// base and fetch cache — via `POST /session`.
-pub async fn serve<F: Fallback>(bind_addr: &str, manager: SessionManager<F>, chain_id: u64) -> eyre::Result<Handle>
+/// base and fetch cache — via `POST /session`. Takes `manager` as an `Arc`
+/// so `forkyard-bin` can hand the same one to `api-mcp`'s stdio surface,
+/// running alongside this HTTP server against one shared engine.
+pub async fn serve<F: Fallback>(bind_addr: &str, manager: Arc<SessionManager<F>>, chain_id: u64) -> eyre::Result<Handle>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
@@ -487,7 +489,7 @@ mod tests {
 
     fn test_state_with_block_env(block_env: revm::context::BlockEnv) -> AppState<TestFallback> {
         AppState {
-            manager: SessionManager::new(TestFallback, block_env, 1, Duration::from_secs(60)),
+            manager: Arc::new(SessionManager::new(TestFallback, block_env, 1, Duration::from_secs(60))),
             chain_id: 1,
             rpc_state: Mutex::new(HashMap::new()),
         }

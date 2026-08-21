@@ -17,6 +17,33 @@ use revm::primitives::U256;
 /// clone shares the same background fetch thread and cache.
 pub type Fork = WrapDatabaseRef<SharedBackend<Ethereum, BlockEnv>>;
 
+async fn block_env_from_provider<P: Provider<Ethereum>>(provider: &P) -> eyre::Result<BlockEnv> {
+    let block = provider
+        .get_block(BlockId::latest())
+        .await?
+        .ok_or_else(|| eyre::eyre!("upstream RPC returned no latest block"))?;
+    let header = &block.header;
+    Ok(BlockEnv {
+        number: U256::from(header.number),
+        timestamp: U256::from(header.timestamp),
+        basefee: header.base_fee_per_gas.unwrap_or(0),
+        gas_limit: header.gas_limit,
+        ..Default::default()
+    })
+}
+
+/// Fetches just the real block context (number, timestamp, base fee) for
+/// `rpc_url`'s latest block — the same lookup `fork` does once at startup,
+/// exposed standalone so `forkyard-ingest` can call it again periodically
+/// to keep a `SessionManager`'s `BlockEnv` from going stale. Opens its own
+/// short-lived provider connection each call — negligible overhead against
+/// a poll interval measured in seconds, and it keeps this crate decoupled
+/// from needing to share `fork`'s own provider instance.
+pub async fn latest_block_env(rpc_url: &str) -> eyre::Result<BlockEnv> {
+    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
+    block_env_from_provider(&provider).await
+}
+
 /// Fork `rpc_url` at its current head, returning both the fork itself and
 /// the real `BlockEnv` (number, timestamp, base fee) of the block it's
 /// pinned to. Spawns a dedicated background thread that owns the actual
@@ -35,19 +62,7 @@ pub type Fork = WrapDatabaseRef<SharedBackend<Ethereum, BlockEnv>>;
 pub async fn fork(rpc_url: &str) -> eyre::Result<(Fork, BlockEnv)> {
     let url = rpc_url.parse()?;
     let provider = ProviderBuilder::new().connect_http(url);
-
-    let block = provider
-        .get_block(BlockId::latest())
-        .await?
-        .ok_or_else(|| eyre::eyre!("upstream RPC returned no latest block"))?;
-    let header = &block.header;
-    let block_env = BlockEnv {
-        number: U256::from(header.number),
-        timestamp: U256::from(header.timestamp),
-        basefee: header.base_fee_per_gas.unwrap_or(0),
-        gas_limit: header.gas_limit,
-        ..Default::default()
-    };
+    let block_env = block_env_from_provider(&provider).await?;
 
     let meta = BlockchainDbMeta::new(block_env.clone(), rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);

@@ -19,7 +19,7 @@ use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use forkyard_engine::{BaseSnapshot, Session};
@@ -116,7 +116,7 @@ where
 {
     fallback: F,
     base: Arc<BaseSnapshot>,
-    block_env: BlockEnv,
+    block_env: Arc<RwLock<BlockEnv>>,
     workers: Vec<std_mpsc::Sender<Job<F>>>,
     counts: Vec<Arc<AtomicUsize>>,
     next_id: AtomicU64,
@@ -145,16 +145,28 @@ where
         Self {
             fallback,
             base: Arc::new(BaseSnapshot::default()),
-            block_env,
+            block_env: Arc::new(RwLock::new(block_env)),
             workers,
             counts,
             next_id: AtomicU64::new(0),
         }
     }
 
-    /// The real block every session from this manager is pinned to.
-    pub fn block_env(&self) -> &BlockEnv {
-        &self.block_env
+    /// The real block new sessions from this manager are pinned to right
+    /// now — an owned clone, not a reference, since `forkyard-ingest` can
+    /// swap this out from another thread between calls (see
+    /// `set_block_env`).
+    pub fn block_env(&self) -> BlockEnv {
+        self.block_env.read().unwrap().clone()
+    }
+
+    /// Swap the block context new sessions are forked against. Existing
+    /// sessions are unaffected — each already has its own `BlockEnv` pinned
+    /// at fork time. This is `forkyard-ingest`'s only write path into a
+    /// `SessionManager`; see its module doc for what it does and does not
+    /// keep fresh.
+    pub fn set_block_env(&self, block_env: BlockEnv) {
+        *self.block_env.write().unwrap() = block_env;
     }
 
     /// A cloned `Sender`, not a borrowed one — `Sender::clone` is a cheap
@@ -177,7 +189,7 @@ where
                 id,
                 base: Arc::clone(&self.base),
                 fallback: self.fallback.clone(),
-                block_env: self.block_env.clone(),
+                block_env: self.block_env(),
                 reply,
             })
             .map_err(|_| SessionError::WorkerGone)?;

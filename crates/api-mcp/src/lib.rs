@@ -12,6 +12,7 @@
 //! hand-writing one.
 
 use std::fmt;
+use std::sync::Arc;
 
 use forkyard_session::{Fallback, SessionId, SessionManager};
 use revm::context::TxEnv;
@@ -79,12 +80,14 @@ fn default_gas_limit() -> u64 {
 
 /// MCP tool surface for one `SessionManager<F>`. Every tool call routes
 /// straight into the manager — no HTTP, no JSON-RPC envelope, no session
-/// mutex to contend with the way `forkyard-api-http` needs one.
+/// mutex to contend with the way `forkyard-api-http` needs one. Takes the
+/// manager as an `Arc` so `forkyard-bin` can hand the same one, still owned
+/// by an `api-http` server running alongside it, to this stdio surface too.
 pub struct ForkyardMcpServer<F: Fallback>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    manager: SessionManager<F>,
+    manager: Arc<SessionManager<F>>,
     #[allow(dead_code)] // read by the tool_handler macro's generated code
     tool_router: ToolRouter<Self>,
 }
@@ -93,7 +96,7 @@ impl<F: Fallback> ForkyardMcpServer<F>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    pub fn new(manager: SessionManager<F>) -> Self {
+    pub fn new(manager: Arc<SessionManager<F>>) -> Self {
         Self { manager, tool_router: Self::tool_router() }
     }
 
@@ -252,7 +255,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_expected_tools_and_round_trips_fork_set_balance_and_advance() {
-        let manager = SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60));
+        let manager = Arc::new(SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60)));
         let server = ForkyardMcpServer::new(manager);
 
         let (server_io, client_io) = tokio::io::duplex(4096);
