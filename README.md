@@ -10,7 +10,7 @@ For a single agent, [Anvil](https://book.getfoundry.sh/anvil/) is simpler and al
 curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash
 ```
 
-Installs a prebuilt `forkyard` binary (x86_64 Linux or arm64 macOS) into `~/.forkyard/bin` — no Rust toolchain required. No release for your platform yet? [Build from source](#build-from-source) below.
+Installs a prebuilt `forkyard` binary (x86_64 Linux or arm64 macOS) into `/usr/local/bin` if writable, else `~/.local/bin` — usually already on `PATH`, no Rust toolchain required. No release for your platform yet? [Build from source](#build-from-source) below.
 
 ## Get started
 
