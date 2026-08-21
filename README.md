@@ -39,10 +39,3 @@ git clone https://github.com/gabrielfior/forkyard
 cd forkyard
 RPC_URL=... cargo run -p forkyard
 ```
-
-## Docs
-
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate-by-crate design.
-- [`docs/RESEARCH.md`](docs/RESEARCH.md) — market landscape, competitive position, cloud/deployment options.
-- [`docs/RELEASE_PLAN.md`](docs/RELEASE_PLAN.md) — GTM and distribution plan.
-- [`docs/PITCH_OUTLINE.md`](docs/PITCH_OUTLINE.md) — pitch deck outline.
