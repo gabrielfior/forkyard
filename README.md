@@ -2,6 +2,18 @@
 
 Instant, disposable forks of live EVM chain state, priced per second, built for AI agents that need to simulate before they act.
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash
+```
+
+Downloads a prebuilt `forkyard` binary for your platform (macOS/Linux, x86_64/arm64) from
+[GitHub Releases](https://github.com/gabrielfior/forkyard/releases) into `~/.forkyard/bin` —
+no Rust toolchain required. Built by `.github/workflows/release.yml` on every `v*.*.*` tag; see
+`docs/RELEASE_PLAN.md` for the rest of the distribution plan. No releases published yet? Build
+from source below.
+
 ## Try it
 
 Requires `RPC_URL` set to an Ethereum mainnet RPC endpoint (copy `.env.example` to `.env`, or export it).

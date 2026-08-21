@@ -56,10 +56,17 @@ between "single binary" (done) and "simpler than Anvil to get" (not done).
 Anvil's bar is `foundryup`: one curl command, no toolchain, prebuilt binary per platform.
 Priority order to match/beat it for agent developers specifically:
 
-1. **Prebuilt release binaries + one-line installer.** GitHub Actions matrix build (macOS
-   arm64/x64, Linux x64/arm64) → GitHub Releases → a tiny `curl -fsSL .../install.sh | bash`.
-   Removes the Rust-toolchain requirement — the single biggest friction point today. Do this
-   first; everything else builds on it.
+1. **Prebuilt release binaries + one-line installer — done 2026-08-21.**
+   `.github/workflows/release.yml` builds `x86_64`/`aarch64` for Linux and macOS on native
+   runners (no cross-compile toolchain) whenever a `v*.*.*` tag is pushed, and attaches
+   `forkyard-<target>.tar.gz` + `.sha256` to a GitHub Release via `softprops/action-gh-release`.
+   `install.sh` (repo root) detects OS/arch and installs the matching build into
+   `~/.forkyard/bin` — `curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash`.
+   **Not yet exercised for real**, since this repo has no GitHub remote configured yet: needs
+   (a) a remote pushed, (b) a first `v0.1.0` tag pushed to confirm the matrix actually builds
+   and the install script actually resolves a real release, (c) `install.sh` doesn't verify the
+   `.sha256` it downloads yet — fine for now, worth closing before pointing a wider audience at
+   the curl-pipe-bash line.
 2. **npm wrapper package** (`@forkyard/cli`, `npx forkyard`). Eliza plugins live in npm-land.
    A thin package whose postinstall fetches the right binary from (1) — same trick as esbuild/
    swc/turbo/biome — lets someone add forkyard with zero Rust awareness. Highest-leverage step

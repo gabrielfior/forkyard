@@ -1,0 +1,62 @@
+name: release
+
+# Tag-triggered: push a `v*.*.*` tag to cut a real release with attached
+# binaries. `workflow_dispatch` exists only to test the build matrix
+# without publishing anything (see the `if` guard on the release step).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for every target on purpose — no cross-compile
+          # toolchain to maintain, at the cost of one job per platform.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release -p forkyard
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/forkyard dist/forkyard
+          tar -czf forkyard-${{ matrix.target }}.tar.gz -C dist forkyard
+          shasum -a 256 forkyard-${{ matrix.target }}.tar.gz > forkyard-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forkyard-${{ matrix.target }}
+          path: |
+            forkyard-${{ matrix.target }}.tar.gz
+            forkyard-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            forkyard-${{ matrix.target }}.tar.gz
+            forkyard-${{ matrix.target }}.tar.gz.sha256
