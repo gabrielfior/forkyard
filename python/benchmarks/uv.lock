@@ -865,6 +865,8 @@ name = "forkyard-benchmarks"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "eth-account" },
+    { name = "eth-utils" },
     { name = "matplotlib" },
     { name = "pandas" },
     { name = "requests" },
@@ -878,6 +880,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "eth-account", specifier = ">=0.13.0" },
+    { name = "eth-utils", specifier = ">=5.0.0" },
     { name = "matplotlib", specifier = ">=3.9.0" },
     { name = "pandas", specifier = ">=2.2.0" },
     { name = "requests", specifier = ">=2.32.0" },

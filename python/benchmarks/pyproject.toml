@@ -5,6 +5,10 @@ description = "Multi-agent fork benchmark: forkyard (one process, N sessions) vs
 requires-python = ">=3.11.9"
 dependencies = [
     "web3>=7.16.0",
+    # Imported directly by actions.py / agent.py / backend.py, so declared
+    # explicitly rather than relied on as web3's transitive deps.
+    "eth-account>=0.13.0",
+    "eth-utils>=5.0.0",
     "requests>=2.32.0",
     "pandas>=2.2.0",
     "matplotlib>=3.9.0",

@@ -293,6 +293,11 @@ where
         // (`crates/api-mcp`), which has no equivalent route here today.
         "forkyard_discard" => {
             state.manager.discard(session_id).await?;
+            // Drop this session's block counter and receipts too. The
+            // manager forgets the session, but `rpc_state` is our own
+            // side table — left alone it grows for the life of the
+            // process, one entry per session ever opened.
+            state.rpc_state.lock().unwrap().remove(&session_id);
             Ok(json!(true))
         }
 
@@ -789,5 +794,22 @@ mod tests {
 
         let after = dispatch(&state, id, "eth_getBalance", &[json!(Address::ZERO.to_string())]).await;
         assert!(after.is_err(), "expected the discarded session to be gone");
+    }
+
+    #[tokio::test]
+    async fn discard_also_drops_the_sessions_rpc_side_state() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        // Stand in for what eth_sendRawTransaction would have recorded:
+        // this side table isn't owned by the session manager, so only the
+        // discard arm can clean it up.
+        state.rpc_state.lock().unwrap().entry(id).or_default().block_number = 3;
+
+        dispatch(&state, id, "forkyard_discard", &[]).await.unwrap();
+
+        assert!(
+            !state.rpc_state.lock().unwrap().contains_key(&id),
+            "discarding a session must not leave its receipts/block counter behind"
+        );
     }
 }
