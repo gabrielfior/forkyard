@@ -1,6 +1,6 @@
 //! The production surface: an MCP server exposing `fork` / `simulate` /
-//! `advance` / `discard` (plus the same `set_balance` test cheatcode
-//! `forkyard-api-http` has) as tools, backed directly by a
+//! `advance` / `discard` (plus the same `set_balance` and `set_storage`
+//! test cheatcodes `forkyard-api-http` has) as tools, backed directly by a
 //! `forkyard-session::SessionManager`. This is what an agent framework
 //! (Claude Code, Cursor, ElizaOS, ...) actually calls — in-process via
 //! stdio, so none of `api-http`'s JSON/HTTP serialization cost applies

@@ -8,4 +8,13 @@ dist/
 *.log
 .venv/
 __pycache__/
-docs/
+# docs/ stays untracked, EXCEPT the spec and plan that tracked source
+# files point at — otherwise a clone gets dead links. Written as `docs/*`
+# rather than `docs/` because git prunes at an excluded *directory* and
+# never evaluates the negations beneath it; the same reason
+# `docs/superpowers/*` re-excludes one level down.
+docs/*
+!docs/superpowers/
+docs/superpowers/*
+!docs/superpowers/specs/
+!docs/superpowers/plans/
