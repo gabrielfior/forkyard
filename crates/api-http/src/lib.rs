@@ -275,6 +275,19 @@ where
             Ok(json!(true))
         }
 
+        // Test-only cheatcode, same role as Anvil's `anvil_setStorageAt` —
+        // overrides a single storage slot in this session's private
+        // overlay only. Exists so an RPC client can fund an ERC-20
+        // balance (or set up any other storage-dependent scenario)
+        // without needing impersonation, which forkyard doesn't support.
+        "forkyard_setStorageAt" => {
+            let address = parse_address(params, 0)?;
+            let key = parse_u256_hex_str(param_str(params, 1)?)?;
+            let value = parse_u256_hex_str(param_str(params, 2)?)?;
+            state.manager.set_storage(session_id, address, key, value).await?;
+            Ok(json!(true))
+        }
+
         "eth_sendRawTransaction" => {
             let raw = parse_raw_tx(params, 0)?;
             let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
@@ -640,5 +653,23 @@ mod tests {
 
         // One send later: real number + 1, and the receipt agrees.
         assert_eq!(dispatch(&state, id, "eth_blockNumber", &[]).await.unwrap(), json!("0x1312d01"));
+    }
+
+    #[tokio::test]
+    async fn set_storage_at_overrides_a_slot_readable_by_a_later_call() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let address = Address::from([3u8; 20]);
+
+        let result = dispatch(
+            &state,
+            id,
+            "forkyard_setStorageAt",
+            &[json!(address.to_string()), json!("0x9"), json!(format!("0x{:064x}", 123u64))],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, json!(true));
     }
 }
