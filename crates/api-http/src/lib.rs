@@ -312,6 +312,7 @@ where
                 .caller(sender)
                 .kind(tx.to)
                 .value(tx.value)
+                .data(tx.input.clone())
                 .gas_limit(tx.gas_limit)
                 .gas_price(tx.gas_price)
                 .nonce(tx.nonce)
@@ -475,8 +476,14 @@ mod tests {
     use revm::state::{AccountInfo, Bytecode};
     use std::time::Duration;
 
-    #[derive(Clone)]
-    struct TestFallback;
+    /// A fake upstream fallback with no real data — except, optionally, one
+    /// pre-seeded `(address, bytecode)` pair, used by the calldata
+    /// regression test below to probe a real contract call without needing
+    /// a live RPC fork.
+    #[derive(Clone, Default)]
+    struct TestFallback {
+        contract: Option<(Address, Bytecode)>,
+    }
 
     #[derive(Debug)]
     struct TestFallbackError;
@@ -490,10 +497,24 @@ mod tests {
 
     impl DatabaseRef for TestFallback {
         type Error = TestFallbackError;
-        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            if let Some((contract_addr, code)) = &self.contract {
+                if *contract_addr == address {
+                    return Ok(Some(AccountInfo {
+                        code_hash: code.hash_slow(),
+                        code: Some(code.clone()),
+                        ..Default::default()
+                    }));
+                }
+            }
             Ok(Some(AccountInfo::default()))
         }
-        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+        fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+            if let Some((_, code)) = &self.contract {
+                if code.hash_slow() == code_hash {
+                    return Ok(code.clone());
+                }
+            }
             Ok(Bytecode::default())
         }
         fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
@@ -510,7 +531,23 @@ mod tests {
 
     fn test_state_with_block_env(block_env: revm::context::BlockEnv) -> AppState<TestFallback> {
         AppState {
-            manager: Arc::new(SessionManager::new(TestFallback, block_env, 1, Duration::from_secs(60))),
+            manager: Arc::new(SessionManager::new(TestFallback::default(), block_env, 1, Duration::from_secs(60))),
+            chain_id: 1,
+            rpc_state: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Like `test_state`, but the fallback also serves real bytecode at
+    /// `contract_addr` — for tests that need to actually execute a
+    /// contract's code, not just move ETH.
+    fn test_state_with_contract(contract_addr: Address, bytecode: Bytecode) -> AppState<TestFallback> {
+        AppState {
+            manager: Arc::new(SessionManager::new(
+                TestFallback { contract: Some((contract_addr, bytecode)) },
+                revm::context::BlockEnv::default(),
+                1,
+                Duration::from_secs(60),
+            )),
             chain_id: 1,
             rpc_state: Mutex::new(HashMap::new()),
         }
@@ -528,6 +565,26 @@ mod tests {
             to: TxKind::Call(to),
             value: U256::from(value),
             input: Default::default(),
+        };
+        let signature = signer.sign_transaction_sync(&mut tx).unwrap();
+        let signed = tx.into_signed(signature);
+        let raw = alloy_eips::eip2718::Encodable2718::encoded_2718(&signed);
+        format!("0x{}", alloy_primitives::hex::encode(&raw))
+    }
+
+    /// General version of `signed_transfer_hex` — arbitrary `to` (including
+    /// `TxKind::Create`), `nonce`, `gas_limit`, and `input` — for the
+    /// calldata regression test below, which needs an actual contract
+    /// deploy/call rather than a plain transfer.
+    fn signed_tx_hex(signer: &PrivateKeySigner, to: TxKind, nonce: u64, gas_limit: u64, input: Vec<u8>) -> String {
+        let mut tx = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 20_000_000_000,
+            gas_limit,
+            to,
+            value: U256::ZERO,
+            input: Bytes::from(input),
         };
         let signature = signer.sign_transaction_sync(&mut tx).unwrap();
         let signed = tx.into_signed(signature);
@@ -601,6 +658,47 @@ mod tests {
         assert_eq!(receipt["status"], json!("0x1"));
         assert_eq!(receipt["gasUsed"], json!("0x5208"));
         assert_eq!(receipt["blockNumber"], json!("0x1"));
+    }
+
+    /// Regression test for a real bug caught live via the Python
+    /// benchmark's manual smoke test (`docs/superpowers/plans/2026-08-26-agent-fork-benchmark.md`
+    /// Task 12): `eth_sendRawTransaction`'s `TxEnv::builder()` never called
+    /// `.data(...)`, so every transaction's calldata was silently dropped.
+    /// A plain ETH transfer never noticed (its input is empty either way),
+    /// but any real contract call executed with empty calldata instead of
+    /// the real one — which is why the benchmark's DAI `approve` action
+    /// reverted against forkyard while succeeding against Anvil at the same
+    /// block. Pre-seeds a contract whose code REVERTs when called with
+    /// empty calldata and succeeds otherwise, then calls it with one byte
+    /// of calldata — a direct, fork-free probe that calldata actually
+    /// reaches the EVM.
+    #[tokio::test]
+    async fn send_raw_transaction_actually_passes_calldata_to_the_contract() {
+        // CALLDATASIZE ISZERO PUSH1 6 JUMPI STOP JUMPDEST PUSH1 0 PUSH1 0
+        // REVERT — i.e. revert iff calldatasize == 0.
+        let code = alloy_primitives::hex::decode("3615600657005b60006000fd").unwrap();
+        let contract_addr = Address::from([0xABu8; 20]);
+        let state = test_state_with_contract(contract_addr, Bytecode::new_raw(Bytes::from(code)));
+        let id = state.manager.fork().await.unwrap();
+
+        let sender = PrivateKeySigner::random();
+        dispatch(
+            &state,
+            id,
+            "forkyard_setBalance",
+            &[json!(sender.address().to_string()), json!("0xde0b6b3a7640000")], // 1 ETH
+        )
+        .await
+        .unwrap();
+
+        let call_hex = signed_tx_hex(&sender, TxKind::Call(contract_addr), 0, 100_000, vec![0x01]);
+        let call_hash = dispatch(&state, id, "eth_sendRawTransaction", &[json!(call_hex)]).await.unwrap();
+        let call_receipt = dispatch(&state, id, "eth_getTransactionReceipt", &[call_hash]).await.unwrap();
+        assert_eq!(
+            call_receipt["status"],
+            json!("0x1"),
+            "calldata must actually reach the EVM — a dropped `data` field makes this revert"
+        );
     }
 
     #[tokio::test]
