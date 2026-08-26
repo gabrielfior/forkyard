@@ -50,3 +50,22 @@ def test_run_agent_always_ends_with_discard_and_starts_with_funding():
     assert records[-1].action == "discard"
     assert len(records) == 1 + 3 + 1  # funding + num_actions + discard
     assert all(r.block_height == 20_000_000 and r.num_agents == 1 and r.agent_id == 0 for r in records)
+
+
+def test_run_agent_respects_the_fund_approve_swap_dependency_order():
+    backend = FakeBackend()
+    rng = random.Random(42)
+
+    records = run_agent(backend, rng, agent_id=0, block_height=20_000_000, num_agents=1, num_actions=30)
+    actions = [r.action for r in records]
+
+    first_fund_idx = next((i for i, a in enumerate(actions) if a == "fund_token"), None)
+    first_approve_idx = next((i for i, a in enumerate(actions) if a == "approve"), None)
+    first_swap_idx = next((i for i, a in enumerate(actions) if a == "swap_token_for_token"), None)
+
+    if first_approve_idx is not None:
+        assert first_fund_idx is not None and first_fund_idx < first_approve_idx, \
+            "approve appeared before any fund_token"
+    if first_swap_idx is not None:
+        assert first_approve_idx is not None and first_approve_idx < first_swap_idx, \
+            "swap_token_for_token appeared before any approve"
