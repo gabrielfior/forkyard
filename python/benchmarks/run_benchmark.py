@@ -1,0 +1,158 @@
+"""CLI entrypoint: sweeps (backend, block_height, num_agents) and records
+per-action + per-run timings to a CSV. See
+docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md."""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import csv
+import os
+import random
+import subprocess
+import sys
+import time
+from typing import IO
+
+import requests
+
+from agent import ActionRecord, run_agent
+from backend import AnvilBackend, ForkyardBackend
+
+FIELDS = ["backend", "block_height", "num_agents", "agent_id", "action", "elapsed_ms", "ok"]
+
+
+def parse_int_list(s: str) -> list[int]:
+    return [int(x) for x in s.split(",")]
+
+
+def write_records(out: IO[str], records: list[ActionRecord]) -> None:
+    writer = csv.DictWriter(out, fieldnames=FIELDS)
+    writer.writeheader()
+    for r in records:
+        writer.writerow(
+            {
+                "backend": r.backend,
+                "block_height": r.block_height,
+                "num_agents": r.num_agents,
+                "agent_id": r.agent_id,
+                "action": r.action,
+                "elapsed_ms": r.elapsed_ms,
+                "ok": r.ok,
+            }
+        )
+
+
+def _wait_for_forkyard(base_url: str, timeout_s: float = 20.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            resp = requests.post(f"{base_url}/session", timeout=1)
+            if resp.ok:
+                return
+        except requests.RequestException as e:
+            last_error = e
+        time.sleep(0.2)
+    raise RuntimeError(f"forkyard on {base_url} did not become ready in {timeout_s}s: {last_error}")
+
+
+def run_forkyard_sweep(
+    rpc_url: str, block_height: int, num_agents: int, actions_per_agent: int, port: int, mcp_port: int
+) -> tuple[list[ActionRecord], float]:
+    env = {
+        **os.environ,
+        "RPC_URL": rpc_url,
+        "FORKYARD_PORT": str(port),
+        "FORKYARD_MCP_HTTP_PORT": str(mcp_port),
+        "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
+    }
+    try:
+        process = subprocess.Popen(["forkyard"], env=env)
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            "the `forkyard` binary was not found on PATH — build it with "
+            "`cargo build -p forkyard --release` and add target/release to PATH"
+        ) from e
+    base_url = f"http://127.0.0.1:{port}"
+    try:
+        _wait_for_forkyard(base_url)
+        session_urls = []
+        for _ in range(num_agents):
+            resp = requests.post(f"{base_url}/session", timeout=5).json()
+            session_urls.append(f"{base_url}/session/{resp['session_id']}")
+
+        start = time.monotonic()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
+            futures = [
+                pool.submit(
+                    run_agent,
+                    ForkyardBackend(session_urls[i]),
+                    random.Random(i),
+                    i,
+                    block_height,
+                    num_agents,
+                    actions_per_agent,
+                )
+                for i in range(num_agents)
+            ]
+            all_records = [r for f in futures for r in f.result()]
+        total_ms = (time.monotonic() - start) * 1000
+        return all_records, total_ms
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+
+
+def run_anvil_sweep(
+    rpc_url: str, block_height: int, num_agents: int, actions_per_agent: int, base_port: int
+) -> tuple[list[ActionRecord], float]:
+    start = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
+        futures = [
+            pool.submit(
+                lambda i=i: run_agent(
+                    AnvilBackend(base_port + i, rpc_url, block_height),
+                    random.Random(i),
+                    i,
+                    block_height,
+                    num_agents,
+                    actions_per_agent,
+                )
+            )
+            for i in range(num_agents)
+        ]
+        all_records = [r for f in futures for r in f.result()]
+    total_ms = (time.monotonic() - start) * 1000
+    return all_records, total_ms
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--agents", type=parse_int_list, required=True)
+    parser.add_argument("--block-heights", type=parse_int_list, required=True)
+    parser.add_argument("--actions-per-agent", type=int, default=5)
+    parser.add_argument("--rpc-url", required=True)
+    parser.add_argument("--out", default="results.csv")
+    args = parser.parse_args()
+
+    all_records: list[ActionRecord] = []
+    for block_height in args.block_heights:
+        for num_agents in args.agents:
+            for sweep_fn, label in [
+                (lambda: run_forkyard_sweep(args.rpc_url, block_height, num_agents, args.actions_per_agent, 18555, 18556), "forkyard"),
+                (lambda: run_anvil_sweep(args.rpc_url, block_height, num_agents, args.actions_per_agent, 19000), "anvil"),
+            ]:
+                print(f"running {label}: block={block_height} agents={num_agents}", file=sys.stderr)
+                records, total_ms = sweep_fn()
+                all_records.extend(records)
+                all_records.append(
+                    ActionRecord(label, block_height, num_agents, -1, "__total__", total_ms, True)
+                )
+
+    with open(args.out, "w", newline="") as f:
+        write_records(f, all_records)
+
+
+if __name__ == "__main__":
+    main()
