@@ -47,8 +47,13 @@ async fn main() -> eyre::Result<()> {
     let ttl_secs: u64 = env_or("FORKYARD_SESSION_TTL_SECS", 3600);
     let ingest_poll_secs: u64 = env_or("FORKYARD_INGEST_POLL_SECS", 12);
     let chain_id: u64 = env_or("FORKYARD_CHAIN_ID", 1);
+    let fork_block_number: Option<u64> =
+        std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
-    let (fork, block_env) = forkyard_fetch::fork(&rpc_url).await?;
+    let (fork, block_env) = match fork_block_number {
+        Some(n) => forkyard_fetch::fork_at(&rpc_url, n).await?,
+        None => forkyard_fetch::fork(&rpc_url).await?,
+    };
     let manager = Arc::new(SessionManager::new(
         fork,
         block_env,
@@ -57,15 +62,25 @@ async fn main() -> eyre::Result<()> {
     ));
     tracing::info!(num_workers, ttl_secs, "forked upstream chain, session manager ready");
 
-    // Background chain-tip follower — re-forks a fresh fallback whenever
-    // the chain actually advances, not just the block number label; see
-    // forkyard-ingest's module doc for exactly what stays bounded-stale.
-    let (ingest_stop_tx, ingest_stop_rx) = tokio::sync::oneshot::channel();
-    let ingest_manager = Arc::clone(&manager);
-    let ingest_task = tokio::spawn(async move {
-        let follower = ChainTipFollower::new(rpc_url, Duration::from_secs(ingest_poll_secs));
-        follower.run(&ingest_manager, ingest_stop_rx).await;
-    });
+    // Background chain-tip follower — only when the fork isn't pinned to an
+    // explicit block. A pinned historical block and "keep following the
+    // tip" are contradictory: re-forking to a newer block would silently
+    // defeat the whole point of FORKYARD_FORK_BLOCK_NUMBER.
+    let ingest_handle = match fork_block_number {
+        Some(n) => {
+            tracing::info!(block = n, "fork pinned to an explicit block; chain-tip following disabled");
+            None
+        }
+        None => {
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+            let ingest_manager = Arc::clone(&manager);
+            let task = tokio::spawn(async move {
+                let follower = ChainTipFollower::new(rpc_url, Duration::from_secs(ingest_poll_secs));
+                follower.run(&ingest_manager, stop_rx).await;
+            });
+            Some((stop_tx, task))
+        }
+    };
 
     let http_handle = forkyard_api_http::serve(&format!("127.0.0.1:{port}"), Arc::clone(&manager), chain_id).await?;
     tracing::info!(addr = %http_handle.addr, "HTTP JSON-RPC surface listening — shared cache reachable over the network");
@@ -95,8 +110,10 @@ async fn main() -> eyre::Result<()> {
 
     wait_for_shutdown_signal().await;
 
-    let _ = ingest_stop_tx.send(());
-    let _ = ingest_task.await;
+    if let Some((stop_tx, task)) = ingest_handle {
+        let _ = stop_tx.send(());
+        let _ = task.await;
+    }
     http_handle.shutdown().await;
     mcp_http_handle.shutdown().await;
 
