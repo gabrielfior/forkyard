@@ -116,6 +116,16 @@ impl<F: DatabaseRef> Session<F> {
     pub fn set_account(&mut self, address: Address, info: AccountInfo) {
         self.overlay_accounts.insert(address, info);
     }
+
+    /// Override a single storage slot directly in this session's private
+    /// overlay — the same test-only cheatcode role `set_account` plays for
+    /// balance/nonce, here for arbitrary contract storage (e.g. writing an
+    /// ERC-20 `balanceOf` mapping entry directly, since there's no faucet
+    /// or impersonation to fund tokens the normal way). Never touches the
+    /// shared base or the real chain. Mirrors Anvil's `anvil_setStorageAt`.
+    pub fn set_storage(&mut self, address: Address, key: StorageKey, value: StorageValue) {
+        self.overlay_storage.insert((address, key), value);
+    }
 }
 
 /// Surfaced when a read misses the session overlay, the shared base, *and*
@@ -257,5 +267,18 @@ mod tests {
 
         let mut b = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
         assert!(b.basic(addr).is_err(), "sibling session must not see a's overlay");
+    }
+
+    #[test]
+    fn set_storage_overrides_the_overlay_and_reads_back() {
+        let base = Arc::new(BaseSnapshot::default());
+        let mut session = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let address = Address::from([0x11; 20]);
+        let key = StorageKey::from(7u64);
+        let value = StorageValue::from(42u64);
+
+        session.set_storage(address, key, value);
+
+        assert_eq!(Database::storage(&mut session, address, key).unwrap(), value);
     }
 }
