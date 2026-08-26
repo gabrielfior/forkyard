@@ -26,7 +26,7 @@ use forkyard_engine::{BaseSnapshot, Session};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
-use revm::primitives::Address;
+use revm::primitives::{Address, StorageKey, StorageValue};
 use revm::state::AccountInfo;
 use revm::{Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::oneshot;
@@ -102,6 +102,13 @@ enum Job<F> {
         id: SessionId,
         address: Address,
         info: AccountInfo,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    SetStorage {
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
 }
@@ -233,6 +240,23 @@ where
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
             .send(Job::SetAccount { id, address, info, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
+    /// Override a single storage slot directly in `id`'s private overlay —
+    /// the test-only cheatcode role, never touching the shared base or the
+    /// real chain. See `Session::set_storage`.
+    pub async fn set_storage(
+        &self,
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+        value: StorageValue,
+    ) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::SetStorage { id, address, key, value, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?
     }
@@ -379,6 +403,17 @@ where
                 Some((session, touched)) => {
                     *touched = Instant::now();
                     session.set_account(address, info);
+                    Ok(())
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
+        }
+        Job::SetStorage { id, address, key, value, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    session.set_storage(address, key, value);
                     Ok(())
                 }
                 None => Err(SessionError::Unknown(id)),
@@ -550,6 +585,24 @@ mod tests {
         assert_eq!(mgr.active_session_count(), 0);
         let tx = TxEnv::builder().build_fill();
         assert!(matches!(mgr.simulate(id, tx).await, Err(SessionError::Unknown(_))));
+    }
+
+    #[tokio::test]
+    async fn set_storage_overrides_a_slot_in_the_sessions_overlay() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+        let address = Address::from([0x22; 20]);
+        let key = U256::from(9u64);
+        let value = U256::from(123u64);
+
+        mgr.set_storage(id, address, key, value).await.unwrap();
+
+        // No direct storage-read accessor exists on SessionManager today,
+        // so this only proves set_storage doesn't error and reaches the
+        // right session (the wrong-id case would surface as
+        // SessionError::Unknown from the .unwrap() above). A full
+        // write-then-read-back is covered at the forkyard-engine level
+        // (Task 3's test).
     }
 
     #[tokio::test]
