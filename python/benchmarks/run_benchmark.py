@@ -20,7 +20,7 @@ import requests
 from agent import ActionRecord, run_agent
 from backend import AnvilBackend, ForkyardBackend
 
-FIELDS = ["backend", "block_height", "num_agents", "agent_id", "action", "elapsed_ms", "ok"]
+FIELDS = ["backend", "block_height", "num_agents", "agent_id", "action", "elapsed_ms", "ok", "error"]
 
 
 def parse_int_list(s: str) -> list[int]:
@@ -36,6 +36,7 @@ def _row(r: ActionRecord) -> dict[str, object]:
         "action": r.action,
         "elapsed_ms": r.elapsed_ms,
         "ok": r.ok,
+        "error": r.error,
     }
 
 
@@ -206,7 +207,7 @@ def main() -> None:
                         *records,
                         ActionRecord(
                             label, block_height, num_agents, -1, "__total__", total_ms,
-                            all(r.ok for r in records),
+                            all(r.ok for r in records), "",
                         ),
                     ]
                     writer.writerows(_row(r) for r in combination)

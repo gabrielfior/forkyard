@@ -1,5 +1,5 @@
 """One function per simulated-agent action, each timed and returning
-(label, elapsed_ms, ok). See docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md
+(label, elapsed_ms, ok, error). See docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md
 for why this specific set (no eth_call, no impersonation, no generic
 ERC-20 faucet on the RPC surface — only what forkyard_setStorageAt /
 anvil_setStorageAt make possible)."""
@@ -14,7 +14,13 @@ from web3 import Web3
 
 from backend import Backend, erc20_balance_slot
 
-ActionResult = tuple[str, float, bool]
+# (label, elapsed_ms, ok, error) — `error` is `repr(exception)` truncated
+# to _MAX_ERROR_CHARS on failure, "" on success. Without it an ok=False row
+# is indistinguishable between a revert, a nonce rejection, an HTTP
+# timeout, and a bug in the harness itself.
+ActionResult = tuple[str, float, bool, str]
+
+_MAX_ERROR_CHARS = 200
 
 UNISWAP_V2_ROUTER = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
 WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
@@ -62,11 +68,11 @@ def _timed(label: str, fn: Callable[[], None]) -> ActionResult:
     start = time.monotonic()
     try:
         fn()
-        ok = True
-    except Exception:
-        ok = False
+        ok, error = True, ""
+    except Exception as e:
+        ok, error = False, repr(e)[:_MAX_ERROR_CHARS]
     elapsed_ms = (time.monotonic() - start) * 1000
-    return (label, elapsed_ms, ok)
+    return (label, elapsed_ms, ok, error)
 
 
 def _send_signed(w3: Web3, signer_key: str, to: str, value: int, data: bytes, nonce: int, gas: int) -> None:

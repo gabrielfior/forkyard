@@ -8,12 +8,12 @@ from plot_results import plot_action_latency, plot_total_time_vs_agents
 def _sample_df() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 1, "agent_id": -1, "action": "__total__", "elapsed_ms": 100.0, "ok": True},
-            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 2, "agent_id": -1, "action": "__total__", "elapsed_ms": 150.0, "ok": True},
-            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 1, "agent_id": -1, "action": "__total__", "elapsed_ms": 300.0, "ok": True},
-            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 2, "agent_id": -1, "action": "__total__", "elapsed_ms": 600.0, "ok": True},
-            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 1, "agent_id": 0, "action": "transfer", "elapsed_ms": 5.0, "ok": True},
-            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 1, "agent_id": 0, "action": "transfer", "elapsed_ms": 8.0, "ok": True},
+            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 1, "agent_id": -1, "action": "__total__", "elapsed_ms": 100.0, "ok": True, "error": ""},
+            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 2, "agent_id": -1, "action": "__total__", "elapsed_ms": 150.0, "ok": True, "error": ""},
+            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 1, "agent_id": -1, "action": "__total__", "elapsed_ms": 300.0, "ok": True, "error": ""},
+            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 2, "agent_id": -1, "action": "__total__", "elapsed_ms": 600.0, "ok": True, "error": ""},
+            {"backend": "forkyard", "block_height": 20_000_000, "num_agents": 1, "agent_id": 0, "action": "transfer", "elapsed_ms": 5.0, "ok": True, "error": ""},
+            {"backend": "anvil", "block_height": 20_000_000, "num_agents": 1, "agent_id": 0, "action": "transfer", "elapsed_ms": 8.0, "ok": True, "error": ""},
         ]
     )
 

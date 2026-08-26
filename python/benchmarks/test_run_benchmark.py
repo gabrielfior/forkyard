@@ -27,6 +27,21 @@ def test_write_records_produces_one_csv_row_per_record():
     assert rows[1]["backend"] == "forkyard"
 
 
+def test_write_records_carries_the_error_column_for_failed_actions():
+    records = [
+        ActionRecord("anvil", 20_000_000, 1, 0, "transfer", 4.0, False, "RuntimeError('tx reverted')"),
+        ActionRecord("anvil", 20_000_000, 1, 0, "get_balance", 1.0, True, ""),
+    ]
+    buf = io.StringIO()
+    write_records(buf, records)
+    reader = csv.DictReader(io.StringIO(buf.getvalue()))
+    rows = list(reader)
+    assert reader.fieldnames == FIELDS
+    assert FIELDS[-1] == "error", "error stays last so consumers of the first 7 columns still work"
+    assert rows[0]["error"] == "RuntimeError('tx reverted')"
+    assert rows[1]["error"] == ""
+
+
 def test_check_binaries_on_path_names_every_missing_binary(monkeypatch):
     monkeypatch.setattr(run_benchmark.shutil, "which", lambda name: None)
     with pytest.raises(RuntimeError) as excinfo:

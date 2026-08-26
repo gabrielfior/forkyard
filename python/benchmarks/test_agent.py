@@ -1,5 +1,7 @@
 import random
 
+import agent as agent_module
+from actions import TOKENS, WETH
 from agent import ActionRecord, run_agent
 
 
@@ -69,3 +71,43 @@ def test_run_agent_respects_the_fund_approve_swap_dependency_order():
     if first_swap_idx is not None:
         assert first_approve_idx is not None and first_approve_idx < first_swap_idx, \
             "swap_token_for_token appeared before any approve"
+
+
+def test_swap_token_for_token_never_self_swaps(monkeypatch):
+    """A DAI->DAI self-swap reverts every time. With a single-entry TOKENS
+    registry the old `or [token_in]` fallback guaranteed exactly that, so
+    the action could never once succeed."""
+    seen: list[tuple[str, str]] = []
+    real_swap = agent_module.swap_token_for_token
+
+    def spy(backend, signer_key, token_in, token_out, amount_in, nonce):
+        seen.append((token_in, token_out))
+        return real_swap(backend, signer_key, token_in, token_out, amount_in, nonce)
+
+    monkeypatch.setattr(agent_module, "swap_token_for_token", spy)
+
+    for seed in range(20):
+        run_agent(
+            FakeBackend(), random.Random(seed),
+            agent_id=0, block_height=20_000_000, num_agents=1, num_actions=40,
+        )
+
+    assert seen, "no swap_token_for_token action was ever chosen across 20 seeds"
+    known = {t["address"] for t in TOKENS.values()} | {WETH}
+    for token_in, token_out in seen:
+        assert token_out != token_in, f"self-swap on {token_in}"
+        assert token_out in known, f"unknown token_out {token_out}"
+
+
+def test_run_agent_records_carry_an_error_string_for_failed_actions():
+    # FakeBackend has no send_raw_transaction, so every tx-sending action
+    # fails — which is exactly what makes the error field observable here.
+    records = run_agent(
+        FakeBackend(), random.Random(42),
+        agent_id=0, block_height=20_000_000, num_agents=1, num_actions=20,
+    )
+
+    failed = [r for r in records if not r.ok]
+    assert failed, "expected the fake backend's tx sends to fail"
+    assert all(r.error for r in failed), "every failed record must carry a diagnostic"
+    assert all(r.error == "" for r in records if r.ok)
