@@ -9,6 +9,7 @@ import concurrent.futures
 import csv
 import os
 import random
+import shutil
 import subprocess
 import sys
 import time
@@ -26,21 +27,41 @@ def parse_int_list(s: str) -> list[int]:
     return [int(x) for x in s.split(",")]
 
 
+def _row(r: ActionRecord) -> dict[str, object]:
+    return {
+        "backend": r.backend,
+        "block_height": r.block_height,
+        "num_agents": r.num_agents,
+        "agent_id": r.agent_id,
+        "action": r.action,
+        "elapsed_ms": r.elapsed_ms,
+        "ok": r.ok,
+    }
+
+
 def write_records(out: IO[str], records: list[ActionRecord]) -> None:
     writer = csv.DictWriter(out, fieldnames=FIELDS)
     writer.writeheader()
-    for r in records:
-        writer.writerow(
-            {
-                "backend": r.backend,
-                "block_height": r.block_height,
-                "num_agents": r.num_agents,
-                "agent_id": r.agent_id,
-                "action": r.action,
-                "elapsed_ms": r.elapsed_ms,
-                "ok": r.ok,
-            }
+    writer.writerows(_row(r) for r in records)
+
+
+def _check_binaries_on_path() -> None:
+    """Fail before any sweep runs rather than deep inside a worker thread
+    on the first Anvil sweep — by which point the whole forkyard half has
+    already been run and would be thrown away."""
+    missing = []
+    if shutil.which("forkyard") is None:
+        missing.append(
+            "the `forkyard` binary was not found on PATH — build it with "
+            "`cargo build -p forkyard --release` and add target/release to PATH"
         )
+    if shutil.which("anvil") is None:
+        missing.append(
+            "the `anvil` binary was not found on PATH — install Foundry "
+            "(https://book.getfoundry.sh/getting-started/installation) before running the Anvil backend"
+        )
+    if missing:
+        raise RuntimeError("; ".join(missing))
 
 
 def _terminate(process: subprocess.Popen) -> None:
@@ -163,22 +184,33 @@ def main() -> None:
     parser.add_argument("--out", default="results.csv")
     args = parser.parse_args()
 
-    all_records: list[ActionRecord] = []
-    for block_height in args.block_heights:
-        for num_agents in args.agents:
-            for sweep_fn, label in [
-                (lambda: run_forkyard_sweep(args.rpc_url, block_height, num_agents, args.actions_per_agent, 18555, 18556), "forkyard"),
-                (lambda: run_anvil_sweep(args.rpc_url, block_height, num_agents, args.actions_per_agent, 19000), "anvil"),
-            ]:
-                print(f"running {label}: block={block_height} agents={num_agents}", file=sys.stderr)
-                records, total_ms = sweep_fn()
-                all_records.extend(records)
-                all_records.append(
-                    ActionRecord(label, block_height, num_agents, -1, "__total__", total_ms, True)
-                )
+    _check_binaries_on_path()
 
+    # Flush after every (block_height, num_agents, backend) combination so
+    # a failure part-way through a long sweep keeps everything collected up
+    # to that point instead of discarding the whole run.
     with open(args.out, "w", newline="") as f:
-        write_records(f, all_records)
+        writer = csv.DictWriter(f, fieldnames=FIELDS)
+        writer.writeheader()
+        f.flush()
+
+        for block_height in args.block_heights:
+            for num_agents in args.agents:
+                for sweep_fn, label in [
+                    (lambda bh=block_height, na=num_agents: run_forkyard_sweep(args.rpc_url, bh, na, args.actions_per_agent, 18555, 18556), "forkyard"),
+                    (lambda bh=block_height, na=num_agents: run_anvil_sweep(args.rpc_url, bh, na, args.actions_per_agent, 19000), "anvil"),
+                ]:
+                    print(f"running {label}: block={block_height} agents={num_agents}", file=sys.stderr)
+                    records, total_ms = sweep_fn()
+                    combination = [
+                        *records,
+                        ActionRecord(
+                            label, block_height, num_agents, -1, "__total__", total_ms,
+                            all(r.ok for r in records),
+                        ),
+                    ]
+                    writer.writerows(_row(r) for r in combination)
+                    f.flush()
 
 
 if __name__ == "__main__":
