@@ -34,14 +34,34 @@ class Backend(Protocol):
     def discard(self) -> None: ...
 
 
+def open_forkyard_session(base_url: str, timeout_s: float = 30.0) -> str:
+    """Open a fresh session on an already-running forkyard process and
+    return its JSON-RPC URL. Split out of `ForkyardBackend.__init__` so a
+    caller can measure the session-open cost inside its own timed region
+    (see run_benchmark.py: this is forkyard's per-agent analogue of
+    `AnvilBackend.__init__` spawning + waiting for an Anvil process)."""
+    resp = requests.post(f"{base_url}/session", timeout=timeout_s)
+    resp.raise_for_status()
+    return f"{base_url}/session/{resp.json()['session_id']}"
+
+
 class ForkyardBackend:
     """One forkyard session, opened against an already-running forkyard
     process's shared cache. `discard()` calls forkyard_discard rather than
-    tearing down any process — the process outlives every session."""
+    tearing down any process — the process outlives every session.
+
+    Pass `base_url` (e.g. `http://127.0.0.1:18555`) to have the session
+    opened here, mirroring how `AnvilBackend.__init__` acquires its own
+    environment; pass `session_url` to reuse an already-open session."""
 
     name = "forkyard"
 
-    def __init__(self, session_url: str):
+    def __init__(self, session_url: str | None = None, *, base_url: str | None = None):
+        if (session_url is None) == (base_url is None):
+            raise ValueError("pass exactly one of session_url or base_url")
+        if session_url is None:
+            assert base_url is not None
+            session_url = open_forkyard_session(base_url)
         self._w3 = Web3(Web3.HTTPProvider(session_url))
 
     def web3(self) -> Web3:
@@ -82,8 +102,25 @@ class AnvilBackend:
                 "(https://book.getfoundry.sh/getting-started/installation) before running the Anvil backend"
             ) from e
         self._url = f"http://127.0.0.1:{port}"
-        self._wait_until_ready(startup_timeout_s)
+        try:
+            self._wait_until_ready(startup_timeout_s)
+        except BaseException:
+            # Never leave an orphaned anvil holding `port`: the sweep
+            # assigns ports as `base_port + agent_index`, so a survivor
+            # here would poison that index for every later sweep.
+            self._terminate_process()
+            raise
         self._w3 = Web3(Web3.HTTPProvider(self._url))
+
+    def _terminate_process(self) -> None:
+        """terminate → wait → kill → wait, so this always returns with the
+        process confirmed dead (or raises, having tried both signals)."""
+        self._process.terminate()
+        try:
+            self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            self._process.wait(timeout=5)
 
     def _wait_until_ready(self, timeout_s: float) -> None:
         deadline = time.monotonic() + timeout_s
@@ -112,9 +149,4 @@ class AnvilBackend:
         self._w3.manager.request_blocking("anvil_setStorageAt", [address, slot_hex, value_hex])
 
     def discard(self) -> None:
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait(timeout=5)
+        self._terminate_process()

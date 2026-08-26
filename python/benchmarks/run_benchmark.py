@@ -43,6 +43,22 @@ def write_records(out: IO[str], records: list[ActionRecord]) -> None:
         )
 
 
+def _terminate(process: subprocess.Popen) -> None:
+    """terminate → wait → kill → wait. The kill fallback matters in a
+    `finally`: a bare `wait(timeout=...)` that expires would raise out of
+    the `finally`, masking the in-flight exception AND leaving an orphaned
+    forkyard holding the sweep's fixed port."""
+    process.terminate()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            print(f"warning: forkyard pid {process.pid} survived SIGKILL", file=sys.stderr)
+
+
 def _wait_for_forkyard(base_url: str, timeout_s: float = 20.0) -> None:
     deadline = time.monotonic() + timeout_s
     last_error: Exception | None = None
@@ -77,22 +93,28 @@ def run_forkyard_sweep(
     base_url = f"http://127.0.0.1:{port}"
     try:
         _wait_for_forkyard(base_url)
-        session_urls = []
-        for _ in range(num_agents):
-            resp = requests.post(f"{base_url}/session", timeout=5).json()
-            session_urls.append(f"{base_url}/session/{resp['session_id']}")
 
+        # The timed region INCLUDES, per agent: opening its own forkyard
+        # session, its whole action sequence, and its discard. It EXCLUDES
+        # the one-time `forkyard` process startup above, which is a shared
+        # cost with no Anvil analogue. This mirrors `run_anvil_sweep`
+        # exactly — there, each worker's `AnvilBackend(...)` construction
+        # (spawn + wait-until-ready) is likewise inside the timer. Keep
+        # both sides symmetric: never hoist session-open back out of the
+        # pool, or forkyard stops paying its per-agent setup cost while
+        # Anvil still pays its own.
         start = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
             futures = [
                 pool.submit(
-                    run_agent,
-                    ForkyardBackend(session_urls[i]),
-                    random.Random(i),
-                    i,
-                    block_height,
-                    num_agents,
-                    actions_per_agent,
+                    lambda i=i: run_agent(
+                        ForkyardBackend(base_url=base_url),
+                        random.Random(i),
+                        i,
+                        block_height,
+                        num_agents,
+                        actions_per_agent,
+                    )
                 )
                 for i in range(num_agents)
             ]
@@ -100,13 +122,18 @@ def run_forkyard_sweep(
         total_ms = (time.monotonic() - start) * 1000
         return all_records, total_ms
     finally:
-        process.terminate()
-        process.wait(timeout=10)
+        _terminate(process)
 
 
 def run_anvil_sweep(
     rpc_url: str, block_height: int, num_agents: int, actions_per_agent: int, base_port: int
 ) -> tuple[list[ActionRecord], float]:
+    # The timed region INCLUDES, per agent: spawning its own Anvil and
+    # waiting until it is ready (`AnvilBackend.__init__`, inline in the
+    # closure below), its whole action sequence, and its discard (which
+    # kills that Anvil). Anvil has no shared one-time startup to exclude,
+    # which is exactly why `run_forkyard_sweep` excludes only forkyard's
+    # single shared process start and times everything per-agent.
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
         futures = [
