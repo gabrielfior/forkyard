@@ -56,6 +56,25 @@ The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, bu
 - **Gas fees are burned to the zero address** — forkyard never sets a block beneficiary, so `advance`'s `gas_used * gas_price` debit lands on `0x0000…0000`, not a miner/validator.
 - **Three cheatcodes live on the JSON-RPC surface, not just MCP** — alongside `forkyard_setBalance` there's `forkyard_setStorageAt(address, slot, value)`, which writes one raw storage slot in that session's overlay (how you mint yourself an ERC-20 balance: compute the `balanceOf` mapping slot and set it — see `python/benchmarks/backend.py`), and `forkyard_discard()`, the HTTP counterpart to the `discard` MCP tool for tearing a session down ahead of its TTL. All three affect only the calling session's overlay.
 
+## Benchmark
+
+`python/benchmarks/` compares forkyard (one process, N forked sessions) against N standalone Anvil processes — one per agent — each running the same randomized action sequence against the same forked block via the same RPC endpoint.
+
+At 10 concurrent agents, the only tier where both backends completed: forkyard finished in **4.6s** (100% action success) vs Anvil's **14.3s** (78%).
+
+Pushing further (50-1000 agents) never stressed local memory — it hit the RPC provider's rate limit instead, and the two architectures failed at that wall very differently:
+
+| Concurrent agents | forkyard action success | Anvil instances that started |
+| --- | --- | --- |
+| 10 | 100% | 100% (10/10) |
+| 50 | 90.4% | **0%** |
+| 100 | 85.9% | 0% |
+| 250 | 50.7% | 0% |
+| 500 | 44.6% | 0% |
+| 1000 | 38.6% | 0% |
+
+Anvil forks a fully independent backend per agent (N× the RPC load) and collapsed at just 50 agents; forkyard shares one fetch cache across every session and degraded gracefully instead (though it too starts timing out internally at 1000-way concurrency — a bottleneck of its own). Read this as directional evidence under RPC-quota pressure, not a precise "Nx faster" claim — see `python/benchmarks/README.md` to reproduce.
+
 ## Build from source
 
 ```bash
