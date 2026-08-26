@@ -229,7 +229,11 @@ where
 
         // The fork's real starting block number plus this session's own
         // send-count — see module doc.
-        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id)))),
+        "eth_blockNumber" => {
+            // Validate that the session exists
+            let _ = state.manager.basic(session_id, Address::ZERO).await?;
+            Ok(json!(format!("0x{:x}", real_block_number(state, session_id))))
+        }
 
         // Real base fee (from the fork's actual block) plus a fixed
         // priority-fee margin — see module doc.
@@ -285,6 +289,14 @@ where
             let key = parse_u256_hex_str(param_str(params, 1)?)?;
             let value = parse_u256_hex_str(param_str(params, 2)?)?;
             state.manager.set_storage(session_id, address, key, value).await?;
+            Ok(json!(true))
+        }
+
+        // Explicit session teardown ahead of its TTL, over the JSON-RPC
+        // surface — the HTTP-side counterpart to the `discard` MCP tool
+        // (`crates/api-mcp`), which has no equivalent route here today.
+        "forkyard_discard" => {
+            state.manager.discard(session_id).await?;
             Ok(json!(true))
         }
 
@@ -671,5 +683,17 @@ mod tests {
         .unwrap();
 
         assert_eq!(result, json!(true));
+    }
+
+    #[tokio::test]
+    async fn discard_ends_the_session_so_later_calls_fail() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        let result = dispatch(&state, id, "forkyard_discard", &[]).await.unwrap();
+        assert_eq!(result, json!(true));
+
+        let after = dispatch(&state, id, "eth_blockNumber", &[]).await;
+        assert!(after.is_err(), "expected the discarded session to be gone");
     }
 }
