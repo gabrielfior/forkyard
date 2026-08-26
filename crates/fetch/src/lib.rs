@@ -17,11 +17,14 @@ use revm::primitives::U256;
 /// clone shares the same background fetch thread and cache.
 pub type Fork = WrapDatabaseRef<SharedBackend<Ethereum, BlockEnv>>;
 
-async fn block_env_from_provider<P: Provider<Ethereum>>(provider: &P) -> eyre::Result<BlockEnv> {
+async fn block_env_from_provider_at<P: Provider<Ethereum>>(
+    provider: &P,
+    block: BlockId,
+) -> eyre::Result<BlockEnv> {
     let block = provider
-        .get_block(BlockId::latest())
+        .get_block(block)
         .await?
-        .ok_or_else(|| eyre::eyre!("upstream RPC returned no latest block"))?;
+        .ok_or_else(|| eyre::eyre!("upstream RPC returned no block for the requested id"))?;
     let header = &block.header;
     Ok(BlockEnv {
         number: U256::from(header.number),
@@ -41,7 +44,18 @@ async fn block_env_from_provider<P: Provider<Ethereum>>(provider: &P) -> eyre::R
 /// from needing to share `fork`'s own provider instance.
 pub async fn latest_block_env(rpc_url: &str) -> eyre::Result<BlockEnv> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    block_env_from_provider(&provider).await
+    block_env_from_provider_at(&provider, BlockId::latest()).await
+}
+
+async fn fork_impl(rpc_url: &str, block: BlockId) -> eyre::Result<(Fork, BlockEnv)> {
+    let url = rpc_url.parse()?;
+    let provider = ProviderBuilder::new().connect_http(url);
+    let block_env = block_env_from_provider_at(&provider, block).await?;
+
+    let meta = BlockchainDbMeta::new(block_env.clone(), rpc_url.to_string());
+    let db = BlockchainDb::new(meta, None);
+    let backend = SharedBackend::spawn_backend_thread(provider, db, None);
+    Ok((WrapDatabaseRef(backend), block_env))
 }
 
 /// Fork `rpc_url` at its current head, returning both the fork itself and
@@ -60,12 +74,13 @@ pub async fn latest_block_env(rpc_url: &str) -> eyre::Result<BlockEnv> {
 /// against a `Fork` without it executes with basefee=0, block number=0,
 /// regardless of what block was actually forked.
 pub async fn fork(rpc_url: &str) -> eyre::Result<(Fork, BlockEnv)> {
-    let url = rpc_url.parse()?;
-    let provider = ProviderBuilder::new().connect_http(url);
-    let block_env = block_env_from_provider(&provider).await?;
+    fork_impl(rpc_url, BlockId::latest()).await
+}
 
-    let meta = BlockchainDbMeta::new(block_env.clone(), rpc_url.to_string());
-    let db = BlockchainDb::new(meta, None);
-    let backend = SharedBackend::spawn_backend_thread(provider, db, None);
-    Ok((WrapDatabaseRef(backend), block_env))
+/// Same as `fork`, but pinned to `block_number` instead of the chain tip —
+/// what lets a caller (e.g. `forkyard-bin`, via `FORKYARD_FORK_BLOCK_NUMBER`)
+/// run a benchmark or test scenario against a fixed, reproducible block
+/// instead of whatever happens to be current.
+pub async fn fork_at(rpc_url: &str, block_number: u64) -> eyre::Result<(Fork, BlockEnv)> {
+    fork_impl(rpc_url, BlockId::number(block_number)).await
 }
