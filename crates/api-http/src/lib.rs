@@ -229,11 +229,7 @@ where
 
         // The fork's real starting block number plus this session's own
         // send-count — see module doc.
-        "eth_blockNumber" => {
-            // Validate that the session exists
-            let _ = state.manager.basic(session_id, Address::ZERO).await?;
-            Ok(json!(format!("0x{:x}", real_block_number(state, session_id))))
-        }
+        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id)))),
 
         // Real base fee (from the fork's actual block) plus a fixed
         // priority-fee margin — see module doc.
@@ -693,7 +689,7 @@ mod tests {
         let result = dispatch(&state, id, "forkyard_discard", &[]).await.unwrap();
         assert_eq!(result, json!(true));
 
-        let after = dispatch(&state, id, "eth_blockNumber", &[]).await;
+        let after = dispatch(&state, id, "eth_getBalance", &[json!(Address::ZERO.to_string())]).await;
         assert!(after.is_err(), "expected the discarded session to be gone");
     }
 }
