@@ -99,6 +99,39 @@ def test_swap_token_for_token_never_self_swaps(monkeypatch):
         assert token_out in known, f"unknown token_out {token_out}"
 
 
+def test_a_failed_send_resyncs_the_nonce_from_the_chain(monkeypatch):
+    """Every tx-sending action on FakeBackend fails (no
+    send_raw_transaction), so the local counter would run away to 1, 2,
+    3... while the chain consumed nothing. The resync must pull it back to
+    what the chain reports."""
+    chain_nonce = 7
+
+    class ResyncBackend(FakeBackend):
+        def web3(self):
+            w3 = super().web3()
+            # Instance attribute, so it isn't bound — takes just `address`.
+            w3.eth.get_transaction_count = lambda address: chain_nonce
+            return w3
+
+    nonces: list[int] = []
+    real_transfer = agent_module.transfer
+
+    def spy(backend, signer_key, to, value, nonce):
+        nonces.append(nonce)
+        return real_transfer(backend, signer_key, to, value, nonce)
+
+    monkeypatch.setattr(agent_module, "transfer", spy)
+    run_agent(
+        ResyncBackend(), random.Random(0),
+        agent_id=0, block_height=20_000_000, num_agents=1, num_actions=40,
+    )
+
+    assert len(nonces) >= 2, "expected several transfers across 40 actions"
+    # Every transfer after the first sees the resynced value, never a
+    # locally-incremented one that the chain never accepted.
+    assert nonces[1:] == [chain_nonce] * (len(nonces) - 1), nonces
+
+
 def test_run_agent_records_carry_an_error_string_for_failed_actions():
     # FakeBackend has no send_raw_transaction, so every tx-sending action
     # fails — which is exactly what makes the error field observable here.
