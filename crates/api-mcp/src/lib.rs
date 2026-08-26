@@ -63,6 +63,16 @@ struct SetBalanceArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+struct SetStorageArgs {
+    session_id: SessionId,
+    address: String,
+    /// Storage slot index, `0x`-prefixed hex.
+    slot: String,
+    /// New value for that slot, `0x`-prefixed hex (32 bytes).
+    value: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 struct TransferArgs {
     session_id: SessionId,
     /// Sender address — must already be funded in this session's overlay
@@ -199,6 +209,15 @@ where
         Ok(CallToolResult::success(vec![ContentBlock::text("true")]))
     }
 
+    #[tool(description = "Test-only cheatcode: override a single storage slot in this session's private overlay only, e.g. to fund an ERC-20 balanceOf mapping entry. Never touches the shared base or the real chain.")]
+    async fn set_storage(&self, Parameters(args): Parameters<SetStorageArgs>) -> Result<CallToolResult, ErrorData> {
+        let address = parse_address(&args.address)?;
+        let slot = parse_u256_hex(&args.slot)?;
+        let value = parse_u256_hex(&args.value)?;
+        self.manager.set_storage(args.session_id, address, slot, value).await.map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![ContentBlock::text("true")]))
+    }
+
     #[tool(description = "Run a transfer read-only against a session — no commit, nothing persists. Use to preview a transaction's effect.")]
     async fn simulate(&self, Parameters(args): Parameters<TransferArgs>) -> Result<CallToolResult, ErrorData> {
         run_transfer(&self.manager, args, false).await
@@ -324,7 +343,7 @@ mod tests {
 
         let tools = client.list_tools(None).await.expect("tools/list should succeed");
         let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
-        for expected in ["fork", "get_balance", "set_balance", "simulate", "advance", "discard"] {
+        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard"] {
             assert!(names.contains(&expected), "missing tool {expected:?}, got {names:?}");
         }
 
@@ -386,7 +405,7 @@ mod tests {
 
         let tools = client.list_tools(None).await.expect("tools/list should succeed");
         let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
-        for expected in ["fork", "get_balance", "set_balance", "simulate", "advance", "discard"] {
+        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard"] {
             assert!(names.contains(&expected), "missing tool {expected:?}, got {names:?}");
         }
 
@@ -433,5 +452,39 @@ mod tests {
 
         client.cancel().await.expect("client should cancel");
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn set_storage_tool_round_trips() {
+        let manager = Arc::new(SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60)));
+        let server = ForkyardMcpServer::new(manager);
+
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let server_task = tokio::spawn(async move {
+            server.serve(server_io).await?.waiting().await?;
+            eyre::Result::<()>::Ok(())
+        });
+        let client = NullClient.serve(client_io).await.expect("client should connect");
+
+        let fork_result = client.call_tool(call("fork", serde_json::json!({}))).await.expect("fork");
+        let session_id: u64 = text_of(&fork_result).parse().unwrap();
+
+        let address = Address::from([3u8; 20]);
+        let result = client
+            .call_tool(call(
+                "set_storage",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "address": address.to_string(),
+                    "slot": "0x9",
+                    "value": format!("0x{:064x}", 123u64),
+                }),
+            ))
+            .await
+            .expect("set_storage");
+        assert_eq!(text_of(&result), "true");
+
+        client.cancel().await.expect("client should cancel");
+        server_task.await.expect("server task").expect("server");
     }
 }
