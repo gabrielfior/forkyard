@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64" role="img" aria-label="forkyard">
+  <g fill="none" stroke="#12938A" stroke-width="7" stroke-linecap="round">
+    <path d="M14 43h36"/>
+    <path d="M14 43V15"/>
+    <path d="M32 43V9"/>
+    <path d="M50 43V15"/>
+    <path d="M32 43v12"/>
+  </g>
+</svg>

@@ -1,3 +1,5 @@
+<img src="assets/logo.svg" alt="" width="72" height="72">
+
 # Forkyard
 
 Instant, disposable forks of live EVM chain state — for AI agents that need to simulate a transaction before committing gas or capital.
