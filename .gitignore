@@ -19,6 +19,6 @@ docs/superpowers/*
 !docs/superpowers/specs/
 !docs/superpowers/plans/
 
-# Benchmark CSVs written next to the harness; the curated set under
-# python/benchmarks/results/ is tracked instead.
+# Benchmark output. Regenerate with the commands in benchmark.md.
 python/benchmarks/*.csv
+python/benchmarks/results/

@@ -15,8 +15,8 @@ find out where, and by how much — including the places where the process model
 is the better one.
 
 Measured 2026-09-04/05 on an Apple M3 Pro (12 cores, 38 GB), macOS, against a
-Tenderly mainnet archive gateway, block 25795072 unless stated. Raw CSVs:
-[`python/benchmarks/results/2026-09-04-superiority/`](python/benchmarks/results/2026-09-04-superiority/).
+Tenderly mainnet archive gateway, block 25795072 unless stated. Result CSVs are
+not tracked in git; [Reproducing](#reproducing) regenerates every one of them.
 
 **Read [Measurement variance](#measurement-variance) before quoting a wall-clock
 number from this page.** Counts and footprints here are reproducible; elapsed
@@ -100,7 +100,14 @@ export FORKYARD_CACHE_DISABLED=1   # except for bench_warmstart.py
 | Restart | `uv run python bench_warmstart.py --agents 5 --contracts 8 --rpc-url $RPC_URL --out warmstart.csv` |
 | Many blocks | `uv run python bench_blocks.py --agents 24 --blocks 1,2,4,8 --base-block 25795072 --block-stride 1000 --rounds 2 --rpc-url $RPC_URL --out blocks.csv` |
 
-`python/benchmarks/README.md` documents every CSV schema and flag.
+Each command writes to `--out`; some also write a `.summary.csv` sibling, and
+`--count-upstream` adds a `.upstream.csv`. Column meanings are in
+`python/benchmarks/README.md`.
+
+Results are not committed — `python/benchmarks/results/` is gitignored, so the
+numbers on this page are reproduced by re-running the table above rather than
+read out of the repo. Run one at a time: a second benchmark sharing CPU, ports
+or RPC quota corrupts the first.
 
 ## Structural results
 
