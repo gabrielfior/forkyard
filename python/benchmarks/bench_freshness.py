@@ -408,9 +408,23 @@ def run_anvil_freshness(
     backends: list[LatestAnvilBackend] = []
     try:
         # Spawned concurrently: N sequential cold forks would take longer
-        # than the measured phase itself at N=25.
+        # than the measured phase itself at N=25. Futures are collected one
+        # at a time rather than through `list(pool.map(...))`, which
+        # re-raises the first failure and throws every already-built backend
+        # away with it — the `finally` below then has an empty list to clean
+        # up. That is not hypothetical: when one of 25 spawns timed out, the
+        # other 24 Anvils stayed alive for hours and sat resident underneath
+        # every benchmark that ran afterwards on the same machine.
         with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
-            backends = list(pool.map(lambda p: LatestAnvilBackend(p, rpc_url), assigned))
+            futures = [pool.submit(LatestAnvilBackend, port, rpc_url) for port in assigned]
+            failure: BaseException | None = None
+            for future in futures:
+                try:
+                    backends.append(future.result())
+                except BaseException as e:  # noqa: BLE001 — re-raised once every peer is collected
+                    failure = failure or e
+            if failure is not None:
+                raise failure
         proxy.reset()
         refreshers: list[Refresher] = [AnvilRefresher(b, rpc_url) for b in backends]
         return run_refresh_phase(refreshers, "anvil", schedule, tip)

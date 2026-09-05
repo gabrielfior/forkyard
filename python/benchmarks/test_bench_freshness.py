@@ -324,3 +324,42 @@ def test_latest_anvil_is_spawned_unpinned_and_without_the_foundry_cache(monkeypa
     assert "--no-storage-caching" in spawned["argv"]
     assert spawned["argv"][:3] == ["anvil", "--fork-url", "http://rpc.example"]
     assert backend.name == "anvil"
+
+
+def test_a_failed_spawn_still_discards_the_anvils_that_did_start(monkeypatch):
+    """`list(pool.map(...))` re-raised the first failure and dropped the
+    successful backends on the floor, leaving them running. One timed-out
+    spawn out of 25 left 24 live Anvils resident under every later
+    benchmark on the machine, quietly taxing their measurements."""
+    import bench_freshness
+
+    discarded: list[int] = []
+
+    class FakeAnvil:
+        def __init__(self, port, rpc_url):
+            if port == 21005:
+                raise RuntimeError(f"anvil on {port} did not become ready in 30.0s")
+            self.port = port
+
+        def discard(self):
+            discarded.append(self.port)
+
+    monkeypatch.setattr(bench_freshness, "LatestAnvilBackend", FakeAnvil)
+
+    class Ports:
+        def __init__(self):
+            self.n = 21000
+
+        def next(self):
+            self.n += 1
+            return self.n
+
+    with pytest.raises(RuntimeError, match="did not become ready"):
+        bench_freshness.run_anvil_freshness(
+            "http://rpc", 8, [0.0], lambda: 1, Ports(), object()
+        )
+
+    assert 21005 not in discarded, "the one that never started has nothing to discard"
+    assert sorted(discarded) == [21001, 21002, 21003, 21004, 21006, 21007, 21008], (
+        "every Anvil that did start must be torn down before the failure propagates"
+    )
