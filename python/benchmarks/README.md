@@ -198,3 +198,84 @@ Anvil's ~32, a 4x gap that should widen as K grows and the fixed cost
 amortises. The slope across K is the number the claim is actually about. One
 more caveat: `_wait_for_forkyard` probes readiness by opening a session it
 never discards, so forkyard is holding K+1 sessions, not K.
+
+## Arrival and freshness benchmarks
+
+`run_benchmark.py` asks two questions that both assume a thundering herd at a
+pinned block. These two scripts ask the other two.
+
+### `bench_arrivals.py` — time-to-first-simulation
+
+Agents do not all start at once; they trickle in. This script makes them
+arrive as a Poisson process of rate λ and measures, per arrival, the
+wall-clock from the **scheduled arrival instant** to the receipt of its first
+transfer — acquire an environment, fund a signer, transact, discard.
+
+```bash
+uv run python bench_arrivals.py --arrival-rates 1,5,20 --duration 30 \
+  --rpc-url $RPC_URL --out arrivals.csv
+```
+
+Measuring from the scheduled instant (not from when a worker thread got
+around to it) is the whole design: an arrival that lands while the machine is
+still spawning earlier Anvils pays for that backlog, and the backlog is the
+point. Arrivals are dispatched by a scheduler thread that sleeps to each
+instant and starts a thread there, never a bounded pool, which would hide it.
+`--max-concurrent-envs` (default 64) is the one exception — a machine guard,
+since λ=20 over 30s is ~600 arrivals and 600 simultaneous Anvils is tens of
+GB — and the time it makes an arrival wait is deliberately counted *inside*
+that arrival's latency. Past the cap, a row measures the cap.
+
+Both backends replay the identical seeded schedule. Each Anvil arrival gets a
+port that is never reused for the whole run (a killed instance's port lingers
+in TIME_WAIT).
+
+`arrivals.csv`: `backend`, `arrival_rate` (λ), `agent_id`, `arrival_s`
+(scheduled offset into the run), `time_to_first_success_ms`, `ok`, `error`.
+`arrivals.summary.csv` adds one row per (backend, λ) with `arrivals`,
+`completed`, `failures`, `p50_ms`/`p95_ms`/`p99_ms`/`max_ms` and
+`peak_concurrent_envs`. Percentiles cover successful arrivals only, with
+failures counted beside them — a 20s Anvil startup timeout in the tail would
+blame the architecture for this machine's resource ceiling. A row with a
+large `failures` count describes only the arrivals that got served at all.
+
+### `bench_freshness.py` — chain-tip freshness at fleet scale
+
+Pinning a block makes forking a one-time cost. Against the live tip it is a
+recurring bill, and that is where the shared base pays: forkyard re-forks
+**one** base per new block for every session at once (`ChainTipFollower`),
+while each Anvil must `anvil_reset` and refetch for itself.
+
+```bash
+uv run python bench_freshness.py --agents 5,25 --duration 120 --refresh-secs 30 \
+  --rpc-url $RPC_URL --out freshness.csv
+```
+
+Both backends run **unpinned** — forkyard without `FORKYARD_FORK_BLOCK_NUMBER`
+(with `FORKYARD_INGEST_POLL_SECS` set from `--poll-secs`, default 4s, so a new
+block lands inside the run), Anvil without `--fork-block-number`. Every
+`--refresh-secs`, all N agents demand current state at the same instant:
+forkyard by opening a new session, Anvil by `anvil_reset` with
+`{"forking": {"jsonRpcUrl": …}}` and no block number. Both then read
+`eth_blockNumber`.
+
+Both go through `rpc_proxy.CountingProxy`, and counting is reset once every
+environment is up: the initial fork is setup, the question is what *staying*
+fresh costs. A separate poller reads the real endpoint **directly**, never
+through the proxy — a yardstick inside the proxy would add its own traffic to
+the number being compared. The tip is read *after* each refresh, so a slow
+refresh is scored against where the chain is when the agent finally gets its
+answer.
+
+`freshness.csv`: `backend`, `agents`, `agent_id`, `refresh_index`,
+`observed_block`, `true_tip`, `block_lag` (= `true_tip − observed_block`),
+`refresh_ms`, `ok`, `error`; `-1` in `observed_block`/`true_tip`/`block_lag`
+means "no answer to report", not zero. `freshness.summary.csv` adds one row
+per (backend, N): `lag_p50`/`lag_p95`, `refresh_ms_p50`/`refresh_ms_p95`,
+`http_requests`, `jsonrpc_calls`, `calls_per_agent_refresh`,
+`upstream_errors`, `top_methods`.
+
+`calls_per_agent_refresh` is the number the two architectures differ on. Read
+it knowing that a large part of Anvil's per-reset bill is re-fetching its ten
+prefunded dev accounts, not the agent's own state — intrinsic to
+`anvil_reset`, but not a cost the agent asked for.
