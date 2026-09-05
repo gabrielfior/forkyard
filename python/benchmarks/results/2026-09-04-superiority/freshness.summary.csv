@@ -1,0 +1,4 @@
+backend,agents,refreshes,ok_refreshes,lag_p50,lag_p95,refresh_ms_p50,refresh_ms_p95,http_requests,jsonrpc_calls,calls_per_agent_refresh,upstream_errors,top_methods
+forkyard,5,20,20,0.0,0.0,23.133,29.97,29,29,1.4,0,"{""eth_getBlockByNumber"": 29}"
+anvil,5,20,20,0.0,0.0,1110.474,1480.83,859,859,43.0,0,"{""eth_getBalance"": 200, ""eth_getTransactionCount"": 200, ""eth_getCode"": 200, ""eth_getAccountInfo"": 199, ""eth_getBlockByNumber"": 60}"
+forkyard,25,100,100,0.0,0.0,50.303,67.075,28,28,0.3,0,"{""eth_getBlockByNumber"": 28}"
