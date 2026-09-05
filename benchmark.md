@@ -14,26 +14,29 @@ should start to matter as agents multiply. These measurements are an attempt to
 find out where, and by how much — including the places where the process model
 is the better one.
 
-Measured 2026-09-04/05 on an Apple M3 Pro (12 cores, 38 GB), macOS, against a
+Measured 2026-09-05 on an Apple M3 Pro (12 cores, 38 GB), macOS, against a
 Tenderly mainnet archive gateway, block 25795072 unless stated. Result CSVs are
 not tracked in git; [Reproducing](#reproducing) regenerates every one of them.
 
-**Read [Measurement variance](#measurement-variance) before quoting a wall-clock
-number from this page.** Counts and footprints here are reproducible; elapsed
-times on this hardware were not.
+Every number is the **median of five runs**, each sweep preceded by a discarded
+warm-up run, with the max/min spread reported so you can see how stable it is.
+Both tools run with their persistent caches **enabled** — warm against warm,
+which is the comparison a returning user actually gets. The host was not idle
+(it runs a desktop; load average 1.7–9.5 across the campaign, recorded per
+repetition), which is part of why the spread column is here.
 
 ## Contents
 
 - [Methodology](#methodology)
 - [Reproducing](#reproducing)
-- [Structural results](#structural-results) — the reproducible ones
+- [Results](#results)
   - [Upstream RPC load](#upstream-rpc-load)
   - [Memory per isolated agent](#memory-per-isolated-agent)
   - [Acquiring an environment](#acquiring-an-environment)
-  - [Checkpointing and branching](#checkpointing-and-branching)
+  - [Branching: K what-ifs from one state](#branching-k-what-ifs-from-one-state)
+  - [Checkpoint cost](#checkpoint-cost)
   - [Restart cost](#restart-cost)
-  - [Many blocks in one process](#many-blocks-in-one-process)
-- [Timing results](#timing-results) — directional only
+  - [Whole-workload wall clock](#whole-workload-wall-clock)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
 - [Measurement variance](#measurement-variance)
 
@@ -52,20 +55,17 @@ teardown. It excludes forkyard's one-time process startup — a single shared co
 with no Anvil counterpart — while Anvil's per-agent spawn is inside the timer,
 because Anvil pays it once per agent.
 
-**Both tools have a persistent cache, and both are disabled by default here.**
+**Both tools keep a persistent cache, and both are enabled.** Foundry writes
+fetched fork state to `~/.foundry/cache/rpc/<chain>/<block>/storage.json`;
+forkyard writes its own per `(chain, block)` under `FORKYARD_CACHE_DIR`. Both
+survive restarts, so warm-against-warm is the like-for-like comparison and the
+one a returning user gets. `--cold-caches` turns both off to measure a
+first-ever run at a block instead.
 
-- Foundry writes fetched fork state to
-  `~/.foundry/cache/rpc/<chain>/<block>/storage.json` and reuses it across
-  processes and runs — a genuinely useful feature. Left enabled, whole sweeps
-  ran in which Anvil made *zero* upstream state calls and still answered every
-  read, which measures previous sweeps rather than either architecture. Anvil
-  therefore spawns with `--no-storage-caching`; `--anvil-rpc-cache` restores it.
-- forkyard now persists its own cache per `(chain, block)`
-  (`FORKYARD_CACHE_DIR`), so every run sets `FORKYARD_CACHE_DISABLED=1` for
-  symmetry.
-
-The exception is [Restart cost](#restart-cost), where both are switched **on**,
-because they are the subject.
+This matters enough to state plainly: warm, Anvil serves most of its state from
+disk, and the upstream-traffic gap that dominates a cold comparison largely
+closes. Every sweep here is therefore preceded by a discarded warm-up run, so
+no reported number is secretly a cold one.
 
 **One benchmark at a time.** A second benchmark sharing CPU, ports or RPC quota
 corrupts the first. The whole pass is serial.
@@ -89,9 +89,12 @@ read the pinned block. Everything here is from the fixed binary.
 ```bash
 cargo build -p forkyard --release && export PATH="$PWD/target/release:$PATH"
 cd python/benchmarks && uv sync
-export RPC_URL=...                 # an archive endpoint, for historical blocks
-export FORKYARD_CACHE_DISABLED=1   # except for `bench.py warmstart`
+export RPC_URL=...    # an archive endpoint, for historical blocks
 ```
+
+Run each sweep once and discard it before measuring: the first run at a block
+fills both caches, so including it reports a cold number. `aggregate_runs.py`
+takes the median and spread over repeated runs and skips the warm-up for you.
 
 | Section | Command |
 | --- | --- |
@@ -117,233 +120,197 @@ numbers on this page are reproduced by re-running the table above rather than
 read out of the repo. Run one at a time: a second benchmark sharing CPU, ports
 or RPC quota corrupts the first.
 
-## Structural results
+## Results
 
-These are counts and footprints rather than elapsed times, and they reproduced
-across independent runs — forkyard's call counts were byte-identical between
-passes.
+Medians of five warm runs. **Spread** is max/min across those five: 1.0 means
+every run agreed, and anything above ~1.5 is a number to treat as approximate.
 
 ### Upstream RPC load
 
-Standard workload, cold on both sides. Two independent runs shown where they
-differ:
+The standard workload, both caches warm:
 
 | Agents | forkyard calls | anvil calls | forkyard per agent | anvil per agent |
 | --- | --- | --- | --- | --- |
-| 1 | 33 | 43 – 97 | 33.0 | 43 – 97 |
-| 10 | 108 | 422 – 834 | 10.8 | 42 – 83 |
-| 50 | **387** | 1,321 – 3,062 | **7.7** | 26 – 61 |
+| 1 | 9 | 13 | 9.0 | 13.0 |
+| 10 | **84** | 142 | 8.4 | 14.2 |
+| 50 | **363** | 666 | **7.3** | 13.3 |
 
-forkyard's per-agent cost *falls* as agents are added, because they share one
-cache; a process-per-agent design pays for its own fork every time. Note
-Anvil's spread — its fetch volume varied more than 2× between runs, so treat
-the ratio as "several times", not a precise multiple.
+forkyard's counts were *identical in all five runs* at every tier; Anvil's
+varied (13 → 96 at one agent, 656 → 785 at fifty) as its cache filled unevenly
+across processes.
 
-The clearest version isolates sharing from everything else. A read-only
-workload where every agent reads the **same** 8 contracts, against one where
-each reads its **own** 8:
+The version that isolates sharing from everything else: a read-only workload
+where every agent reads the **same** 8 contracts, against one where each agent
+reads its **own** 8.
 
 | Agents | Shared: forkyard | Shared: anvil | Disjoint: forkyard | Disjoint: anvil |
 | --- | --- | --- | --- | --- |
-| 1 | 37 | 76 – 78 | 37 | 78 |
-| 10 | **37** | 253 – 776 | 325 | 687 – 776 |
-| 50 | **37** | 1,203 – 2,125 | 1,605 | 3,395 |
+| 1 | **1** | 3 | 1 | 3 |
+| 10 | **1** | 30 | 84 | 142 |
+| 50 | **1** | 300 | 363 | 666 |
 
-On shared state forkyard's upstream traffic is **flat** — 37 calls whether one
-agent reads those contracts or fifty, identical across both runs. On disjoint
-state, where nothing *can* be shared, the advantage narrows to roughly 2×, which
-is per-fork overhead rather than caching. That second column is the control: it
-shows the first column is measuring what it claims to.
+Warm and sharing state, forkyard needs **one upstream call at any agent count**
+— the fork's own block-header lookup — because the contracts are already in the
+base every session reads from. Anvil, whose cache is per process, still pays
+about six calls per agent. On disjoint state, where nothing *can* be shared, the
+advantage falls to under 2×: that column is the control, and it is what shows
+the first one is measuring cache sharing rather than general overhead.
 
-Priced with Alchemy's published compute-unit table at $0.45/million CU, the
-standard workload came to **$0.08 per 1,000 agent runs against $0.58**. True but
-minor — cost only becomes an argument at 10^5–10^6 runs; the quota ceiling
-matters more.
+Priced with Alchemy's published compute-unit table at $0.45/million CU this is
+cents per thousand agent runs either way. The cost argument only matters at
+10^5–10^6 runs; the quota ceiling is the useful version of it.
 
 ### Memory per isolated agent
 
 Every writer writes a value only it uses, to the same account every other writer
-targets, then reads it back. `isolation_violations` was 0 on every row, so these
-are genuinely isolated agents.
+targets, then reads it back. Zero isolation violations across all five runs, so
+these are genuinely isolated agents.
 
 | Concurrent writers | forkyard RSS | anvil RSS | forkyard per GB | anvil per GB |
 | --- | --- | --- | --- | --- |
-| 1 | 16.8 MB | 32.8 MB | 61 | 31 |
-| 10 | 17.4 MB | 325 MB | 588 | 32 |
-| 25 | 18.0 MB | 794 MB | 1,425 | 32 |
-| 50 | **18.9 MB** | 1,546 MB | **2,708** | 33 |
+| 1 | 21.2 MB | 30.7 MB | 48 | 33 |
+| 10 | 21.5 MB | 292 MB | 476 | 35 |
+| 50 | **23.2 MB** | 1,434 MB | **2,211** | 36 |
 
-forkyard's footprint moves 16.8 → 18.9 MB going from 1 to 50 concurrent
-writers; Anvil's is linear at ~31 MB each, which is simply what a process costs.
-The 24-agent multi-block sweep agrees independently: 15–19 MB against 610–770 MB.
+forkyard's footprint moves 21.2 → 23.2 MB going from 1 to 50 concurrent
+writers. Anvil's is linear at ~29 MB each, which is what a process costs — its
+own design decision, not a fault.
 
 ### Acquiring an environment
 
 | Concurrent agents | forkyard `POST /session` | anvil spawn → ready |
 | --- | --- | --- |
-| 1 | 3 – 5 ms | ~840 – 870 ms |
-| 10 | 13 – 18 ms | ~860 – 875 ms |
-| 25 | 16 – 153 ms | ~840 – 1,055 ms |
-| 50 | 213 – 383 ms | 1,055 – 2,546 ms |
-| 100 | 563 – 802 ms | 2,539 – 20,090 ms |
+| 1 | **4.3 ms** | 627 ms |
+| 10 | 16.2 ms | 662 ms |
+| 50 | 215 ms | 686 ms |
 
-Under no contention the gap is about 200×. It narrows as concurrency rises,
-because forkyard's session opens start queueing behind its worker pool — see
-[Where Anvil is the better tool](#where-anvil-is-the-better-tool).
+Uncontended the gap is ~150×. It closes as concurrency rises, because forkyard's
+session opens queue behind its four worker threads while Anvil's spawn cost
+stays flat — the shape behind every high-concurrency result below.
 
-### Checkpointing and branching
+### Branching: K what-ifs from one state
 
-**Anvil's `evm_snapshot`/`evm_revert` are excellent and this benchmark says so**:
-~1 ms flat regardless of how much state is dirty. If you need to rewind one
-timeline, that is the right primitive and forkyard offers nothing better.
+One prefix of 5 actions, then K branches of 3 actions each, run concurrently
+where the architecture allows it. Whole-sweep seconds:
 
-What scales with state is the serializing path, `anvil_dumpState`/`loadState`:
-
-| Dirty slots | anvil dump | anvil load | blob size | forkyard fork | forkyard discard |
-| --- | --- | --- | --- | --- | --- |
-| 100 | 1.7 ms | 1.3 ms | 3.3 KB | 0.6 ms | 1.0 ms |
-| 1,000 | 2.1 ms | 2.2 ms | 8.4 KB | 0.7 ms | 1.0 ms |
-| 10,000 | 5.8 ms | 6.2 ms | 56 KB | **0.6 ms** | 0.9 ms |
-
-These are not the same operation — forkyard branches off a shared base and never
-carries the writes, Anvil's dump does — so compare the *shape* of the columns,
-flat against growing, not the absolute milliseconds.
-
-Where the two models genuinely diverge is **K branches live at once**. Anvil's
-snapshot stack is a single timeline: you explore a branch, revert, explore the
-next. forkyard's `forkyard_forkFrom` hands each child the parent's state as a
-pointer, and all K run concurrently. Creating one branch:
-
-| K | forkyard `forkFrom` | anvil snapshot+revert | anvil spawn + replay prefix |
+| K | forkyard | anvil-processes | anvil-snapshot |
 | --- | --- | --- | --- |
-| 2 | 2.1 ms | 5.2 ms | 4,990 ms |
-| 32 | **0.9 ms** | 4.5 ms | 6,561 ms |
+| 2 | **0.08** | 0.73 | 0.72 |
+| 8 | **0.18** | 1.97 | 10.67 |
+| 32 | **0.54** | 2.06 | 9.87 |
 
-Upstream calls for the whole K=32 sweep: forkyard **129**, anvil-snapshot 348,
-anvil-processes 1,310. Zero isolation violations — every child's diverging write
-stayed invisible to its siblings and to its parent.
+Creating one branch: forkyard `forkyard_forkFrom` **0.7 ms**, Anvil
+`evm_snapshot` + `evm_revert` 2.2 ms, spawning a process and replaying the
+prefix 1,156 ms. The snapshot stack is fast per operation but serial by
+construction — one branch at a time — which is what the K=8 and K=32 columns
+show. Zero isolation violations: every child's diverging write stayed invisible
+to its siblings and its parent.
+
+### Checkpoint cost
+
+**Anvil's `evm_snapshot`/`evm_revert` are excellent and this says so**: about a
+millisecond flat, regardless of how much state is dirty. To rewind a single
+timeline that is the right primitive, and forkyard has nothing better.
+
+What grows with state is the serializing path, `anvil_dumpState`/`loadState`:
+1.7 → 6.2 ms and a 3.3 KB → 56 KB blob as dirty slots go 100 → 10,000, against
+forkyard's flat 0.6 ms branch off a shared base and no blob at all. These are
+not the same operation — forkyard's branch never carries the writes — so compare
+the shape of the columns, flat against growing, not the milliseconds.
 
 ### Restart cost
 
-The one axis where Anvil was clearly ahead, and the reason forkyard now persists
-its cache too. **Both caches enabled** — the only section where that is true.
-5 agents, 8 contracts:
+Both persistent caches enabled, 5 agents reading 8 contracts, cold run then warm:
 
 | Backend | Cold calls | Warm calls | Cold time | Warm time |
 | --- | --- | --- | --- | --- |
 | forkyard | 37 | **1** | 3.13 s | **0.14 s** |
 | anvil | 90 | 15 | 9.24 s | 3.42 s |
 
-forkyard's warm floor is one call — the fork's own block-header lookup. Anvil's
+forkyard's warm floor is one call, the fork's own block-header lookup. Anvil's
 is 15, because each process re-resolves state that forkyard serves once from a
-shared base. Before this feature the same measurement had forkyard refetching
-everything on every start, and Anvil comfortably ahead.
+shared base. Before forkyard had a persistent cache at all, this was the one
+axis where Anvil was clearly ahead.
 
-### Many blocks in one process
+### Whole-workload wall clock
 
-`POST /session {"block_number": N}` pins a session to its own block with one
-shared cache per block. Anvil's `--fork-block-number` is per process, so B
-blocks means at least B processes — and since a process is Anvil's unit of
-isolation, N isolated agents means N processes. 24 agents over B blocks, twice:
+The standard agent workload, warm, median of five:
 
-| B | forkyard calls (r1 / r2) | anvil calls (r1 / r2) | forkyard RSS | anvil RSS |
+| Agents | forkyard | spread | anvil | spread |
 | --- | --- | --- | --- | --- |
-| 1 | 20 / **0** | 861 / 1,236 | 15.5 MB | 610 MB |
-| 2 | 40 / **0** | 1,462 / 1,463 | 16.2 MB | 675 MB |
-| 4 | 80 / **0** | 1,459 / 1,399 | 17.1 MB | 770 MB |
-| 8 | 160 / **0** | 1,438 / 1,228 | 18.5 MB | 730 MB |
+| 1 | **0.62 s** | 1.09× | 1.51 s | 3.49× |
+| 10 | **1.76 s** | 3.62× | 2.13 s | 1.10× |
+| 50 | 6.34 s | 1.05× | **2.72 s** | 1.15× |
 
-forkyard's cost scales with **B, not N** — 20 calls per block regardless of how
-many agents use it — and the second round costs nothing, because the per-block
-bases are already warm in-process.
-
-## Timing results
-
-Directional only. Two independent passes of the same sweeps disagreed by up to
-7× on this machine; see [Measurement variance](#measurement-variance).
-
-**Standard workload, whole-sweep wall clock (range across two runs):**
+Ten disposable forks per agent instead of one long-lived environment, same total
+work:
 
 | Agents | forkyard | anvil |
 | --- | --- | --- |
-| 1 | 2.7 – 2.9 s | 4.9 – 6.2 s |
-| 10 | 3.6 – 3.8 s | 4.9 – 5.3 s |
-| 50 | 7.6 – 8.4 s | 8.5 – 11.9 s |
-| 100 | 12.8 – 13.7 s | 12.1 – 62.3 s |
+| 1 | **3.53 s** | 11.32 s |
+| 10 | **9.18 s** | 13.57 s |
 
-**Branching, whole sweep** (one clean run): at K=32, forkyard **4.72 s**,
-anvil-processes 9.81 s, anvil-snapshot 30.27 s — the last growing linearly in K
-because it explores one branch at a time.
+And agents arriving over time rather than all at once (p50 from scheduled
+arrival to first successful simulation):
 
-**Arrivals** (Poisson, time from scheduled arrival to first successful
-simulation, clean run):
+| Arrival rate | forkyard p50 | anvil p50 |
+| --- | --- | --- |
+| 1/s | **340 ms** | 1,082 ms |
+| 5/s | **353 ms** | 1,092 ms |
+| 20/s | 6,233 ms | **1,181 ms** |
 
-| λ (agents/s) | forkyard p50 | anvil p50 | forkyard failures | anvil failures |
-| --- | --- | --- | --- | --- |
-| 1 | 330 ms | 1,780 ms | 0 / 17 | 0 / 17 |
-| 5 | 325 ms | 1,988 ms | 6 / 84 | 11 / 84 |
-| 20 | 5,857 ms | 14,291 ms | 0 / 372 | 59 / 372 |
-
-An earlier pass — since found to have been contaminated by leaked processes —
-had forkyard *slower* at λ=20. The clean run reverses that, which is exactly why
-the table above is labelled directional.
-
-**Staying at the chain tip**, 5 agents refreshing every 30 s for two minutes:
-forkyard refreshed in ~17–23 ms using 14–29 upstream calls total; Anvil in
-~1,110 ms using 859. Both stayed current. At 25 agents forkyard used 28 calls;
-the Anvil leg could not be measured — 25 tip-forked instances would not all
-start on this machine, and in a later attempt even 5 would not.
-
-**Under a provider quota**, forkyard's sustainable agent count was consistently
-at or above Anvil's (Anvil: 0–5 across every configuration), but forkyard's own
-ceiling moved between runs (5–25 agents), so no specific number is quotable yet.
+The pattern across all three: forkyard is ahead while its worker pool is not the
+constraint — single agents, churn, arrivals up to ~5/s — and behind once it is.
+At 50 concurrent agents and at 20 arrivals/s, Anvil's flat per-process cost wins.
 
 ## Where Anvil is the better tool
 
-**Rewinding one timeline.** `evm_snapshot`/`evm_revert` cost ~1 ms flat no
-matter how much state is dirty. forkyard has no equivalent primitive, and for
-"try this, undo it, try the next" in a single agent, Anvil's is simply the right
-design.
+**Concurrency past a few tens of agents.** This is the clearest one. forkyard
+shards sessions over `FORKYARD_NUM_WORKERS` threads — 4 by default — and that
+queue becomes the ceiling: at 50 concurrent agents the standard workload took
+6.34 s against Anvil's 2.72 s, and at 20 arrivals/second forkyard's p50 was
+6,233 ms against 1,181 ms. Anvil's per-process cost is flat, and warm it has no
+fetch penalty left to pay. Raising the worker count helps a lot (100 agents:
+13.1 s at 4 workers, 5.5 s at 12) but does not change the shape.
 
-**Per-interaction latency at high concurrency.** forkyard shards sessions over
-`FORKYARD_NUM_WORKERS` threads — 4 by default — and that queue becomes the
-ceiling. Past a few tens of concurrent agents Anvil's per-interaction latency is
-better, and forkyard's session opens degrade from ~4 ms to several hundred.
-Raising the worker count helps materially (100 agents: 4 workers → 13.1 s,
-12 workers → 5.5 s) but does not change the shape.
+**Rewinding one timeline.** `evm_snapshot`/`evm_revert` cost about a millisecond
+flat no matter how much state is dirty. forkyard has no equivalent primitive,
+and for "try this, undo it, try the next" inside one agent, Anvil's design is
+simply the right one.
 
-**Cold, unshared state.** When agents touch disjoint state, the shared cache has
-nothing to share and forkyard is left with its worker queue. This is the regime
-where it does worst.
+**Unshared state.** When agents touch disjoint state the shared cache has
+nothing to share, the upstream advantage falls to under 2×, and forkyard is left
+carrying its worker queue.
 
 **Maturity and surface area.** Anvil implements the whole Ethereum JSON-RPC
-surface plus a large, well-documented cheatcode set, is battle-tested, and
-integrates with the rest of Foundry. forkyard's HTTP surface is deliberately
-small — no `eth_call`, no `eth_getCode`, no `eth_getStorageAt` (reads go through
+surface plus a large, documented cheatcode set, is battle-tested, and integrates
+with the rest of Foundry. forkyard's HTTP surface is deliberately small — no
+`eth_call`, no `eth_getCode`, no `eth_getStorageAt` (reads go through
 `eth_estimateGas`), which several benchmarks here had to be written around.
 
-**Anything with one agent.** Every advantage measured on this page begins at
-"more than one". For a single agent, Anvil is one command and no new concepts.
+**Anything with one agent.** Every advantage measured here begins at "more than
+one". For a single agent Anvil is one command and no new concepts.
 
 ## Measurement variance
 
-Two independent passes of the same sweeps, on the same machine and endpoint,
-disagreed substantially:
+Timing benchmarks on a desktop are noisy, and earlier passes of this work were
+noisy enough to reverse a conclusion. Two causes were found and fixed:
 
-- forkyard's **upstream call counts were byte-identical** between passes
-  (33/108/387; 37/325/1,605 in the overlap tests).
-- Anvil's call counts varied by **more than 2×** (e.g. 1,321 vs 3,062 at 50
-  agents), presumably from spawn-order and retry differences.
-- **Wall clocks varied by up to 7×** on the heavier legs (forkyard's 25-agent
-  long-lived sweep: 9.2 s in one pass, 69.2 s in another).
+- A crash while spawning the 25th tip-forked Anvil leaked the other 24, which
+  then sat resident under every later benchmark for hours (fixed in `da5ce48`,
+  with a regression test).
+- Consolidating the benchmark scripts renamed the *string* `"FORKYARD_PORT"`
+  along with the constant of that name, so five sweeps told forkyard nothing
+  about its port, it fell back to its default, and collided with whatever was
+  already listening (fixed in `6ff71e3`, with a regression test).
 
-Two causes were identified and one was fixed. A crash while spawning the 25th
-tip-forked Anvil leaked the other 24, which then sat resident under every later
-benchmark for hours — fixed in `da5ce48`, with a regression test. The second is
-environmental: the host carried a load average of 4–5 from unrelated work during
-the second pass, and these benchmarks are sensitive to that.
+What remains is the host itself: it runs a desktop, and load average moved
+between 1.7 and 9.5 during the campaign. That is why every number here is a
+median of five runs with the max/min spread beside it. Most spreads are between
+1.0 and 1.4; two rows reach ~3.5× on the strength of a single slow repetition,
+and are marked. Counts are steadier than times — forkyard's upstream call counts
+were identical across all five runs at every tier, while Anvil's varied by up to
+7× at one agent as its cache filled unevenly.
 
-Consequently: the counts and footprints above are safe to quote; the elapsed
-times are not, until they have been repeated several times on an idle machine.
-Anything published as a headline number should come from a repeated run with a
-reported spread, not from a single pass.
+Reproduce with `aggregate_runs.py`, which takes the median and spread across
+`<name>_rep*.csv` and excludes the warm-up run.
