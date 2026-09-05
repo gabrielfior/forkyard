@@ -35,6 +35,7 @@ repetition), which is part of why the spread column is here.
   - [Acquiring an environment](#acquiring-an-environment)
   - [Branching: K what-ifs from one state](#branching-k-what-ifs-from-one-state)
   - [Checkpoint cost](#checkpoint-cost)
+  - [Many blocks in one process](#many-blocks-in-one-process)
   - [Restart cost](#restart-cost)
   - [Whole-workload wall clock](#whole-workload-wall-clock)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
@@ -145,16 +146,28 @@ reads its **own** 8.
 
 | Agents | Shared: forkyard | Shared: anvil | Disjoint: forkyard | Disjoint: anvil |
 | --- | --- | --- | --- | --- |
-| 1 | **1** | 3 | 1 | 3 |
-| 10 | **1** | 30 | 84 | 142 |
-| 50 | **1** | 300 | 363 | 666 |
+| 1 | **1** | 3 | 1 | 58 |
+| 10 | **1** | 30 | 1 | 327 |
+| 50 | **1** | 300 | 1 | 1,734 |
 
 Warm and sharing state, forkyard needs **one upstream call at any agent count**
 — the fork's own block-header lookup — because the contracts are already in the
 base every session reads from. Anvil, whose cache is per process, still pays
-about six calls per agent. On disjoint state, where nothing *can* be shared, the
-advantage falls to under 2×: that column is the control, and it is what shows
-the first one is measuring cache sharing rather than general overhead.
+about six calls per agent.
+
+**The disjoint column stops being a control once caches are warm**, and it is
+worth saying why rather than quietly dropping it. Cold, it separates the two
+things forkyard's cache does: *sharing* one copy between concurrent sessions,
+and *persisting* it across runs. Warm, persistence alone answers the disjoint
+reads too — a previous run already fetched those contracts — so forkyard reports
+1 either way and the column no longer isolates anything. Cold, the same control
+gives 37 shared against 1,605 disjoint for forkyard, which is where the claim
+that sharing (not just persistence) is doing work actually comes from. Run
+`--cold-caches` to reproduce that half.
+
+Anvil's disjoint number is high for a warm run because 50 processes exiting at
+once each write the same per-block cache file, so it ends up holding only part
+of what was fetched — a per-process cache paying for a shared workload twice.
 
 Priced with Alchemy's published compute-unit table at $0.45/million CU this is
 cents per thousand agent runs either way. The cost argument only matters at
@@ -213,10 +226,34 @@ millisecond flat, regardless of how much state is dirty. To rewind a single
 timeline that is the right primitive, and forkyard has nothing better.
 
 What grows with state is the serializing path, `anvil_dumpState`/`loadState`:
-1.7 → 6.2 ms and a 3.3 KB → 56 KB blob as dirty slots go 100 → 10,000, against
-forkyard's flat 0.6 ms branch off a shared base and no blob at all. These are
-not the same operation — forkyard's branch never carries the writes — so compare
-the shape of the columns, flat against growing, not the milliseconds.
+
+| Dirty slots | anvil dump | anvil load | blob | forkyard fork | anvil snapshot/revert |
+| --- | --- | --- | --- | --- | --- |
+| 100 | 1.2 ms | 1.1 ms | 3.3 KB | 0.7 ms | 0.8 / 1.1 ms |
+| 1,000 | 2.0 ms | 2.0 ms | 8.4 KB | 0.7 ms | 1.0 / 1.2 ms |
+| 10,000 | 5.9 ms | 6.7 ms | 56 KB | **0.7 ms** | 0.8 / 1.0 ms |
+
+Dump and load grow with dirty state; snapshot, revert and forkyard's branch do
+not. The branch and the dump are not the same operation — forkyard's branch
+never carries the writes — so compare the shape of each column, flat against
+growing, rather than the milliseconds.
+
+### Many blocks in one process
+
+`POST /session {"block_number": N}` pins a session to its own block with one
+shared cache per block; Anvil's `--fork-block-number` is per process. Twelve
+agents spread over B blocks, run twice:
+
+| B | forkyard calls (r1 / r2) | anvil calls (r1 / r2) | forkyard RSS | anvil RSS |
+| --- | --- | --- | --- | --- |
+| 1 | 20 / **0** | 36 / 36 | 15.3 MB | 271 MB |
+| 4 | 80 / **0** | 36 / 36 | 16.6 MB | 321 MB |
+
+forkyard's cost scales with the number of *blocks*, not agents — 20 calls per
+block — and the second round is free because those bases are already warm in
+process. Anvil's is flat here because its own disk cache is warm too; what it
+cannot amortise is memory, at roughly 25 MB per process against one 16 MB
+process.
 
 ### Restart cost
 
