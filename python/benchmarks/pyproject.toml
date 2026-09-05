@@ -19,3 +19,9 @@ dependencies = [
 dev = [
     "pytest>=8.3.0",
 ]
+
+[tool.pytest.ini_options]
+# The modules under test sit next to this file, not in an installed package,
+# so tests/ can only import them with the project root on the path.
+pythonpath = ["."]
+testpaths = ["tests"]

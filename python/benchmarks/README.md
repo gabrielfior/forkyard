@@ -14,7 +14,7 @@ Both binaries must be on `PATH` — they are spawned by bare name:
 cargo build -p forkyard --release          # from the repo root
 export PATH="$PWD/target/release:$PATH"
 uv sync
-uv run pytest                              # unit tests: no subprocesses, no network
+uv run pytest                              # tests/ — no subprocesses, no network
 ```
 
 `--rpc-url` must serve historical state at the blocks you sweep; some public
@@ -34,6 +34,8 @@ endpoints only do that on a paid tier.
 | `rpc_proxy.py` | counting/rate-limiting JSON-RPC proxy |
 | `cost_model.py` | upstream calls → provider compute units and dollars |
 | `plot_results.py` | PNGs from a `run_benchmark.py` CSV |
+| `aggregate_runs.py` | median and spread across repeated runs of a sweep |
+| `tests/` | the unit tests; `pythonpath = ["."]` in `pyproject.toml` is what lets them import the modules above |
 
 Results are written where `--out` says and are **not** tracked in git.
 
@@ -62,10 +64,12 @@ corrupts the first.
 - `--count-upstream` — routes both backends through `rpc_proxy.py` and writes
   `<out>.upstream.csv`. Adds a local hop, so take counts from such a run and
   timings from a direct one.
-- `--anvil-rpc-cache` — let Anvil use `~/.foundry/cache` (**off** by default).
-  Foundry persists fork state per block and reuses it across runs, so leaving
-  it on makes a sweep partly a measurement of earlier sweeps. forkyard's
-  equivalent is `FORKYARD_CACHE_DISABLED=1`, which the measurement pass sets.
+- `--cold-caches` — turn **both** persistent caches off: Anvil's
+  `~/.foundry/cache` and forkyard's `FORKYARD_CACHE_DIR`. Both are on by
+  default, because both survive restarts and warm-against-warm is the
+  like-for-like comparison. Use this to measure a first-ever run at a block,
+  and warm up once before measuring otherwise — the first run at a block fills
+  both caches.
 
 ## CSV columns
 
