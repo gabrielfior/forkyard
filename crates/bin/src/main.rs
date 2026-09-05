@@ -22,8 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forkyard_api_mcp::ForkyardMcpServer;
+use forkyard_fetch::Fork;
 use forkyard_ingest::ChainTipFollower;
-use forkyard_session::SessionManager;
+use forkyard_session::{BlockForkFuture, SessionManager, DEFAULT_MAX_PINNED_BLOCKS};
 use tracing_subscriber::EnvFilter;
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -50,22 +51,42 @@ async fn main() -> eyre::Result<()> {
     let fork_block_number: Option<u64> =
         std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
+    // How many *explicitly pinned* blocks (`POST /session {"block_number":
+    // N}`) stay warm at once, on top of the default one. Each costs its own
+    // fetch backend — cache plus background thread — so this is a real
+    // memory bound, not a tidy-up.
+    let max_pinned_blocks: usize = env_or("FORKYARD_MAX_PINNED_BLOCKS", DEFAULT_MAX_PINNED_BLOCKS);
+
     let (fork, block_env) = match fork_block_number {
         Some(n) => forkyard_fetch::fork_at(&rpc_url, n).await?,
         None => forkyard_fetch::fork(&rpc_url).await?,
     };
-    let manager = Arc::new(SessionManager::new(
-        fork,
-        block_env,
-        num_workers,
-        Duration::from_secs(ttl_secs),
-    ));
-    tracing::info!(num_workers, ttl_secs, "forked upstream chain, session manager ready");
+    // The factory is the only thing that knows the RPC URL — `forkyard-session`
+    // deliberately doesn't, which is what keeps it unit-testable with an
+    // in-memory fallback and no network.
+    let fork_rpc_url = rpc_url.clone();
+    let manager = Arc::new(
+        SessionManager::new(fork, block_env, num_workers, Duration::from_secs(ttl_secs)).with_block_forks(
+            move |number: u64| -> BlockForkFuture<Fork> {
+                let rpc_url = fork_rpc_url.clone();
+                Box::pin(async move {
+                    forkyard_fetch::fork_at(&rpc_url, number).await.map_err(|e| e.to_string())
+                })
+            },
+            max_pinned_blocks,
+        ),
+    );
+    tracing::info!(num_workers, ttl_secs, max_pinned_blocks, "forked upstream chain, session manager ready");
 
     // Background chain-tip follower — only when the fork isn't pinned to an
     // explicit block. A pinned historical block and "keep following the
     // tip" are contradictory: re-forking to a newer block would silently
     // defeat the whole point of FORKYARD_FORK_BLOCK_NUMBER.
+    //
+    // It refreshes the *default* base only (`refresh_fallback`), never the
+    // per-session pinned blocks: a session opened with `{"block_number":
+    // N}` is reproducing something at N and must not be dragged to the tip
+    // underneath the agent using it.
     let ingest_handle = match fork_block_number {
         Some(n) => {
             tracing::info!(block = n, "fork pinned to an explicit block; chain-tip following disabled");

@@ -54,7 +54,15 @@ async fn fork_impl(rpc_url: &str, block: BlockId) -> eyre::Result<(Fork, BlockEn
 
     let meta = BlockchainDbMeta::new(block_env.clone(), rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);
-    let backend = SharedBackend::spawn_backend_thread(provider, db, None);
+    // Pin the backend's *state* reads to the same block the `BlockEnv` was
+    // read from. `SharedBackend`'s `pin_block: None` means every
+    // account/storage/code fetch goes to `latest` no matter which block was
+    // forked — so `fork_at(url, N)` used to be a block-number label stuck on
+    // live state, not a fork of block N. Invisible when forking the tip;
+    // fatal for per-session block pinning, where two sessions at different
+    // blocks would otherwise read the exact same (latest) state.
+    let pin = BlockId::number(block_env.number.to::<u64>());
+    let backend = SharedBackend::spawn_backend_thread(provider, db, Some(pin));
     Ok((WrapDatabaseRef(backend), block_env))
 }
 
