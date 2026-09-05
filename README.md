@@ -74,33 +74,33 @@ of isolation is an OS process with its own cache; forkyard's is a session inside
 one process sharing one warm cache. That should be invisible for one agent, and
 start to matter as agents multiply.
 
-Three measurements, on an Apple M3 Pro against a mainnet archive endpoint, both
-tools starting cold:
+Three results, median of five runs on an Apple M3 Pro against a mainnet archive
+endpoint, with **both tools' persistent caches warm**:
 
-**One shared cache, flat upstream traffic.** With every agent reading the same
-contracts, forkyard sent **37 upstream JSON-RPC calls whether 1 agent or 50 were
-running** — identical across independent runs — against 76 → 2,125 for
-process-per-agent. When agents read *disjoint* state instead, the gap narrows to
-about 2×, which is the control that shows the first number is really measuring
-cache sharing.
+**Reading shared state costs one upstream call, at any scale.** With every agent
+reading the same contracts, forkyard sent **1 upstream JSON-RPC call whether 1
+agent or 50 were running** — identical in all five runs — against 3 → 300 for a
+cache-per-process design. When agents read *disjoint* state the gap falls under
+2×, which is the control showing the first number really is cache sharing.
 
 **Isolated agents are cheap in memory.** At 50 agents writing concurrently, each
-verifying it reads back its own value, forkyard used **18.9 MB in one process**
-against **1,546 MB across 50 Anvil instances** — its footprint moved 16.8 → 18.9
-MB going from 1 agent to 50, because a session is not a process.
+verifying it reads back its own value, forkyard used **23 MB in one process**
+against **1,434 MB across 50 Anvil instances** — its footprint moved 21 → 23 MB
+going from 1 agent to 50, because a session is not a process.
 
-**Restarts stay warm.** Both tools persist a fetch cache; on a second run at the
-same block forkyard needed **1 upstream call** against 15, having refetched
-everything on every start before that feature existed.
+**Branching from a live state is ~1,600× cheaper than re-forking.** Opening a
+branch from another session's current state takes **0.7 ms**, against 1,156 ms
+to spawn a process and replay the setup; 32 branches from one prefix finish in
+0.54s against 2.06s.
 
-Anvil is the better tool in other regimes — rewinding a single timeline
-(`evm_snapshot` costs ~1 ms regardless of dirty state), per-interaction latency
-past a few tens of concurrent agents, cold unshared state, and anything with one
-agent.
+Anvil is the better tool in other regimes — notably past a few tens of
+concurrent agents, where forkyard's four-thread ceiling decides it (50 agents:
+2.72s against 6.34s), and for rewinding a single timeline, where `evm_snapshot`
+costs about a millisecond regardless of dirty state.
 
 **[benchmark.md](benchmark.md)** has the full set: methodology, every result
-including those that favour Anvil, measured variance, and commands to reproduce
-each one.
+including those that favour Anvil, the measured run-to-run spread, and commands
+to reproduce each one.
 
 ## Build from source
 
