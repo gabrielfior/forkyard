@@ -1,0 +1,3 @@
+backend,block_height,num_agents,episodes,http_requests,jsonrpc_calls,calls_per_agent,upstream_errors,top_methods
+forkyard,25795072,10,1,37,37,3.7,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,10,1,778,778,77.8,0,"{""eth_getBalance"": 190, ""eth_getTransactionCount"": 190, ""eth_getCode"": 190, ""eth_getAccountInfo"": 98, ""eth_getStorageAt"": 80}"

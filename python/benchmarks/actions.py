@@ -156,5 +156,20 @@ def swap_token_for_token(
     return _timed("swap_token_for_token", do)
 
 
+def read_contract(backend: Backend, address: str, data_hex: str) -> ActionResult:
+    """Read one contract's state without writing anything.
+
+    `eth_estimateGas` is the read primitive both backends share — forkyard's
+    HTTP surface has no `eth_call` — and it does the job: it executes the
+    call in the EVM, so a `getReserves()` here pulls the pair's code and its
+    reserve slot through whatever cache the backend has. The account read
+    alongside it adds the balance/nonce half of the same fetch."""
+    def do():
+        w3 = backend.web3()
+        w3.eth.estimate_gas({"to": address, "data": data_hex})
+        w3.eth.get_balance(address)
+    return _timed("read_contract", do)
+
+
 def discard_session(backend: Backend) -> ActionResult:
     return _timed("discard", backend.discard)

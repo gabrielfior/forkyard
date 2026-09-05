@@ -85,7 +85,10 @@ class AnvilBackend:
 
     name = "anvil"
 
-    def __init__(self, port: int, fork_url: str, fork_block_number: int, startup_timeout_s: float = 20.0):
+    def __init__(
+        self, port: int, fork_url: str, fork_block_number: int,
+        startup_timeout_s: float = 20.0, rpc_cache: bool = False,
+    ):
         try:
             self._process = subprocess.Popen(
                 [
@@ -94,6 +97,18 @@ class AnvilBackend:
                     "--fork-block-number", str(fork_block_number),
                     "--port", str(port),
                     "--silent",
+                    # Foundry otherwise persists fetched fork state under
+                    # ~/.foundry/cache/rpc/<chain>/<block>/, so the second and
+                    # every later Anvil at a given block reads state the
+                    # *previous benchmark runs* fetched — measured directly:
+                    # whole sweeps where Anvil made zero upstream state calls
+                    # and still answered every read. forkyard has no such
+                    # cross-process cache; it refills in memory on each
+                    # process start. Disabling this is what makes the two
+                    # comparable, and what stops a sweep from measuring the
+                    # machine's benchmark history. `rpc_cache=True` puts it
+                    # back, to measure the cache itself.
+                    *([] if rpc_cache else ["--no-storage-caching"]),
                 ],
             )
         except FileNotFoundError as e:

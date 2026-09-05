@@ -1,0 +1,11 @@
+backend,block_height,num_agents,episodes,http_requests,jsonrpc_calls,calls_per_agent,upstream_errors,top_methods
+forkyard,25795072,1,1,37,37,37.0,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,1,1,78,78,78.0,0,"{""eth_getBalance"": 19, ""eth_getCode"": 19, ""eth_getTransactionCount"": 19, ""eth_getAccountInfo"": 10, ""eth_getStorageAt"": 8}"
+forkyard,25795072,5,1,37,37,7.4,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,5,1,390,390,78.0,0,"{""eth_getBalance"": 95, ""eth_getTransactionCount"": 95, ""eth_getCode"": 95, ""eth_getAccountInfo"": 50, ""eth_getStorageAt"": 40}"
+forkyard,25795072,10,1,37,37,3.7,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,10,1,780,780,78.0,0,"{""eth_getBalance"": 190, ""eth_getCode"": 190, ""eth_getTransactionCount"": 190, ""eth_getAccountInfo"": 100, ""eth_getStorageAt"": 80}"
+forkyard,25795072,25,1,37,37,1.5,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,25,1,1732,1732,69.3,0,"{""eth_getTransactionCount"": 424, ""eth_getBalance"": 423, ""eth_getCode"": 423, ""eth_getAccountInfo"": 219, ""eth_getStorageAt"": 168}"
+forkyard,25795072,50,1,37,37,0.7,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
+anvil,25795072,50,1,3201,3201,64.0,0,"{""eth_getCode"": 781, ""eth_getTransactionCount"": 779, ""eth_getBalance"": 778, ""eth_getAccountInfo"": 401, ""eth_getStorageAt"": 312}"
