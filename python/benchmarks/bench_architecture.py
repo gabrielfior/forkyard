@@ -497,7 +497,7 @@ def start_forkyard(rpc_url: str, block_height: int) -> subprocess.Popen:
             env={
                 **os.environ,
                 "RPC_URL": rpc_url,
-                "BRANCHING_FORKYARD_PORT": str(BRANCHING_FORKYARD_PORT),
+                "FORKYARD_PORT": str(BRANCHING_FORKYARD_PORT),
                 "FORKYARD_MCP_HTTP_PORT": str(BRANCHING_FORKYARD_MCP_PORT),
                 "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
             },
@@ -862,7 +862,7 @@ def checkpoint_main() -> None:
                     env={
                         **os.environ,
                         "RPC_URL": args.rpc_url,
-                        "CHECKPOINT_FORKYARD_PORT": str(CHECKPOINT_FORKYARD_PORT),
+                        "FORKYARD_PORT": str(CHECKPOINT_FORKYARD_PORT),
                         "FORKYARD_MCP_HTTP_PORT": str(CHECKPOINT_FORKYARD_MCP_PORT),
                         "FORKYARD_FORK_BLOCK_NUMBER": str(args.block_height),
                     },
@@ -1051,7 +1051,7 @@ def sweep_forkyard(
         env={
             **os.environ,
             "RPC_URL": rpc_url,
-            "WRITERS_FORKYARD_PORT": str(WRITERS_FORKYARD_PORT),
+            "FORKYARD_PORT": str(WRITERS_FORKYARD_PORT),
             "FORKYARD_MCP_HTTP_PORT": str(WRITERS_FORKYARD_MCP_PORT),
             "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
         },

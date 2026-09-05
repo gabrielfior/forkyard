@@ -67,7 +67,7 @@ def run_forkyard(
     env = {
         **os.environ,
         "RPC_URL": rpc_url,
-        "WARMSTART_FORKYARD_PORT": str(WARMSTART_FORKYARD_PORT),
+        "FORKYARD_PORT": str(WARMSTART_FORKYARD_PORT),
         "FORKYARD_MCP_HTTP_PORT": str(WARMSTART_FORKYARD_MCP_PORT),
         "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
         "FORKYARD_CACHE_DIR": str(cache_dir),
@@ -479,7 +479,7 @@ def run_forkyard_arm(
     env = {
         **os.environ,
         "RPC_URL": rpc_url,
-        "BLOCKS_FORKYARD_PORT": str(BLOCKS_FORKYARD_PORT),
+        "FORKYARD_PORT": str(BLOCKS_FORKYARD_PORT),
         "FORKYARD_MCP_HTTP_PORT": str(BLOCKS_FORKYARD_MCP_PORT),
         # Above B, always: at or below it the LRU starts evicting bases
         # mid-round and the arm would measure eviction-and-refetch rather

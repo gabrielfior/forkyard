@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import bench_architecture
 import bench_common
 import csv
@@ -1169,3 +1171,53 @@ def test_writers_cli_refuses_to_run_without_an_endpoint(monkeypatch, capsys):
     with pytest.raises(SystemExit):
         bench_architecture.writers_main()
     assert "--rpc-url" in capsys.readouterr().err
+
+
+def test_every_sweep_passes_the_real_forkyard_env_var_names(monkeypatch):
+    """A refactor once renamed the string "FORKYARD_PORT" itself, so forkyard
+    fell back to its default port and collided with whatever was already
+    there. The failure looked like a flaky port, not a typo."""
+    import bench_cache
+    import bench_load
+
+    seen: list[dict[str, str]] = []
+
+    class FakeProcess:
+        pid = 1
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    def fake_popen(argv, env=None, **kwargs):
+        if argv[:1] == ["forkyard"]:
+            seen.append(env or {})
+        raise RuntimeError("stop here — only the env is under test")
+
+    for module in (bench_architecture, bench_load, bench_cache):
+        monkeypatch.setattr(module.subprocess, "Popen", fake_popen, raising=False)
+    monkeypatch.setattr(bench_architecture, "process_pids", lambda name: set())
+
+    for call in (
+        lambda: bench_architecture.sweep_forkyard("http://rpc", 1, 1, 1, 0.1),
+        lambda: bench_cache.run_forkyard("http://rpc", 1, 1, ["0xabc"], Path("/tmp/x")),
+    ):
+        try:
+            call()
+        except Exception:
+            pass
+
+    # One env per call site: a signature mismatch that skipped a call would
+    # otherwise let the buggy one go unchecked, which is how the first
+    # version of this test passed while the bug was present.
+    assert len(seen) == 2, f"expected both call sites to start forkyard, saw {len(seen)}"
+    for env in seen:
+        assert "FORKYARD_PORT" in env, sorted(k for k in env if "FORKYARD" in k)
+        assert "FORKYARD_FORK_BLOCK_NUMBER" in env
+        assert not any(k.startswith(("WRITERS_", "BRANCHING_", "CHECKPOINT_", "BLOCKS_", "WARMSTART_"))
+                       for k in env), "a benchmark-local prefix leaked into an env var name"
