@@ -14,7 +14,7 @@ def test_erc20_balance_slot_matches_known_dai_vector():
     assert slot == expected
 
 
-def test_anvil_is_spawned_with_rpc_caching_disabled(monkeypatch):
+def test_anvil_uses_foundrys_cache_by_default(monkeypatch):
     """Without it Anvil serves fork state from ~/.foundry/cache written by
     earlier runs, while forkyard refills from the endpoint every start."""
     import backend as backend_module
@@ -42,11 +42,11 @@ def test_anvil_is_spawned_with_rpc_caching_disabled(monkeypatch):
 
     backend_module.AnvilBackend(8545, "http://rpc.example", 20_000_000)
 
-    assert "--no-storage-caching" in spawned["argv"]
+    assert "--no-storage-caching" not in spawned["argv"]
     assert spawned["argv"][:2] == ["anvil", "--fork-url"]
 
 
-def test_anvil_rpc_cache_can_be_enabled_to_measure_the_cache_itself(monkeypatch):
+def test_anvil_rpc_cache_can_be_disabled_to_measure_a_cold_start(monkeypatch):
     import backend as backend_module
 
     spawned: dict[str, list[str]] = {}
@@ -69,6 +69,6 @@ def test_anvil_rpc_cache_can_be_enabled_to_measure_the_cache_itself(monkeypatch)
     )
     monkeypatch.setattr(backend_module.AnvilBackend, "_wait_until_ready", lambda self, timeout: None)
 
-    backend_module.AnvilBackend(8545, "http://rpc.example", 20_000_000, rpc_cache=True)
+    backend_module.AnvilBackend(8545, "http://rpc.example", 20_000_000, rpc_cache=False)
 
-    assert "--no-storage-caching" not in spawned["argv"]
+    assert "--no-storage-caching" in spawned["argv"]

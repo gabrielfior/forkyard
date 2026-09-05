@@ -124,8 +124,8 @@ def test_forkyard_is_stopped_politely_so_its_cache_actually_lands(monkeypatch):
 
 
 def test_anvil_runs_with_foundrys_cache_enabled(monkeypatch):
-    """Every other benchmark passes --no-storage-caching. Here the cache is
-    the subject, so this arm must opt back in or the warm row is meaningless."""
+    """The cold row clears the cache; the arm itself must never disable it,
+    or the warm row measures nothing."""
     seen: list[bool] = []
 
     def fake_anvil(port, fork_url, block, rpc_cache=False):

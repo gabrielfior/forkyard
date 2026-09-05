@@ -77,7 +77,7 @@ class AnvilBackend:
 
     def __init__(
         self, port: int, fork_url: str, fork_block_number: int,
-        startup_timeout_s: float = 20.0, rpc_cache: bool = False,
+        startup_timeout_s: float = 20.0, rpc_cache: bool = True,
     ):
         try:
             self._process = subprocess.Popen(
@@ -87,10 +87,11 @@ class AnvilBackend:
                     "--fork-block-number", str(fork_block_number),
                     "--port", str(port),
                     "--silent",
-                    # Without this Anvil serves fork state from
-                    # ~/.foundry/cache written by *earlier runs* (measured:
-                    # sweeps with zero upstream state calls), while forkyard
-                    # refills from the endpoint every start.
+                    # Foundry's ~/.foundry/cache is on by default here because
+                    # forkyard now persists its own per-(chain, block) cache:
+                    # the like-for-like comparison is warm against warm. Pass
+                    # rpc_cache=False, and FORKYARD_CACHE_DISABLED on the other
+                    # side, to measure both cold.
                     *([] if rpc_cache else ["--no-storage-caching"]),
                 ],
             )

@@ -165,6 +165,7 @@ def run_forkyard_sweep(
     rpc_url: str, block_height: int, num_agents: int, actions_per_agent: int,
     port: int, mcp_port: int, episodes: int = 1,
     contracts_per_agent: list[list[str]] | None = None,
+    cold_cache: bool = False,
 ) -> tuple[list[ActionRecord], float]:
     env = {
         **os.environ,
@@ -173,6 +174,13 @@ def run_forkyard_sweep(
         "FORKYARD_MCP_HTTP_PORT": str(mcp_port),
         "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
     }
+    # Set explicitly either way: inheriting a stale FORKYARD_CACHE_DISABLED
+    # from the shell would silently make a warm run cold, which reads as
+    # "persistence does nothing" rather than as a misconfiguration.
+    if cold_cache:
+        env["FORKYARD_CACHE_DISABLED"] = "1"
+    else:
+        env.pop("FORKYARD_CACHE_DISABLED", None)
     try:
         process = subprocess.Popen(["forkyard"], env=env)
     except FileNotFoundError as e:
@@ -201,7 +209,7 @@ def run_anvil_sweep(
     rpc_url: str, block_height: int, num_agents: int, actions_per_agent: int,
     base_port: int, episodes: int = 1,
     contracts_per_agent: list[list[str]] | None = None,
-    anvil_rpc_cache: bool = False,
+    anvil_rpc_cache: bool = True,
 ) -> tuple[list[ActionRecord], float]:
     # Timed per agent and episode: spawn + wait-until-ready, actions, and
     # the discard that kills the process. Anvil has no shared startup to
@@ -236,11 +244,11 @@ def main() -> None:
              "from such a run are not comparable to a direct one.",
     )
     parser.add_argument(
-        "--anvil-rpc-cache", action="store_true",
-        help="let Anvil use ~/.foundry/cache (off by default). Anvil persists "
-             "fetched fork state per pinned block and reuses it across processes "
-             "and runs; forkyard has no cross-process cache, so leaving this on "
-             "makes a sweep partly a measurement of earlier sweeps.",
+        "--cold-caches", action="store_true",
+        help="run both backends without their persistent caches: Anvil with "
+             "--no-storage-caching, forkyard with FORKYARD_CACHE_DISABLED. Both "
+             "keep a per-(chain, block) cache across runs, so the default here "
+             "is warm against warm; use this to measure a first-ever run.",
     )
     parser.add_argument(
         "--state-overlap", choices=["shared", "disjoint"], default=None,
@@ -291,10 +299,11 @@ def main() -> None:
                         )
                         for sweep_fn, label in [
                             (lambda bh=block_height, na=num_agents, cpa=contracts_per_agent: run_forkyard_sweep(
-                                rpc_url, bh, na, args.actions_per_agent, 18555, 18556, args.episodes, cpa), "forkyard"),
+                                rpc_url, bh, na, args.actions_per_agent, 18555, 18556, args.episodes, cpa,
+                                args.cold_caches), "forkyard"),
                             (lambda bh=block_height, na=num_agents, cpa=contracts_per_agent: run_anvil_sweep(
                                 rpc_url, bh, na, args.actions_per_agent, 19000, args.episodes, cpa,
-                                args.anvil_rpc_cache), "anvil"),
+                                not args.cold_caches), "anvil"),
                         ]:
                             print(
                                 f"running {label}: block={block_height} agents={num_agents} "

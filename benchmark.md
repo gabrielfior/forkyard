@@ -68,8 +68,16 @@ The exception is [Restart cost](#restart-cost), where both are switched **on**,
 because they are the subject.
 
 **One benchmark at a time.** A second benchmark sharing CPU, ports or RPC quota
-corrupts the first. The whole pass is serial — and even so, see
-[Measurement variance](#measurement-variance).
+corrupts the first. The whole pass is serial.
+
+**forkyard runs on its shipped defaults**, in particular
+`FORKYARD_NUM_WORKERS=4` — the thread pool sessions are sharded over. That
+default is the concurrency ceiling these numbers run into: at 100 agents the
+same sweep took 13.1s at 4 workers and 5.5s at 12 on a 12-core machine, and
+session opens degrade from ~4ms to several hundred as agents pile up. Raising
+it is the first thing to try before concluding anything about forkyard under
+load; the tables here deliberately do not, because the default is what a user
+gets.
 
 **A bug that invalidated earlier numbers.** Until commit `874dfd2`,
 `SharedBackend` was spawned with `pin_block: None`, so `FORKYARD_FORK_BLOCK_NUMBER`
