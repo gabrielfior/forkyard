@@ -1,2 +1,0 @@
-backend,agents,refreshes,ok_refreshes,lag_p50,lag_p95,refresh_ms_p50,refresh_ms_p95,http_requests,jsonrpc_calls,calls_per_agent_refresh,upstream_errors,top_methods
-forkyard,5,20,20,39.5,82.0,17.4,25.752,14,14,0.7,2,"{""eth_getBlockByNumber"": 14}"

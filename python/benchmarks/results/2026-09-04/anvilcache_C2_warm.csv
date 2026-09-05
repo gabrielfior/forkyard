@@ -1,3 +1,0 @@
-backend,block_height,num_agents,episodes,http_requests,jsonrpc_calls,calls_per_agent,upstream_errors,top_methods
-forkyard,25795072,10,1,37,37,3.7,0,"{""eth_getBalance"": 9, ""eth_getTransactionCount"": 9, ""eth_getCode"": 9, ""eth_getStorageAt"": 8, ""eth_getBlockByNumber"": 1}"
-anvil,25795072,10,1,30,30,3.0,0,"{""eth_chainId"": 10, ""eth_getBlockByNumber"": 10, ""eth_gasPrice"": 10}"

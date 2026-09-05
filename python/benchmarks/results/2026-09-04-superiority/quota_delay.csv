@@ -1,8 +1,0 @@
-backend,quota_rps,num_agents,action_success_rate,wall_clock_ms,jsonrpc_calls,throttled_calls,total_delay_ms,max_sustainable_agents
-forkyard,10,5,1.0,6397.3,73,46,18654.9,5
-forkyard,10,25,0.91,42917.2,207,120,74984.4,5
-anvil,10,5,0.0,20231.6,215,198,1862513.8,0
-forkyard,50,5,1.0,4928.0,73,0,0.0,25
-forkyard,50,25,1.0,5327.0,204,0,0.0,25
-anvil,50,5,1.0,10880.5,454,154,86076.9,5
-anvil,50,25,0.0,20373.7,866,796,6094330.9,5
