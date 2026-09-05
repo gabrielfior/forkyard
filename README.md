@@ -4,7 +4,7 @@
 
 Instant, disposable forks of live EVM chain state — for AI agents that need to simulate a transaction before committing gas or capital.
 
-For a single agent, [Anvil](https://book.getfoundry.sh/anvil/) is simpler and already enough — it is the standard for good reason, and forkyard is measured against it throughout. Forkyard is for once there's more than one concurrent agent/session: one process, one shared warm cache across many isolated sessions, with MCP (stdio), MCP (Streamable HTTP), and JSON-RPC (HTTP) surfaces all running side by side out of the box.
+One process, one shared warm cache, many isolated sessions — with MCP (stdio), MCP (Streamable HTTP) and JSON-RPC (HTTP) surfaces running side by side out of the box. [Anvil](https://book.getfoundry.sh/anvil/) is the standard here and stays the simpler choice for a single agent; [when each tool wins](#forkyard-or-anvil) is measured below.
 
 ## Install
 
@@ -47,7 +47,7 @@ The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, bu
 | `FORKYARD_PORT` | `8555` | HTTP JSON-RPC port. |
 | `FORKYARD_MCP_HTTP_PORT` | `8556` | MCP-over-Streamable-HTTP port. |
 | `FORKYARD_SESSION_TTL_SECS` | `3600` | Idle lifetime of a session before it's reaped. |
-| `FORKYARD_NUM_WORKERS` | `4` | OS threads sessions are sharded across. The default is deliberately small; under heavy concurrency it is the first thing to raise — see [Benchmark](#benchmark), where 100 concurrent agents ran 2.4x faster at `12` (13.06s → 5.49s). |
+| `FORKYARD_NUM_WORKERS` | `4` | OS threads sessions are sharded across. The default is deliberately small; under heavy concurrency it is the first thing to raise — see [benchmark.md](benchmark.md), where 100 concurrent agents ran 2.4x faster at `12`. |
 | `FORKYARD_FORK_BLOCK_NUMBER` | *(unset)* | Pin the fork to an explicit historical block instead of following the chain tip. When set, the background chain-tip follower is **disabled** — re-forking to a newer block would defeat the point of pinning — so every session sees exactly that block for the process's whole lifetime. Reproducible runs (benchmarks, regression tests) want this; note that your `RPC_URL` must actually serve historical state at that height, which some public endpoints only do on a paid tier. |
 | `FORKYARD_CACHE_DIR` | `$HOME/.forkyard/cache` | Where the fork cache is persisted between runs, as `<dir>/<chain_id>/<block_number>.json` — accounts, contract code, storage slots and block hashes, so a restart at the same block starts warm instead of refetching everything. Written atomically on shutdown (including SIGTERM) and loaded at startup; a file that's missing, truncated, from another chain or block, or in an older format is logged and ignored, and the process starts cold rather than failing. This is the equivalent of Foundry's `~/.foundry/cache/rpc/<chain>/<block>/storage.json`, and it's a separate directory on purpose — the two formats are unrelated. |
 | `FORKYARD_CACHE_DISABLED` | *(unset)* | Set to `1`/`true` to neither load nor save the persisted cache — every start is a cold start. What a benchmark toggles to measure cold and warm in one run; measured here, 5 agents reading 4 contracts at a pinned block cost 14 upstream calls cold and **1** on a restart with the cache in place. |
@@ -64,43 +64,29 @@ The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, bu
 - **Three cheatcodes live on the JSON-RPC surface, not just MCP** — alongside `forkyard_setBalance` there's `forkyard_setStorageAt(address, slot, value)`, which writes one raw storage slot in that session's overlay (how you mint yourself an ERC-20 balance: compute the `balanceOf` mapping slot and set it — see `python/benchmarks/backend.py`), and `forkyard_discard()`, the HTTP counterpart to the `discard` MCP tool for tearing a session down ahead of its TTL. All three affect only the calling session's overlay.
 - **Branching a session — `forkyard_forkFrom()`** — opens a *new* session whose starting state is the calling session's current state (the shared base plus everything that session has written or cached), and answers with `{"session_id": …}`, the same shape `POST /session` returns. From that moment the two are independent: neither sees the other's later writes, a child can be branched again, and discarding the parent leaves its children fully working. This is the one thing `evm_snapshot`/`evm_revert` can't express — a snapshot stack has one live branch at a time — and it costs a fold of that session's overlay into a fresh structurally-shared base, not a state dump.
 
-## Benchmark
+## forkyard or Anvil?
 
-[Anvil](https://book.getfoundry.sh/anvil/) is the standard tool for forked-state
-simulation and a very good one — it is what forkyard measures itself against
-because it is what everyone already reaches for, and for a single agent it stays
-the simpler choice. The difference the benchmarks probe is narrow: Anvil's unit
-of isolation is an OS process with its own cache; forkyard's is a session inside
-one process sharing one warm cache. That should be invisible for one agent, and
-start to matter as agents multiply.
+[Anvil](https://book.getfoundry.sh/anvil/) is the standard for forked-state
+simulation and the right default: for one agent, or a handful of long-lived
+ones, it is simpler and — with both caches warm — faster. forkyard is for the
+shapes below, where making a *session* rather than a *process* the unit of
+isolation changes the numbers.
 
-Three results, median of five runs on an Apple M3 Pro against a mainnet archive
-endpoint, with **both tools' persistent caches warm**:
+| Reach for | When | Measured |
+| --- | --- | --- |
+| **forkyard** | Exploring K what-ifs from one state | branch in **0.7 ms** vs 1,156 ms to respawn and replay; 32 branches in **0.54 s** vs 2.06 s (9.87 s through `evm_snapshot`, which is serial by design) |
+| **forkyard** | Forks are disposable — one per hypothesis | acquire in **4 ms** vs 627 ms; 10 agents × 10 forks in **9.2 s** vs 13.6 s |
+| **forkyard** | Dozens of isolated agents at once | 50 concurrent writers in **23 MB, one process** vs 1,434 MB across 50 |
+| **forkyard** | Agents read the same hot contracts, or upstream is metered | **1 upstream call at any agent count** vs 3 → 300 as agents scale |
+| **forkyard** | Agents need different fork blocks | one process, cost scaling with blocks not agents; Anvil needs a process per block |
+| **Anvil** | More than ~25 concurrent long-lived agents | 50 agents: **2.7 s** vs 6.3 s — forkyard's 4-thread default becomes the ceiling |
+| **Anvil** | Rewinding a single timeline | `evm_snapshot` ~**1 ms** flat at any dirty-state size; forkyard has no equivalent |
+| **Anvil** | You need the full RPC surface or cheatcodes | forkyard has no `eth_call`, `eth_getCode` or `eth_getStorageAt` |
+| **Anvil** | One agent | every forkyard advantage here begins at "more than one" |
 
-**Reading shared state costs one upstream call, at any scale.** With every agent
-reading the same contracts, forkyard sent **1 upstream JSON-RPC call whether 1
-agent or 50 were running** — identical in all five runs — against 3 → 300 for a
-cache-per-process design. When agents read *disjoint* state the gap falls under
-2×, which is the control showing the first number really is cache sharing.
-
-**Isolated agents are cheap in memory.** At 50 agents writing concurrently, each
-verifying it reads back its own value, forkyard used **23 MB in one process**
-against **1,434 MB across 50 Anvil instances** — its footprint moved 21 → 23 MB
-going from 1 agent to 50, because a session is not a process.
-
-**Branching from a live state is ~1,600× cheaper than re-forking.** Opening a
-branch from another session's current state takes **0.7 ms**, against 1,156 ms
-to spawn a process and replay the setup; 32 branches from one prefix finish in
-0.54s against 2.06s.
-
-Anvil is the better tool in other regimes — notably past a few tens of
-concurrent agents, where forkyard's four-thread ceiling decides it (50 agents:
-2.72s against 6.34s), and for rewinding a single timeline, where `evm_snapshot`
-costs about a millisecond regardless of dirty state.
-
-**[benchmark.md](benchmark.md)** has the full set: methodology, every result
-including those that favour Anvil, the measured run-to-run spread, and commands
-to reproduce each one.
+Medians of five warm runs on an Apple M3 Pro against a mainnet archive endpoint.
+**[benchmark.md](benchmark.md)** has the methodology, the run-to-run spread, the
+results that did not favour forkyard, and commands to reproduce each one.
 
 ## Build from source
 
