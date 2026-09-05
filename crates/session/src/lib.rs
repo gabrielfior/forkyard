@@ -70,12 +70,31 @@ impl fmt::Display for SessionError {
 }
 impl std::error::Error for SessionError {}
 
-enum Job<F> {
+// The `DatabaseRef` bound is only here because `Branch`/`Adopt` carry a
+// whole `Session<F>` between workers, and `Session` declares it on its own
+// type parameter; every `F` this crate instantiates `Job` with is a
+// `Fallback`, which already implies it.
+enum Job<F: DatabaseRef> {
     Fork {
         id: SessionId,
         base: Arc<BaseSnapshot>,
         fallback: F,
         block_env: BlockEnv,
+        reply: oneshot::Sender<()>,
+    },
+    /// Take a branch of `parent`'s current state on the worker that owns
+    /// it, handing the ready-made child back for `fork_from` to register
+    /// on whichever worker its own id lands on. Two hops, because parent
+    /// and child are almost never on the same shard.
+    Branch {
+        parent: SessionId,
+        reply: oneshot::Sender<Result<Box<Session<F>>, SessionError>>,
+    },
+    /// Register an already-built session (a `Branch`'s child) under `id`,
+    /// on the same insert-with-a-fresh-TTL-stamp path `Fork` takes.
+    Adopt {
+        id: SessionId,
+        session: Box<Session<F>>,
         reply: oneshot::Sender<()>,
     },
     Simulate {
@@ -217,6 +236,40 @@ where
                 block_env: self.block_env(),
                 reply,
             })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?;
+        Ok(id)
+    }
+
+    /// Branch a new session off `parent`'s *current* state — everything
+    /// `parent` has written or cached so far, not just the shared base
+    /// `fork` starts from. This is the "K what-ifs from where this agent
+    /// already got to" primitive: still no state copy (see
+    /// `Session::branch`), where Anvil needs either K sequential
+    /// snapshot/revert cycles in one process or K processes each redoing
+    /// the setup.
+    ///
+    /// The child is an ordinary session from the registry's point of view:
+    /// its own id, its own shard (`worker_for` hashes ids, so it usually
+    /// isn't the parent's), its own TTL clock, discardable on its own. The
+    /// parent stays live and independent — branching only reads it, and
+    /// the two never see each other's later writes.
+    ///
+    /// Errors with `SessionError::Unknown` if `parent` is unknown or has
+    /// already expired.
+    pub async fn fork_from(&self, parent: SessionId) -> Result<SessionId, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(parent)
+            .send(Job::Branch { parent, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        let session = rx.await.map_err(|_| SessionError::WorkerGone)??;
+
+        // The id is allocated only once the branch actually succeeded, so
+        // a `fork_from` against a dead parent doesn't burn one.
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Adopt { id, session, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
         Ok(id)
@@ -374,6 +427,23 @@ where
     match job {
         Job::Fork { id, base, fallback, block_env, reply } => {
             sessions.insert(id, (Session::fork(base, fallback, block_env), Instant::now()));
+            let _ = reply.send(());
+        }
+        Job::Branch { parent, reply } => {
+            let result = match sessions.get_mut(&parent) {
+                Some((session, touched)) => {
+                    // Branching counts as activity on the parent: a root
+                    // session an agent only ever branches from must not be
+                    // reaped out from under the tree mid-run.
+                    *touched = Instant::now();
+                    Ok(Box::new(session.branch()))
+                }
+                None => Err(SessionError::Unknown(parent)),
+            };
+            let _ = reply.send(result);
+        }
+        Job::Adopt { id, session, reply } => {
+            sessions.insert(id, (*session, Instant::now()));
             let _ = reply.send(());
         }
         Job::Simulate { id, tx, disable_checks, reply } => {
@@ -566,6 +636,139 @@ mod tests {
             result_b.is_success(),
             "b must not observe a's overlay write — it shares the base and fallback, not a's session"
         );
+    }
+
+    /// Balance is the only session state `SessionManager` can read back
+    /// directly (`basic`), so the branching tests express "did this state
+    /// come along / stay isolated" as balances on distinct addresses.
+    async fn fund(mgr: &SessionManager<FundedFallback>, id: SessionId, address: Address, balance: u64) {
+        mgr.set_account(id, address, AccountInfo { balance: U256::from(balance), ..Default::default() })
+            .await
+            .unwrap();
+    }
+
+    async fn balance_of(mgr: &SessionManager<FundedFallback>, id: SessionId, address: Address) -> U256 {
+        mgr.basic(id, address).await.unwrap().unwrap().balance
+    }
+
+    #[tokio::test]
+    async fn fork_from_starts_the_child_where_the_parent_had_got_to() {
+        let mgr = manager();
+        let parent = mgr.fork().await.unwrap();
+        let touched = Address::from([0x31; 20]);
+        fund(&mgr, parent, touched, 500).await;
+
+        let child = mgr.fork_from(parent).await.unwrap();
+
+        assert_eq!(balance_of(&mgr, child, touched).await, U256::from(500));
+        // The child is a session like any other, registered on its own
+        // shard — not a view onto the parent.
+        assert_ne!(child, parent);
+        assert_eq!(mgr.active_session_count(), 2);
+
+        // A session forked from the shared base instead of the parent
+        // sees none of it — this is what fork_from adds over fork.
+        let sibling = mgr.fork().await.unwrap();
+        assert_eq!(balance_of(&mgr, sibling, touched).await, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn a_child_and_its_parent_never_see_each_others_later_writes() {
+        let mgr = manager();
+        let parent = mgr.fork().await.unwrap();
+        let shared = Address::from([0x41; 20]);
+        fund(&mgr, parent, shared, 1).await;
+
+        let child = mgr.fork_from(parent).await.unwrap();
+        fund(&mgr, child, shared, 999).await;
+        fund(&mgr, parent, shared, 2).await;
+
+        assert_eq!(balance_of(&mgr, parent, shared).await, U256::from(2), "the child's write must not reach the parent");
+        assert_eq!(balance_of(&mgr, child, shared).await, U256::from(999), "the parent's later write must not reach the child");
+
+        // Same thing through real execution, not just the cheatcode: the
+        // whole-balance nonce-0 spend below can only succeed once per
+        // session, so both sides succeeding proves neither replayed into
+        // the other's state.
+        let recipient = Address::from([2u8; 20]);
+        assert!(mgr.advance(parent, spend_funded_balance(recipient)).await.unwrap().is_success());
+        assert!(mgr.advance(child, spend_funded_balance(recipient)).await.unwrap().is_success());
+    }
+
+    #[tokio::test]
+    async fn branching_a_branch_keeps_the_whole_chain_of_state() {
+        let mgr = manager();
+        let root = mgr.fork().await.unwrap();
+        let from_root = Address::from([0x51; 20]);
+        fund(&mgr, root, from_root, 10).await;
+
+        let child = mgr.fork_from(root).await.unwrap();
+        let from_child = Address::from([0x52; 20]);
+        fund(&mgr, child, from_child, 20).await;
+
+        let grandchild = mgr.fork_from(child).await.unwrap();
+        let from_grandchild = Address::from([0x53; 20]);
+        fund(&mgr, grandchild, from_grandchild, 30).await;
+
+        assert_eq!(balance_of(&mgr, grandchild, from_root).await, U256::from(10));
+        assert_eq!(balance_of(&mgr, grandchild, from_child).await, U256::from(20));
+        assert_eq!(balance_of(&mgr, grandchild, from_grandchild).await, U256::from(30));
+
+        // Depth doesn't leak upward either.
+        assert_eq!(balance_of(&mgr, child, from_grandchild).await, U256::ZERO);
+        assert_eq!(balance_of(&mgr, root, from_child).await, U256::ZERO);
+    }
+
+    #[tokio::test]
+    async fn many_children_of_one_parent_are_mutually_isolated() {
+        let mgr = manager();
+        let parent = mgr.fork().await.unwrap();
+        let shared = Address::from([0x61; 20]);
+        fund(&mgr, parent, shared, 7).await;
+
+        // Eight what-ifs off the same state — the case the whole feature
+        // exists for, and more than the manager's two shards, so children
+        // land on both.
+        let mut children = Vec::new();
+        for i in 0..8u64 {
+            let child = mgr.fork_from(parent).await.unwrap();
+            fund(&mgr, child, shared, 100 + i).await;
+            children.push(child);
+        }
+
+        for (i, child) in children.iter().enumerate() {
+            assert_eq!(balance_of(&mgr, *child, shared).await, U256::from(100 + i as u64));
+        }
+        assert_eq!(balance_of(&mgr, parent, shared).await, U256::from(7), "no sibling may write through to the parent");
+    }
+
+    #[tokio::test]
+    async fn children_keep_working_after_their_parent_is_discarded() {
+        let mgr = manager();
+        let parent = mgr.fork().await.unwrap();
+        let touched = Address::from([0x71; 20]);
+        fund(&mgr, parent, touched, 64).await;
+        let child = mgr.fork_from(parent).await.unwrap();
+        let grandchild = mgr.fork_from(child).await.unwrap();
+
+        // The agent tree outlives its root: nothing about the child's
+        // state lives in the parent's session anymore.
+        mgr.discard(parent).await.unwrap();
+
+        assert_eq!(balance_of(&mgr, child, touched).await, U256::from(64));
+        assert_eq!(balance_of(&mgr, grandchild, touched).await, U256::from(64));
+        assert!(mgr.advance(child, spend_funded_balance(Address::from([2u8; 20]))).await.unwrap().is_success());
+    }
+
+    #[tokio::test]
+    async fn fork_from_an_unknown_or_discarded_session_errors_instead_of_panicking() {
+        let mgr = manager();
+        assert!(matches!(mgr.fork_from(999).await, Err(SessionError::Unknown(999))));
+
+        let id = mgr.fork().await.unwrap();
+        mgr.discard(id).await.unwrap();
+        assert!(matches!(mgr.fork_from(id).await, Err(SessionError::Unknown(_))));
+        assert_eq!(mgr.active_session_count(), 0, "a failed fork_from must not register anything");
     }
 
     #[tokio::test]

@@ -126,6 +126,61 @@ impl<F: DatabaseRef> Session<F> {
     pub fn set_storage(&mut self, address: Address, key: StorageKey, value: StorageValue) {
         self.overlay_storage.insert((address, key), value);
     }
+
+    /// Branch a *new* session off this one's current state — base plus
+    /// everything this session has written or resolved so far, folded into
+    /// its own fresh `BaseSnapshot`, with an empty overlay on top. This is
+    /// "explore K what-ifs from where I already got to": Anvil can only say
+    /// it as a snapshot/revert stack (one branch live at a time) or by
+    /// serializing the whole touched state through `anvil_dumpState`.
+    ///
+    /// Neither side is a copy of state and neither can reach the other
+    /// afterwards. The fold clones `imbl` maps — structurally shared with
+    /// this session's base, so it pays only for the overlay's own entries,
+    /// not for the base's — into an `Arc` nothing else holds, and after
+    /// that no `BaseSnapshot` is ever mutated again: this session keeps
+    /// writing into *its* overlay (invisible to the child, whose base was
+    /// frozen at this instant) and the child writes into the child's
+    /// overlay (invisible to this session, which doesn't hold the child's
+    /// base at all). Dropping either side leaves the other whole — the
+    /// parent's own base survives on the child's `Arc` even if the parent
+    /// itself is discarded, which is what lets an agent tree outlive its
+    /// root.
+    ///
+    /// `block_env` and the fallback come along unchanged: a branch is
+    /// another branch of the same fork at the same block, not a re-fork at
+    /// head. The fallback clone is the same cheap shared-cache handle
+    /// `SessionManager::fork` hands out (see `forkyard_fetch::Fork`), so
+    /// the child keeps reading through the same warm cache.
+    pub fn branch(&self) -> Self
+    where
+        F: Clone,
+    {
+        let mut accounts = self.base.accounts.clone();
+        for (address, info) in &self.overlay_accounts {
+            accounts.insert(*address, info.clone());
+        }
+        let mut code = self.base.code.clone();
+        for (hash, bytecode) in &self.overlay_code {
+            code.insert(*hash, bytecode.clone());
+        }
+        let mut storage = self.base.storage.clone();
+        for (key, value) in &self.overlay_storage {
+            storage.insert(*key, *value);
+        }
+
+        Self {
+            // No overlay counterpart to fold in: `block_hash` reads are
+            // served straight from base-or-fallback and never cached in
+            // the overlay, so the base's map is already the whole picture.
+            base: Arc::new(BaseSnapshot { accounts, code, storage, block_hashes: self.base.block_hashes.clone() }),
+            fallback: self.fallback.clone(),
+            block_env: self.block_env.clone(),
+            overlay_accounts: HashMap::new(),
+            overlay_code: HashMap::new(),
+            overlay_storage: HashMap::new(),
+        }
+    }
 }
 
 /// Surfaced when a read misses the session overlay, the shared base, *and*
@@ -267,6 +322,121 @@ mod tests {
 
         let mut b = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
         assert!(b.basic(addr).is_err(), "sibling session must not see a's overlay");
+    }
+
+    /// A fallback that serves one contract's code and counts how often it
+    /// was asked for it — the only way to tell "the child read this out of
+    /// the folded base" apart from "the child went back to the fallback,"
+    /// since a branch inherits the parent's fallback and would otherwise
+    /// resolve either way.
+    #[derive(Clone)]
+    struct CountingCodeFallback {
+        code: Bytecode,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl DatabaseRef for CountingCodeFallback {
+        type Error = NoFallbackError;
+        fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            Ok(Some(AccountInfo::default()))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self.code.clone())
+        }
+        fn storage_ref(&self, _address: Address, _index: StorageKey) -> Result<StorageValue, Self::Error> {
+            Ok(StorageValue::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    fn funded(balance: u64) -> AccountInfo {
+        AccountInfo { balance: revm::primitives::U256::from(balance), ..Default::default() }
+    }
+
+    #[test]
+    fn branch_starts_from_the_parents_current_state_not_the_parents_base() {
+        let base = Arc::new(BaseSnapshot::default());
+        let mut parent = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let addr = Address::from([0x31; 20]);
+        let key = StorageKey::from(3u64);
+        parent.set_account(addr, funded(500));
+        parent.set_storage(addr, key, StorageValue::from(77u64));
+
+        let mut child = parent.branch();
+
+        // NoFallback errors on every miss, so a read that resolves at all
+        // proves the value came from the folded base — the child's own
+        // overlay is empty and the base it forked from is empty too.
+        assert_eq!(child.basic(addr).unwrap().unwrap().balance, revm::primitives::U256::from(500u64));
+        assert_eq!(Database::storage(&mut child, addr, key).unwrap(), StorageValue::from(77u64));
+        assert_eq!(child.block_env(), parent.block_env());
+    }
+
+    #[test]
+    fn branch_carries_the_parents_cached_code_without_refetching_it() {
+        let code = Bytecode::new_raw(revm::primitives::Bytes::from(vec![0x60, 0x00]));
+        let code_hash = code.hash_slow();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback = CountingCodeFallback { code, hits: Arc::clone(&hits) };
+        let mut parent = Session::fork(
+            Arc::new(BaseSnapshot::default()),
+            fallback,
+            revm::context::BlockEnv::default(),
+        );
+
+        parent.code_by_hash(code_hash).unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        let mut child = parent.branch();
+        child.code_by_hash(code_hash).unwrap();
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the branch already holds the parent's cached code — it must not go back to the fallback"
+        );
+    }
+
+    #[test]
+    fn a_branch_and_its_parent_never_see_each_others_later_writes() {
+        let base = Arc::new(BaseSnapshot::default());
+        let mut parent = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let shared = Address::from([0x41; 20]);
+        parent.set_account(shared, funded(1));
+
+        let mut child = parent.branch();
+
+        // Both sides move the same account after the branch point.
+        child.set_account(shared, funded(999));
+        parent.set_account(shared, funded(2));
+
+        assert_eq!(parent.basic(shared).unwrap().unwrap().balance, revm::primitives::U256::from(2u64));
+        assert_eq!(child.basic(shared).unwrap().unwrap().balance, revm::primitives::U256::from(999u64));
+
+        // An address only one side has ever heard of stays unknown to the
+        // other — with NoFallback, "unknown" surfaces as an error.
+        let child_only = Address::from([0x42; 20]);
+        child.set_account(child_only, funded(5));
+        assert!(parent.basic(child_only).is_err(), "the parent must not see the child's later writes");
+
+        let parent_only = Address::from([0x43; 20]);
+        parent.set_account(parent_only, funded(6));
+        assert!(child.basic(parent_only).is_err(), "the child must not see the parent's later writes");
+    }
+
+    #[test]
+    fn a_branch_outlives_the_parent_it_came_from() {
+        let base = Arc::new(BaseSnapshot::default());
+        let mut parent = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let addr = Address::from([0x51; 20]);
+        parent.set_account(addr, funded(42));
+
+        let mut child = parent.branch();
+        drop(parent); // the agent tree's root goes away mid-run
+
+        assert_eq!(child.basic(addr).unwrap().unwrap().balance, revm::primitives::U256::from(42u64));
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //! /session/{id}` carries the actual JSON-RPC calls against that session.
 //! This is what lets N callers share one warm cache instead of each paying
 //! for their own, the way the earlier per-agent-fork example did.
+//! `forkyard_forkFrom` on that same endpoint opens a session starting from
+//! *this* session's current state rather than from the shared base — the
+//! branching primitive Anvil can only express as a snapshot/revert stack
+//! or a whole-state dump.
 //!
 //! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
 //! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
@@ -63,7 +67,7 @@ const PRIORITY_FEE_WEI: u64 = 1_500_000_000;
 /// exactly the bug this constant used to have (30M vs. the real 16.7M cap).
 const ESTIMATE_GAS_LIMIT: u64 = 16_777_216;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionRpcState {
     receipts: HashMap<String, Value>,
     block_number: u64,
@@ -286,6 +290,34 @@ where
             let value = parse_u256_hex_str(param_str(params, 2)?)?;
             state.manager.set_storage(session_id, address, key, value).await?;
             Ok(json!(true))
+        }
+
+        // Open a new session starting from *this* session's current
+        // state, not from the shared base the way `POST /session` does —
+        // "explore K what-ifs from where this agent already got to."
+        //
+        // A JSON-RPC method rather than a `POST /session/{id}/fork` route
+        // because everything about it is already here: the session id is
+        // the routing key of this endpoint, `SessionError::Unknown` already
+        // maps to the -32001 the rest of the surface returns for a dead
+        // session, and a client that already speaks JSON-RPC to a session
+        // (web3.py's `make_request`, say) needs no second HTTP shape to
+        // reach it. The result is the same `{"session_id": ...}` object
+        // `POST /session` returns, so the client's existing parsing works
+        // unchanged.
+        "forkyard_forkFrom" => {
+            let child = state.manager.fork_from(session_id).await?;
+            // A branch continues the parent's timeline, so it inherits the
+            // parent's block counter and receipts: a client that just
+            // watched the parent reach block N must not see its branch
+            // report N-3 and re-serve a receipt lookup as null. These live
+            // in our own side table, not in the session the manager
+            // branched.
+            let mut guard = state.rpc_state.lock().unwrap();
+            if let Some(inherited) = guard.get(&session_id).cloned() {
+                guard.insert(child, inherited);
+            }
+            Ok(json!({ "session_id": child }))
         }
 
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
@@ -704,6 +736,68 @@ mod tests {
             json!("0x1"),
             "calldata must actually reach the EVM — a dropped `data` field makes this revert"
         );
+    }
+
+    async fn balance_of(state: &AppState<TestFallback>, id: SessionId, address: Address) -> Value {
+        dispatch(state, id, "eth_getBalance", &[json!(address.to_string())]).await.unwrap()
+    }
+
+    async fn set_balance(state: &AppState<TestFallback>, id: SessionId, address: Address, hex: &str) {
+        dispatch(state, id, "forkyard_setBalance", &[json!(address.to_string()), json!(hex)])
+            .await
+            .unwrap();
+    }
+
+    async fn fork_from(state: &AppState<TestFallback>, id: SessionId) -> SessionId {
+        let result = dispatch(state, id, "forkyard_forkFrom", &[]).await.unwrap();
+        result["session_id"].as_u64().expect("fork_from must answer in POST /session's shape")
+    }
+
+    #[tokio::test]
+    async fn fork_from_opens_a_session_holding_the_parents_current_state() {
+        let state = test_state();
+        let parent = state.manager.fork().await.unwrap();
+        let funded = Address::from([0x31; 20]);
+        set_balance(&state, parent, funded, "0x64").await;
+
+        let child = fork_from(&state, parent).await;
+        assert_eq!(balance_of(&state, child, funded).await, json!("0x64"));
+
+        // Writes after the branch stay on the side that made them.
+        set_balance(&state, child, funded, "0x1").await;
+        set_balance(&state, parent, funded, "0x2").await;
+        assert_eq!(balance_of(&state, child, funded).await, json!("0x1"));
+        assert_eq!(balance_of(&state, parent, funded).await, json!("0x2"));
+    }
+
+    /// The branch continues the parent's timeline: the block height a
+    /// client already observed on the parent must not go backwards on the
+    /// child, and a receipt from before the branch must still resolve.
+    #[tokio::test]
+    async fn fork_from_inherits_the_parents_block_height_and_receipts() {
+        let state = test_state();
+        let parent = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, parent, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw_hex = signed_transfer_hex(&sender, Address::from([9u8; 20]), 1, 0);
+        let tx_hash = dispatch(&state, parent, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+        assert_eq!(dispatch(&state, parent, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
+
+        let child = fork_from(&state, parent).await;
+        assert_eq!(dispatch(&state, child, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
+        let receipt = dispatch(&state, child, "eth_getTransactionReceipt", &[tx_hash]).await.unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+    }
+
+    #[tokio::test]
+    async fn fork_from_a_discarded_session_is_an_rpc_error_not_a_panic() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        dispatch(&state, id, "forkyard_discard", &[]).await.unwrap();
+
+        let err = dispatch(&state, id, "forkyard_forkFrom", &[]).await.unwrap_err();
+        assert_eq!(err.code, -32001);
     }
 
     #[tokio::test]
