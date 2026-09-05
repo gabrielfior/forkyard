@@ -34,11 +34,9 @@ fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-/// Kill switches are typed by hand at a shell prompt or set by a benchmark
-/// harness, so accept what people actually write rather than only what
-/// `bool::from_str` accepts — `FORKYARD_CACHE_DISABLED=1` silently parsing
-/// to "not disabled" would make a cold-vs-warm measurement quietly
-/// meaningless.
+/// Accepts what people actually type, not just `bool::from_str`:
+/// `FORKYARD_CACHE_DISABLED=1` parsing as "not disabled" would silently
+/// make a cold-vs-warm measurement meaningless.
 fn env_flag(key: &str) -> bool {
     match std::env::var(key) {
         Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
@@ -46,21 +44,12 @@ fn env_flag(key: &str) -> bool {
     }
 }
 
-/// Fold what this process fetched into what a previous one had already
-/// cached, and write the result out atomically.
-///
-/// The merge is what keeps a warm restart from eroding the cache: reads
-/// served out of the seeded base never reach the fetch backend, so
-/// `cache_snapshot` alone would return only the *new* misses and each
-/// restart would save a smaller file than it loaded, back to empty. It is
-/// guarded on the block still matching, because after a chain-tip refresh
-/// the seeded snapshot describes a block that is no longer this one, and
-/// filing an old block's balances under a new block's number would be
-/// wrong rather than merely stale.
-///
-/// Every failure here is logged and swallowed: this runs on the shutdown
-/// path, and a cache that can't be written is a slower next start, not a
-/// reason to fail an exit.
+/// Fold what this process fetched into what a previous one cached, and
+/// write it out atomically. The merge stops a warm restart from eroding
+/// the cache: seeded reads never reach the fetch backend, so
+/// `cache_snapshot` alone returns only the new misses. Guarded on the
+/// block still matching, since a tip refresh moves the seeded snapshot's
+/// block. Failures are logged and swallowed; this is the shutdown path.
 fn persist_cache(
     cache: &ForkCache,
     manager: &SessionManager<Fork>,
@@ -113,16 +102,13 @@ async fn main() -> eyre::Result<()> {
     let fork_block_number: Option<u64> =
         std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
-    // How many *explicitly pinned* blocks (`POST /session {"block_number":
-    // N}`) stay warm at once, on top of the default one. Each costs its own
-    // fetch backend — cache plus background thread — so this is a real
-    // memory bound, not a tidy-up.
+    // Explicitly pinned blocks kept warm at once, on top of the default
+    // one. Each costs its own fetch backend — cache plus background thread
+    // — so this is a memory bound, not a tidy-up.
     let max_pinned_blocks: usize = env_or("FORKYARD_MAX_PINNED_BLOCKS", DEFAULT_MAX_PINNED_BLOCKS);
 
-    // The on-disk fork cache. `FORKYARD_CACHE_DISABLED` exists so a
-    // benchmark can measure cold and warm on demand in one command — with
-    // no way to turn it off, the second run of anything is warm and the
-    // cold number becomes unmeasurable.
+    // `FORKYARD_CACHE_DISABLED` exists so a benchmark can still measure a
+    // cold start: without it, every run after the first is warm.
     let cache = if env_flag("FORKYARD_CACHE_DISABLED") {
         tracing::info!("FORKYARD_CACHE_DISABLED is set — every start is a cold start");
         None
@@ -130,9 +116,8 @@ async fn main() -> eyre::Result<()> {
         let dir = std::env::var_os("FORKYARD_CACHE_DIR").map(PathBuf::from).unwrap_or_else(default_cache_dir);
         Some(ForkCache::new(dir))
     };
-    // 0 (the default) means "only at shutdown". A non-zero interval buys
-    // back the cache a SIGKILL or a power loss would cost, at the price of
-    // serializing the whole snapshot that often.
+    // 0 (the default) means "only at shutdown". A non-zero interval trades
+    // serializing the whole snapshot that often for surviving a SIGKILL.
     let cache_flush_secs: u64 = env_or("FORKYARD_CACHE_FLUSH_SECS", 0);
 
     let (fork, block_env) = match fork_block_number {
@@ -140,11 +125,9 @@ async fn main() -> eyre::Result<()> {
         None => forkyard_fetch::fork(&rpc_url).await?,
     };
 
-    // Seed from disk before any session exists, so even the very first
-    // read of a restarted process is warm. A cache file that is missing,
-    // truncated, from another chain or block, or written by an older
-    // format is reported and ignored — never fatal, the whole point being
-    // that the cache is an optimisation and not a dependency.
+    // Before any session exists, so even the first read of a restarted
+    // process is warm. Any unusable cache file (missing, truncated, wrong
+    // chain or block, older format) is logged and ignored — never fatal.
     let seeded = cache.as_ref().zip(u64::try_from(block_env.number).ok()).and_then(|(cache, block_number)| {
         let key = CacheKey::new(chain_id, block_number);
         match cache.load(key) {
@@ -168,9 +151,9 @@ async fn main() -> eyre::Result<()> {
             }
         }
     });
-    // The factory is the only thing that knows the RPC URL — `forkyard-session`
-    // deliberately doesn't, which is what keeps it unit-testable with an
-    // in-memory fallback and no network.
+    // The factory is the only thing that knows the RPC URL —
+    // `forkyard-session` deliberately doesn't, which keeps it testable
+    // against an in-memory fallback with no network.
     let fork_rpc_url = rpc_url.clone();
     let mut manager = SessionManager::new(fork, block_env, num_workers, Duration::from_secs(ttl_secs))
         .with_block_forks(
@@ -194,10 +177,8 @@ async fn main() -> eyre::Result<()> {
     // tip" are contradictory: re-forking to a newer block would silently
     // defeat the whole point of FORKYARD_FORK_BLOCK_NUMBER.
     //
-    // It refreshes the *default* base only (`refresh_fallback`), never the
-    // per-session pinned blocks: a session opened with `{"block_number":
-    // N}` is reproducing something at N and must not be dragged to the tip
-    // underneath the agent using it.
+    // `refresh_fallback` touches the default base only: a session pinned to
+    // block N must not be dragged to the tip underneath its agent.
     let ingest_handle = match fork_block_number {
         Some(n) => {
             tracing::info!(block = n, "fork pinned to an explicit block; chain-tip following disabled");
@@ -240,10 +221,9 @@ async fn main() -> eyre::Result<()> {
         }
     });
 
-    // Optional interval flush, off by default. Runs on a blocking thread
-    // because serializing a large snapshot is real CPU and file I/O, and
-    // stalling a runtime worker for it would show up as latency on
-    // whichever agent's request happened to share that thread.
+    // Optional interval flush, off by default. On a blocking thread:
+    // serializing a large snapshot is CPU and file I/O, and stalling a
+    // runtime worker shows up as latency for whoever shares it.
     let flush_handle = match (&cache, cache_flush_secs) {
         (Some(cache), secs) if secs > 0 => {
             let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
@@ -287,10 +267,8 @@ async fn main() -> eyre::Result<()> {
     mcp_http_handle.shutdown().await;
 
     // After both surfaces are down, so nothing is still fetching into the
-    // backend while it's being read. This is on the SIGTERM path
-    // deliberately: the benchmark harness terminates the process with
-    // SIGTERM, so a cache written only on a clean stdin-EOF exit would
-    // never be written at all.
+    // backend while it's read. On the SIGTERM path deliberately: that is
+    // how the benchmark harness stops the process.
     if let Some(cache) = &cache {
         persist_cache(cache, &manager, chain_id, seeded.as_deref());
     }

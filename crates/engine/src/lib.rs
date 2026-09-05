@@ -29,12 +29,9 @@ pub struct BaseSnapshot {
 }
 
 impl BaseSnapshot {
-    /// Build a snapshot from state that came from somewhere other than a
-    /// session — a cache file (`persist`) or a fetch backend's own cache
-    /// (`forkyard_fetch::cache_snapshot`). The fields stay private because
-    /// nothing may *mutate* a base once it's shared; handing over the four
-    /// maps at construction time is the only way state legitimately enters
-    /// one.
+    /// Build a snapshot from state that didn't come from a session — a
+    /// cache file (`persist`) or a fetch backend's cache. Construction is
+    /// the only way in: a shared base must never be mutated.
     pub fn from_parts(
         accounts: impl IntoIterator<Item = (Address, AccountInfo)>,
         code: impl IntoIterator<Item = (B256, Bytecode)>,
@@ -49,14 +46,11 @@ impl BaseSnapshot {
         }
     }
 
-    /// This snapshot with `newer`'s entries laid over it, `newer` winning
-    /// on any key both hold. Used at shutdown to fold what this run
-    /// actually fetched back into what a previous run had already cached:
-    /// reads served out of the base never reach the fetch backend, so
-    /// saving only the backend's own cache would shrink the file on every
-    /// warm restart until it was empty again. Only ever called with two
-    /// snapshots of the *same* block — state at one height is one value,
-    /// so which side wins is a tie-break, not a policy.
+    /// This snapshot with `newer` laid over it, `newer` winning ties. Folds
+    /// what this run fetched back into what a previous run cached; saving
+    /// the backend's cache alone would shrink the file on every warm
+    /// restart. Only ever called for two snapshots of the same block, where
+    /// state is one value and the tie-break doesn't matter.
     pub fn merged_with(&self, newer: &BaseSnapshot) -> Self {
         Self {
             accounts: newer.accounts.clone().union(self.accounts.clone()),
@@ -223,31 +217,12 @@ impl<F: DatabaseRef> Session<F> {
         self.overlay_storage.insert((address, key), value);
     }
 
-    /// Branch a *new* session off this one's current state — base plus
-    /// everything this session has written or resolved so far, folded into
-    /// its own fresh `BaseSnapshot`, with an empty overlay on top. This is
-    /// "explore K what-ifs from where I already got to": Anvil can only say
-    /// it as a snapshot/revert stack (one branch live at a time) or by
-    /// serializing the whole touched state through `anvil_dumpState`.
-    ///
-    /// Neither side is a copy of state and neither can reach the other
-    /// afterwards. The fold clones `imbl` maps — structurally shared with
-    /// this session's base, so it pays only for the overlay's own entries,
-    /// not for the base's — into an `Arc` nothing else holds, and after
-    /// that no `BaseSnapshot` is ever mutated again: this session keeps
-    /// writing into *its* overlay (invisible to the child, whose base was
-    /// frozen at this instant) and the child writes into the child's
-    /// overlay (invisible to this session, which doesn't hold the child's
-    /// base at all). Dropping either side leaves the other whole — the
-    /// parent's own base survives on the child's `Arc` even if the parent
-    /// itself is discarded, which is what lets an agent tree outlive its
-    /// root.
-    ///
-    /// `block_env` and the fallback come along unchanged: a branch is
-    /// another branch of the same fork at the same block, not a re-fork at
-    /// head. The fallback clone is the same cheap shared-cache handle
-    /// `SessionManager::fork` hands out (see `forkyard_fetch::Fork`), so
-    /// the child keeps reading through the same warm cache.
+    /// A new session off this one's *current* state — base plus overlay,
+    /// folded into a fresh `BaseSnapshot` that is structurally shared, so
+    /// it costs the overlay's entries, not the base's. The child's base is
+    /// frozen here and no base is mutated again, so later writes on either
+    /// side stay invisible to the other and the child outlives the parent.
+    /// `block_env` and the fallback carry over unchanged.
     pub fn branch(&self) -> Self
     where
         F: Clone,
@@ -266,9 +241,8 @@ impl<F: DatabaseRef> Session<F> {
         }
 
         Self {
-            // No overlay counterpart to fold in: `block_hash` reads are
-            // served straight from base-or-fallback and never cached in
-            // the overlay, so the base's map is already the whole picture.
+            // No overlay counterpart: `block_hash` reads are never cached
+            // in the overlay, so the base's map is the whole picture.
             base: Arc::new(BaseSnapshot { accounts, code, storage, block_hashes: self.base.block_hashes.clone() }),
             fallback: self.fallback.clone(),
             block_env: self.block_env.clone(),
@@ -420,11 +394,9 @@ mod tests {
         assert!(b.basic(addr).is_err(), "sibling session must not see a's overlay");
     }
 
-    /// A fallback that serves one contract's code and counts how often it
-    /// was asked for it — the only way to tell "the child read this out of
-    /// the folded base" apart from "the child went back to the fallback,"
-    /// since a branch inherits the parent's fallback and would otherwise
-    /// resolve either way.
+    /// Counts code lookups. A branch inherits the parent's fallback and so
+    /// resolves either way; only the count separates "read from the folded
+    /// base" from "went back to the fallback".
     #[derive(Clone)]
     struct CountingCodeFallback {
         code: Bytecode,
@@ -463,9 +435,8 @@ mod tests {
 
         let mut child = parent.branch();
 
-        // NoFallback errors on every miss, so a read that resolves at all
-        // proves the value came from the folded base — the child's own
-        // overlay is empty and the base it forked from is empty too.
+        // NoFallback errors on every miss, so resolving at all proves the
+        // value came from the folded base.
         assert_eq!(child.basic(addr).unwrap().unwrap().balance, revm::primitives::U256::from(500u64));
         assert_eq!(Database::storage(&mut child, addr, key).unwrap(), StorageValue::from(77u64));
         assert_eq!(child.block_env(), parent.block_env());

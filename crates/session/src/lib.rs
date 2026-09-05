@@ -35,31 +35,19 @@ use tokio::sync::{oneshot, OnceCell};
 
 pub type SessionId = u64;
 
-/// Default ceiling on how many *distinct explicitly-pinned* blocks are kept
-/// warm at once (`FORKYARD_MAX_PINNED_BLOCKS` overrides it in
-/// `forkyard-bin`). Deliberately small: each pinned block costs a whole
-/// fetch backend — its own cache and its own background fetch thread — so
-/// an unbounded block->base map is a memory leak with a network cost
-/// attached, not just a big `HashMap`.
+/// How many explicitly-pinned blocks stay warm at once
+/// (`FORKYARD_MAX_PINNED_BLOCKS` overrides it). Small on purpose: each
+/// costs a whole fetch backend — its own cache and fetch thread.
 pub const DEFAULT_MAX_PINNED_BLOCKS: usize = 8;
 
 /// What a `BlockForkFactory` hands back. Boxed because the factory is held
-/// as a trait object (the manager is generic over `F`, not over the
-/// factory, and one `Arc<SessionManager<F>>` is shared by every API
-/// surface), and `String`-errored because the manager has no use for the
-/// factory's own error type beyond reporting it: `forkyard_fetch::fork_at`
-/// yields an `eyre::Report`, a test stub yields whatever it likes, and
-/// neither belongs in this crate's signatures.
+/// as a trait object; `String`-errored because the factory's own error type
+/// (an `eyre::Report`, a test stub's) has no place in these signatures.
 pub type BlockForkFuture<F> = Pin<Box<dyn Future<Output = Result<(F, BlockEnv), String>> + Send>>;
 
-/// Builds the fallback (and its real `BlockEnv`) for one explicitly-pinned
-/// block. Injected rather than called directly for the same reason `new`
-/// takes an already-built `F` instead of forking one itself: this crate
-/// knows nothing about RPC URLs or `forkyard-fetch`, and the tests below
-/// drive block pinning with a counting in-memory stub and no network at
-/// all. Blanket-implemented for any `Fn(u64) -> BlockForkFuture<F>`, so
-/// `forkyard-bin` passes a closure and only a test that needs to *count*
-/// invocations has to name a type.
+/// Builds the fallback (and its real `BlockEnv`) for one pinned block.
+/// Injected because this crate knows nothing about RPC URLs, which is what
+/// lets the tests below pin blocks against a stub with no network.
 pub trait BlockForkFactory<F>: Send + Sync + 'static {
     fn fork_at(&self, block_number: u64) -> BlockForkFuture<F>;
 }
@@ -73,11 +61,9 @@ where
     }
 }
 
-/// One explicitly-pinned block's shared state. Every session opened at that
-/// block forks off *this* base and clones *this* fallback — that sharing is
-/// the entire point: two agents reproducing an incident at block X must not
-/// each refetch X's state, which is exactly what two Anvil processes with
-/// `--fork-block-number X` would do.
+/// One pinned block's shared state: every session opened at that block
+/// forks off this base and clones this fallback, so two agents at block X
+/// don't each refetch X (what two `--fork-block-number X` Anvils do).
 struct PinnedBlock<F> {
     base: Arc<BaseSnapshot>,
     fallback: F,
@@ -85,17 +71,13 @@ struct PinnedBlock<F> {
 }
 
 /// Bounded block -> shared-state cache, evicting least-recently-*used*
-/// first. `OnceCell` rather than a plain map value so two concurrent
-/// `fork_at_block(X)` calls collapse into one factory invocation instead of
-/// racing to fetch X twice (the sharing guarantee has to hold under
-/// concurrency, not just when callers happen to be sequential); it also
-/// stores nothing on failure, so an unreachable block errors now and can be
-/// retried later rather than poisoning that block forever.
+/// first. `OnceCell` so two concurrent `fork_at_block(X)` calls collapse
+/// into one factory invocation, and so a failure stores nothing and can be
+/// retried rather than poisoning that block.
 struct PinnedBlocks<F> {
     cells: HashMap<u64, Arc<OnceCell<PinnedBlock<F>>>>,
-    /// Least-recently-used first. A `Vec` scan, not something cleverer,
-    /// because `cap` is a handful of blocks and this is only touched on
-    /// session creation.
+    /// Least-recently-used first. A `Vec` scan is enough: `cap` is a
+    /// handful of blocks, touched only on session creation.
     recency: Vec<u64>,
     cap: usize,
 }
@@ -106,11 +88,9 @@ impl<F> PinnedBlocks<F> {
         self.recency.push(block_number);
         let cell = Arc::clone(self.cells.entry(block_number).or_default());
 
-        // Evicting only drops this map's own handle. Sessions already open
-        // at an evicted block hold their own `Arc<BaseSnapshot>` and their
-        // own `F` clone, so they keep working exactly as before — what is
-        // lost is the *sharing*: the next session asking for that block
-        // pays the factory (and the refetch) again.
+        // Eviction drops only this map's handle: live sessions hold their
+        // own base and fallback and keep working. What's lost is sharing —
+        // the next session at that block pays the factory again.
         while self.recency.len() > self.cap {
             let evicted = self.recency.remove(0);
             self.cells.remove(&evicted);
@@ -143,11 +123,9 @@ pub enum SessionError {
     /// (a worker's own job loop panicked past `catch_unwind`, or the
     /// manager was dropped), not a normal runtime condition.
     WorkerGone,
-    /// No fallback could be built for an explicitly requested block: the
-    /// upstream RPC can't serve it (not yet mined, pruned, unreachable), or
-    /// this manager was built without a block-fork factory at all. Asking
-    /// for a block that doesn't exist is a caller error to report, not a
-    /// panic to take a worker down with.
+    /// No fallback could be built for the requested block — upstream can't
+    /// serve it, or no block-fork factory was configured. A caller error to
+    /// report, not a panic to take a worker down with.
     BlockUnavailable(u64, String),
 }
 
@@ -166,8 +144,7 @@ impl fmt::Display for SessionError {
 impl std::error::Error for SessionError {}
 
 // The `DatabaseRef` bound is only here because `Branch`/`Adopt` carry a
-// whole `Session<F>` between workers, and `Session` declares it on its own
-// type parameter; every `F` this crate instantiates `Job` with is a
+// whole `Session<F>`, which declares it. Every `F` used here is a
 // `Fallback`, which already implies it.
 enum Job<F: DatabaseRef> {
     Fork {
@@ -177,10 +154,9 @@ enum Job<F: DatabaseRef> {
         block_env: BlockEnv,
         reply: oneshot::Sender<()>,
     },
-    /// Take a branch of `parent`'s current state on the worker that owns
-    /// it, handing the ready-made child back for `fork_from` to register
-    /// on whichever worker its own id lands on. Two hops, because parent
-    /// and child are almost never on the same shard.
+    /// Branch `parent` on the worker that owns it, handing the child back
+    /// for `fork_from` to register. Two hops, because parent and child are
+    /// almost never on the same shard.
     Branch {
         parent: SessionId,
         reply: oneshot::Sender<Result<Box<Session<F>>, SessionError>>,
@@ -242,20 +218,17 @@ where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     fallback: Arc<RwLock<F>>,
-    /// Swappable, not fixed, since `with_base` can seed it from a cache
-    /// file and `refresh_fallback` has to drop it again when the chain
-    /// moves — a base holds one block's account balances and storage, and
-    /// serving those after a tip refresh would be stale state, not a warm
-    /// cache. The `Arc` inside is what sessions actually fork from, so a
-    /// swap never disturbs a session already holding the old one.
+    /// Swappable because `with_base` seeds it from a cache file and
+    /// `refresh_fallback` must drop it when the chain moves. Sessions fork
+    /// from the inner `Arc`, so a swap never disturbs one already holding
+    /// the old base.
     base: RwLock<Arc<BaseSnapshot>>,
     block_env: Arc<RwLock<BlockEnv>>,
     workers: Vec<std_mpsc::Sender<Job<F>>>,
     counts: Vec<Arc<AtomicUsize>>,
     next_id: AtomicU64,
-    /// `None` unless `with_block_forks` was called — a manager built by a
-    /// test with an in-memory fallback has no way to fetch a block, and
-    /// says so (`SessionError::BlockUnavailable`) instead of pretending.
+    /// `None` unless `with_block_forks` was called: a manager with no way
+    /// to fetch a block says so via `BlockUnavailable`.
     block_forks: Option<Arc<dyn BlockForkFactory<F>>>,
     pinned: Mutex<PinnedBlocks<F>>,
 }
@@ -297,33 +270,21 @@ where
     }
 
     /// Enable `fork_at_block`: `factory` builds the fallback for one block,
-    /// and at most `max_pinned_blocks` distinct blocks are kept warm at
-    /// once (see `DEFAULT_MAX_PINNED_BLOCKS`). Consuming builder rather
-    /// than a `new` parameter so the existing four-argument constructor —
-    /// used by every test in this workspace and by both API crates — keeps
-    /// compiling and keeps meaning exactly what it meant.
+    /// and at most `max_pinned_blocks` stay warm at once. A builder rather
+    /// than a `new` parameter, to leave the four-argument `new` alone.
     pub fn with_block_forks(mut self, factory: impl BlockForkFactory<F>, max_pinned_blocks: usize) -> Self {
         self.block_forks = Some(Arc::new(factory));
         self.pinned.get_mut().unwrap().cap = max_pinned_blocks.max(1);
         self
     }
 
-    /// Start with `base` already warm instead of empty — how
-    /// `forkyard-bin` replays a cache file written by a previous run
-    /// (`forkyard_engine::persist`), so the first session of a restarted
-    /// process reads accounts and slots the last one already paid for
-    /// rather than refetching them all. Anvil gets this from
-    /// `~/.foundry/cache`; without it, forkyard's cache died with the
-    /// process and a restart was always cold.
+    /// Start with `base` already warm instead of empty — how `forkyard-bin`
+    /// replays a cache file from a previous run (`forkyard_engine::persist`)
+    /// so a restart isn't cold.
     ///
-    /// The caller is responsible for the base actually describing
-    /// `block_env`'s block: a snapshot of another block's accounts is
-    /// wrong, not merely stale, which is why `persist` refuses to load a
-    /// file whose recorded block doesn't match.
-    ///
-    /// Consuming builder, for the same reason as `with_block_forks`: the
-    /// four-argument `new` is used by both API crates and every test here,
-    /// and keeps meaning what it meant.
+    /// The caller must ensure the base describes `block_env`'s block:
+    /// another block's accounts are wrong, not merely stale, which is why
+    /// `persist` refuses a file whose recorded block doesn't match.
     pub fn with_base(self, base: BaseSnapshot) -> Self {
         *self.base.write().unwrap() = Arc::new(base);
         self
@@ -337,11 +298,8 @@ where
     }
 
     /// A clone of the fallback new sessions currently read through — the
-    /// same cheap shared-cache handle every session gets. `forkyard-bin`
-    /// needs it at shutdown to snapshot what the fetch backend actually
-    /// fetched; it is deliberately the *current* one, since
-    /// `refresh_fallback` may have replaced the one the process started
-    /// with.
+    /// *current* one, since `refresh_fallback` may have replaced the one
+    /// the process started with.
     pub fn current_fallback(&self) -> F {
         self.fallback.read().unwrap().clone()
     }
@@ -379,13 +337,10 @@ where
     pub fn refresh_fallback(&self, fallback: F, block_env: BlockEnv) {
         *self.fallback.write().unwrap() = fallback;
         *self.block_env.write().unwrap() = block_env;
-        // The base has to go with it. Once `with_base` exists the base can
-        // hold real balances and slots read at the *old* block, and those
-        // are checked before the fallback is ever consulted — so a base
-        // that outlived its block would keep serving pre-refresh state
-        // forever, and the refresh would silently do nothing for exactly
-        // the accounts anyone cared about. Cheap: the next session's reads
-        // repopulate through the new fallback.
+        // The base goes too: since `with_base`, it can hold real balances
+        // read at the *old* block, and it is checked before the fallback —
+        // so keeping it would make the refresh a no-op for exactly the
+        // accounts anyone cared about.
         *self.base.write().unwrap() = Arc::new(BaseSnapshot::default());
     }
 
@@ -417,24 +372,15 @@ where
         Ok(id)
     }
 
-    /// Fork a new session pinned to `block_number`, whatever block this
-    /// manager's own default is currently on. Sessions at the same block
-    /// share one base and one fallback — i.e. one warm cache per block, not
-    /// one per session — which is what lets a single process serve an agent
-    /// reproducing an incident at block X alongside an agent working at
-    /// head, where Anvil needs one process per `--fork-block-number`.
+    /// Fork a session pinned to `block_number`, whatever block this manager
+    /// defaults to. Sessions at the same block share one base and one
+    /// fallback: the first pays the factory, later ones are as cheap as
+    /// `fork`. `BlockUnavailable` if the block can't be forked or
+    /// `with_block_forks` was never called.
     ///
-    /// The first session at a given block pays the factory (a real fetch);
-    /// every later one is as cheap as `fork`. Errors with
-    /// `SessionError::BlockUnavailable` if the block can't be forked or if
-    /// this manager was built without `with_block_forks`.
-    ///
-    /// Deliberately *not* short-circuited to the default base when
-    /// `block_number` happens to equal the manager's current block: an
-    /// explicitly pinned session must survive `refresh_fallback` (the
-    /// chain-tip follower's refresh moves the default base, and the whole
-    /// point of pinning is not being moved), so the two live in separate
-    /// slots even when they name the same height.
+    /// Not short-circuited to the default base when the numbers match: a
+    /// pinned session must survive `refresh_fallback`, which moves the
+    /// default base out from under it.
     pub async fn fork_at_block(&self, block_number: u64) -> Result<SessionId, SessionError> {
         let (base, fallback, block_env) = {
             let cell = self.pinned.lock().unwrap().get_or_insert(block_number);
@@ -463,12 +409,9 @@ where
         Ok(id)
     }
 
-    /// The real block one specific session is pinned to — its own, not the
-    /// manager's: since `fork_at_block` exists, `block_env()` is only the
-    /// default for *new* unpinned forks and says nothing about a given
-    /// session. An RPC surface answering `eth_blockNumber` for a session
-    /// has to ask this, or a session pinned at a historical block reports
-    /// the tip.
+    /// The block one session is pinned to, not the manager's default. An
+    /// RPC surface answering `eth_blockNumber` must ask this, or a session
+    /// pinned at a historical block reports the tip.
     pub async fn session_block_env(&self, id: SessionId) -> Result<BlockEnv, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
@@ -477,29 +420,20 @@ where
         rx.await.map_err(|_| SessionError::WorkerGone)?.map(|env| *env)
     }
 
-    /// How many distinct explicitly-pinned blocks are currently kept warm —
-    /// for observability and for the eviction tests below. Never counts the
+    /// How many explicitly-pinned blocks are kept warm. Never counts the
     /// manager's own default block.
     pub fn pinned_block_count(&self) -> usize {
         self.pinned.lock().unwrap().cells.len()
     }
 
-    /// Branch a new session off `parent`'s *current* state — everything
-    /// `parent` has written or cached so far, not just the shared base
-    /// `fork` starts from. This is the "K what-ifs from where this agent
-    /// already got to" primitive: still no state copy (see
-    /// `Session::branch`), where Anvil needs either K sequential
-    /// snapshot/revert cycles in one process or K processes each redoing
-    /// the setup.
+    /// Branch a new session off `parent`'s *current* state — everything it
+    /// has written or cached, not just the base `fork` starts from, and
+    /// still without copying state (see `Session::branch`).
     ///
-    /// The child is an ordinary session from the registry's point of view:
-    /// its own id, its own shard (`worker_for` hashes ids, so it usually
-    /// isn't the parent's), its own TTL clock, discardable on its own. The
-    /// parent stays live and independent — branching only reads it, and
-    /// the two never see each other's later writes.
-    ///
-    /// Errors with `SessionError::Unknown` if `parent` is unknown or has
-    /// already expired.
+    /// The child is an ordinary session: its own id, its own shard (ids are
+    /// hashed, so usually not the parent's), its own TTL clock. The parent
+    /// stays live, and neither sees the other's later writes.
+    /// `SessionError::Unknown` if `parent` is gone or expired.
     pub async fn fork_from(&self, parent: SessionId) -> Result<SessionId, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.worker_for(parent)
@@ -507,8 +441,8 @@ where
             .map_err(|_| SessionError::WorkerGone)?;
         let session = rx.await.map_err(|_| SessionError::WorkerGone)??;
 
-        // The id is allocated only once the branch actually succeeded, so
-        // a `fork_from` against a dead parent doesn't burn one.
+        // Allocated only after the branch succeeded, so a `fork_from`
+        // against a dead parent doesn't burn an id.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
@@ -675,9 +609,8 @@ where
         Job::Branch { parent, reply } => {
             let result = match sessions.get_mut(&parent) {
                 Some((session, touched)) => {
-                    // Branching counts as activity on the parent: a root
-                    // session an agent only ever branches from must not be
-                    // reaped out from under the tree mid-run.
+                    // Branching counts as activity: a root that is only
+                    // ever branched from must not be reaped mid-run.
                     *touched = Instant::now();
                     Ok(Box::new(session.branch()))
                 }
@@ -713,9 +646,8 @@ where
         }
         Job::BlockEnvOf { id, reply } => {
             let result = match sessions.get_mut(&id) {
-                // Counts as activity like every other read here: a client
-                // polling `eth_blockNumber` on a session is using it, and
-                // must not have it reaped out from under itself.
+                // Counts as activity: a client polling `eth_blockNumber` on
+                // a session is using it.
                 Some((session, touched)) => {
                     *touched = Instant::now();
                     Ok(Box::new(session.block_env().clone()))
@@ -862,12 +794,9 @@ mod tests {
     /// the upstream RPC can't produce (not yet mined, pruned, unreachable).
     const UNMINED_BLOCK: u64 = 999_999_999;
 
-    /// A stub `BlockForkFactory` handing out `ValueFallback(block_number)`
-    /// — "at block N, WATCHED's balance is N" — so a session's block is
-    /// observable as ordinary state, and counting how many times it was
-    /// actually asked. The count is the whole point of these tests: "two
-    /// sessions at the same block share one cache" is only really provable
-    /// as "two sessions at the same block cost one fetch."
+    /// Hands out `ValueFallback(block_number)` — "at block N, WATCHED's
+    /// balance is N" — and counts calls. The count is what makes sharing
+    /// provable: two sessions at one block must cost one fetch.
     #[derive(Clone, Default)]
     struct CountingBlockForks {
         calls: Arc<AtomicUsize>,
@@ -888,9 +817,8 @@ mod tests {
         }
     }
 
-    /// A manager whose default block is `ValueFallback(1)`, plus block
-    /// pinning backed by the counting stub. Returns the call counter
-    /// alongside, since that's what the sharing assertions read.
+    /// Default block `ValueFallback(1)`, block pinning via the counting
+    /// stub, returned with its call counter.
     fn pinning_manager(max_pinned_blocks: usize) -> (SessionManager<ValueFallback>, Arc<AtomicUsize>) {
         let forks = CountingBlockForks::default();
         let calls = Arc::clone(&forks.calls);
@@ -1412,11 +1340,9 @@ mod tests {
         )
         .with_base(cached_base(100));
 
-        // The chain moved and the fallback moved with it. The seeded base
-        // describes the *old* block, and it is checked before the fallback
-        // — so if it survived, every session from here on would read the
-        // old balance forever and the refresh would be a no-op for exactly
-        // the accounts anyone had already touched.
+        // The seeded base describes the *old* block and is checked before
+        // the fallback, so surviving the refresh would pin every later
+        // session to the old balance forever.
         mgr.refresh_fallback(
             CountingFallback { balance: 999, reads: Arc::clone(&reads) },
             BlockEnv { number: U256::from(2), ..Default::default() },
@@ -1428,13 +1354,9 @@ mod tests {
         assert!(mgr.base().is_empty());
     }
 
-    /// The whole restart story end to end, minus the network: one manager
-    /// resolves an account through its fallback, what it resolved is
-    /// written to a cache file, and a *second* manager built from that file
-    /// answers the same read without its fallback being touched. This is
-    /// the dimension Anvil won on — `anvil` warm made 30 upstream calls
-    /// against forkyard's 37 every run, because Foundry's cache outlives
-    /// the process and forkyard's didn't.
+    /// The restart story end to end, minus the network: one manager
+    /// resolves through its fallback, persists, and a second manager built
+    /// from that file answers the same read without touching its fallback.
     #[tokio::test]
     async fn a_cache_file_written_by_one_run_warms_the_next_one() {
         use forkyard_engine::persist::{CacheKey, ForkCache};

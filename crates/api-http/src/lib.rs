@@ -6,14 +6,9 @@
 //! /session/{id}` carries the actual JSON-RPC calls against that session.
 //! This is what lets N callers share one warm cache instead of each paying
 //! for their own, the way the earlier per-agent-fork example did. An
-//! optional `{"block_number": N}` body on `POST /session` pins that session
-//! to block N — one process serving agents at different heights, each
-//! height's state fetched once and shared, where Anvil's
-//! `--fork-block-number` is per process.
-//! `forkyard_forkFrom` on that same endpoint opens a session starting from
-//! *this* session's current state rather than from the shared base — the
-//! branching primitive Anvil can only express as a snapshot/revert stack
-//! or a whole-state dump.
+//! optional `{"block_number": N}` body pins the session to block N, each
+//! height fetched once and shared; `forkyard_forkFrom` opens one from
+//! *this* session's current state instead of the shared base.
 //!
 //! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
 //! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
@@ -25,10 +20,8 @@
 //! which stays in-process and therefore doesn't pay this crate's JSON/HTTP
 //! serialization cost).
 //!
-//! `eth_gasPrice` is the session's own fork's real base fee (its
-//! `BlockEnv`, itself `forkyard_fetch::fork`'s actual fetched block — the
-//! session's, not the manager's, since a pinned session's block and the
-//! manager's current one differ) plus a fixed
+//! `eth_gasPrice` is the base fee of the *session's* own `BlockEnv` (not
+//! the manager's — a pinned session's block differs) plus a fixed
 //! priority-fee margin — not a made-up constant, but it's still a snapshot
 //! from whenever the fork was taken, not a live-updating fee market (that
 //! needs `forkyard-ingest` to exist first). `eth_blockNumber` is that same
@@ -161,15 +154,10 @@ fn field_str<'a>(call: &'a Value, key: &str) -> Option<&'a str> {
     call.get(key).and_then(Value::as_str)
 }
 
-/// The block context `session_id` was actually forked at. Asked of the
-/// session rather than of the manager because `POST /session
-/// {"block_number": N}` means the two can differ: a session pinned to a
-/// historical block would otherwise report the manager's current tip for
-/// `eth_blockNumber` and the tip's base fee for `eth_gasPrice`.
-///
-/// Falls back to the manager's own block for a session the manager no
-/// longer knows — preserving what these two methods did for an expired
-/// session before pinning existed, rather than turning them into errors.
+/// The block `session_id` was forked at — asked of the session, not the
+/// manager, since a pinned session would otherwise report the tip for
+/// `eth_blockNumber` and the tip's base fee for `eth_gasPrice`. An expired
+/// session falls back to the manager's block rather than erroring.
 async fn session_block_env<F: Fallback>(state: &AppState<F>, session_id: SessionId) -> revm::context::BlockEnv
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -318,27 +306,15 @@ where
             Ok(json!(true))
         }
 
-        // Open a new session starting from *this* session's current
-        // state, not from the shared base the way `POST /session` does —
-        // "explore K what-ifs from where this agent already got to."
-        //
-        // A JSON-RPC method rather than a `POST /session/{id}/fork` route
-        // because everything about it is already here: the session id is
-        // the routing key of this endpoint, `SessionError::Unknown` already
-        // maps to the -32001 the rest of the surface returns for a dead
-        // session, and a client that already speaks JSON-RPC to a session
-        // (web3.py's `make_request`, say) needs no second HTTP shape to
-        // reach it. The result is the same `{"session_id": ...}` object
-        // `POST /session` returns, so the client's existing parsing works
-        // unchanged.
+        // Branches off *this* session's current state rather than the shared
+        // base. A method, not a `/session/{id}/fork` route: the id is already
+        // this endpoint's routing key, and the result is the same
+        // `{"session_id": ...}` shape `POST /session` returns.
         "forkyard_forkFrom" => {
             let child = state.manager.fork_from(session_id).await?;
-            // A branch continues the parent's timeline, so it inherits the
-            // parent's block counter and receipts: a client that just
-            // watched the parent reach block N must not see its branch
-            // report N-3 and re-serve a receipt lookup as null. These live
-            // in our own side table, not in the session the manager
-            // branched.
+            // The block counter and receipts live in our side table, not the
+            // session, so a branch would otherwise report a lower block than
+            // the client just saw on its parent.
             let mut guard = state.rpc_state.lock().unwrap();
             if let Some(inherited) = guard.get(&session_id).cloned() {
                 guard.insert(child, inherited);
@@ -453,9 +429,8 @@ where
     }
 }
 
-/// Optional body of `POST /session`. Every field optional, and the whole
-/// body optional, because the overwhelmingly common request — the benchmark
-/// harness's, `python/examples`' — is a bodyless POST meaning "a session at
+/// Optional body of `POST /session` — body and fields both optional,
+/// because the common request is a bodyless POST meaning "a session at
 /// whatever block this server is on."
 #[derive(Deserialize, Default)]
 struct OpenSessionRequest {
@@ -464,12 +439,9 @@ struct OpenSessionRequest {
 }
 
 /// Opens a session, honouring an optional `{"block_number": N}` body.
-/// Deliberately parses raw bytes rather than taking an `Option<Json<_>>`
-/// extractor: a bodyless POST, an empty body with `Content-Type:
-/// application/json`, and a literal `null` all have to mean the same
-/// "default block" thing, and only one of those three survives axum's Json
-/// extractor. Backwards compatibility here is load-bearing — existing
-/// clients post no body at all.
+/// Parses raw bytes rather than `Option<Json<_>>`: a bodyless POST, an
+/// empty JSON body, and a literal `null` must all mean "default block",
+/// and axum's Json extractor accepts only one of the three.
 async fn open_session<F: Fallback>(state: &AppState<F>, body: &[u8]) -> Value
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -958,10 +930,9 @@ mod tests {
         assert!(after.is_err(), "expected the discarded session to be gone");
     }
 
-    /// Stub block-fork factory for the `POST /session {"block_number": N}`
-    /// tests: block N's fallback reports balance N for `PINNED_PROBE`, so
-    /// "which block did this session actually open at" is answerable over
-    /// the ordinary RPC surface, with no network.
+    /// Block N's stub fallback reports balance N for `PINNED_PROBE`, so
+    /// "which block did this session open at" is answerable over the
+    /// ordinary RPC surface, with no network.
     const PINNED_PROBE: Address = Address::new([0x5A; 20]);
 
     #[derive(Clone)]

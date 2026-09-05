@@ -55,13 +55,9 @@ async fn fork_impl(rpc_url: &str, block: BlockId) -> eyre::Result<(Fork, BlockEn
 
     let meta = BlockchainDbMeta::new(block_env.clone(), rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);
-    // Pin the backend's *state* reads to the same block the `BlockEnv` was
-    // read from. `SharedBackend`'s `pin_block: None` means every
-    // account/storage/code fetch goes to `latest` no matter which block was
-    // forked — so `fork_at(url, N)` used to be a block-number label stuck on
-    // live state, not a fork of block N. Invisible when forking the tip;
-    // fatal for per-session block pinning, where two sessions at different
-    // blocks would otherwise read the exact same (latest) state.
+    // `pin_block: None` sends every account/storage/code read to `latest`
+    // whatever block was forked, so `fork_at(url, N)` was a label on live
+    // state. Two sessions at different blocks read identical state.
     let pin = BlockId::number(block_env.number.to::<u64>());
     let backend = SharedBackend::spawn_backend_thread(provider, db, Some(pin));
     Ok((WrapDatabaseRef(backend), block_env))
@@ -94,28 +90,19 @@ pub async fn fork_at(rpc_url: &str, block_number: u64) -> eyre::Result<(Fork, Bl
     fork_impl(rpc_url, BlockId::number(block_number)).await
 }
 
-/// Everything this fork has actually fetched from upstream so far, as a
-/// `BaseSnapshot` — the form `forkyard_engine::persist` writes to disk and
-/// `SessionManager::with_base` reads back at startup.
+/// Everything this fork has fetched from upstream so far, in the form
+/// `forkyard_engine::persist` writes and `SessionManager::with_base` reads.
 ///
-/// This has to come from the fetch backend rather than from the manager's
-/// own base: a session caches a resolved read in its private overlay and
-/// the shared base is only ever seeded, never grown (see `Session`'s
-/// `TODO(fetch)`), so the backend's cache is the one place holding
-/// everything every session ever paid for. It is also pure chain state —
-/// nothing in this workspace ever commits an execution diff into the
-/// backend, so a session's `advance` writes cannot leak into what gets
-/// persisted.
-///
-/// Copies the backend's maps under its own locks; paid once, at shutdown.
+/// Must come from the backend, not the manager's base: the base is only
+/// ever seeded, never grown, so the backend's cache is the one place
+/// holding what every session paid for. Copies its maps under lock.
 pub fn cache_snapshot(fork: &Fork) -> BaseSnapshot {
     let backend = &fork.0;
     let accounts = backend.accounts();
 
-    // The backend keeps code inline on each `AccountInfo` and has no
-    // hash-keyed map of its own, so build one here: `Session::code_by_hash`
-    // looks code up by hash, and code that only ever existed inline would
-    // send that lookup upstream for a contract we already hold.
+    // The backend only keeps code inline on each `AccountInfo`, so build the
+    // hash-keyed map `Session::code_by_hash` needs; otherwise that lookup
+    // goes upstream for a contract we already hold.
     let code: Vec<_> = accounts
         .values()
         .filter_map(|info| info.code.as_ref())
@@ -128,10 +115,8 @@ pub fn cache_snapshot(fork: &Fork) -> BaseSnapshot {
         .into_iter()
         .flat_map(|(address, slots)| slots.into_iter().map(move |(key, value)| ((address, key), value)));
 
-    // The engine keys block hashes by `u64` where the backend keys them by
-    // `U256`. A height that doesn't fit a u64 can't have been asked for
-    // through the engine in the first place, so drop it rather than invent
-    // a truncated key that would answer for some other block.
+    // The engine keys block hashes by `u64`, the backend by `U256`. Drop
+    // what doesn't fit rather than truncate into another block's key.
     let block_hashes = backend
         .block_hashes()
         .into_iter()

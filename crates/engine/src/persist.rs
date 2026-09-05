@@ -1,21 +1,13 @@
 //! On-disk persistence for a `BaseSnapshot`, keyed by (chain id, block
 //! number).
 //!
-//! Why this exists at all: forkyard's warm cache lived only in the process,
-//! so restarting it threw away every account, slot and code blob already
-//! paid for. Measured against Anvil on the same pinned block and the same 8
-//! contracts, that was the one dimension Anvil won — Foundry persists its
-//! fork cache to `~/.foundry/cache/rpc/<chain>/<block>/storage.json`, so a
-//! *second* `anvil` run made 30 upstream calls where forkyard made 37 every
-//! single time. This module is forkyard's equivalent, and the reason a
-//! restart is now free rather than a re-fetch.
+//! The warm cache used to live only in the process, so a restart re-paid
+//! for everything — the one dimension Anvil won, since Foundry persists its
+//! fork cache to `~/.foundry/cache/rpc/<chain>/<block>/storage.json`.
 //!
-//! The whole module's contract is that the cache is an optimisation and
-//! never a dependency: every failure path here — missing, unreadable,
-//! truncated, wrong version, wrong chain, wrong block — is an ordinary
-//! `Err` the caller logs and ignores, starting cold. Nothing in here
-//! panics, and writes go through a temp file plus a rename so a crash
-//! mid-write cannot leave a half-written file that poisons the next start.
+//! The cache is an optimisation, never a dependency: every failure path
+//! here is an ordinary `Err` the caller logs before starting cold, nothing
+//! panics, and writes go through a temp file plus a rename.
 
 use std::fmt;
 use std::fs;
@@ -29,23 +21,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::BaseSnapshot;
 
-/// Written into every file and checked on load. A file without exactly
-/// this string is somebody else's JSON that happens to sit at our path —
-/// `anvil --dump-state` output, a half-copied `storage.json`, a log — and
-/// must be refused before its fields are believed.
+/// Written into every file and checked on load: a file without this tag is
+/// someone else's JSON sitting at our path, and must be refused before any
+/// of its fields are believed.
 pub const CACHE_FORMAT: &str = "forkyard-fork-cache";
 
-/// Bumped whenever the meaning of the fields below changes. An old file is
-/// rejected rather than migrated: the cost of being wrong is serving stale
-/// or misinterpreted chain state into a simulation, and the cost of being
-/// right is one cold start.
+/// Bumped whenever the fields below change meaning. An old file is
+/// rejected, not migrated: misreading it means stale state in a
+/// simulation, where rejecting it costs one cold start.
 pub const CACHE_FORMAT_VERSION: u32 = 1;
 
-/// What a cache file is *for* — the chain and block whose state it holds.
-/// Carried inside the file as well as in its path, because a path can be
-/// renamed, copied between machines or hand-edited, and a snapshot of
-/// block X's state served as block Y's is silently wrong in a way no test
-/// downstream would catch.
+/// The chain and block a cache file holds. Carried inside the file as well
+/// as in its path: paths get renamed and copied, and block X's state served
+/// as block Y's is silently wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CacheKey {
     pub chain_id: u64,
@@ -66,14 +54,12 @@ impl fmt::Display for CacheKey {
 
 #[derive(Debug)]
 pub enum CacheError {
-    /// No file for this key yet — the ordinary first-run case, not a
-    /// fault. Kept distinct so a caller can log it at debug rather than
-    /// warn.
+    /// The ordinary first-run case, kept distinct so a caller can log it
+    /// at debug rather than warn.
     Missing(PathBuf),
     Io(PathBuf, io::Error),
-    /// Unparseable, truncated, or holding a code blob that isn't valid
-    /// bytecode. All three mean the same thing to a caller: don't trust
-    /// any of it.
+    /// Unparseable, truncated, or holding invalid bytecode — all of which
+    /// mean the same thing to a caller: don't trust any of it.
     Malformed(PathBuf, String),
     NotAForkyardCache { path: PathBuf, found: Option<String> },
     VersionMismatch { path: PathBuf, found: Option<u32>, expected: u32 },
@@ -83,8 +69,8 @@ pub enum CacheError {
 }
 
 impl CacheError {
-    /// True for the "there just isn't one yet" case, so a caller can keep
-    /// a first run quiet and still shout about a genuinely broken file.
+    /// Lets a caller keep a first run quiet and still shout about a
+    /// genuinely broken file.
     pub fn is_missing(&self) -> bool {
         matches!(self, Self::Missing(_))
     }
@@ -128,12 +114,9 @@ impl fmt::Display for CacheError {
 
 impl std::error::Error for CacheError {}
 
-/// One account, as primitive fields rather than a serialized `AccountInfo`.
-/// `AccountInfo` does derive serde, but it also carries a runtime-only
-/// `account_id` hint and an inline `code` copy of what the `code` list
-/// below already holds by hash — spelling the four fields that actually
-/// describe the account keeps the file both smaller and independent of
-/// revm's own struct layout across upgrades.
+/// Primitive fields rather than a serialized `AccountInfo`: that carries a
+/// runtime-only `account_id` and an inline copy of code the `code` list
+/// already holds, and ties the file to revm's struct layout.
 #[derive(Serialize, Deserialize)]
 struct StoredAccount {
     address: Address,
@@ -142,12 +125,9 @@ struct StoredAccount {
     code_hash: B256,
 }
 
-/// Code as its original (unpadded) bytes, not as a serialized `Bytecode`.
-/// `Bytecode`'s own serde form is the *analyzed* representation — padded
-/// bytes, jump table, kind tag — which is an internal detail of revm's
-/// interpreter and would tie this file format to a revm version. Raw bytes
-/// plus `Bytecode::new_raw_checked` reproduces the same value from a form
-/// that is just the contract's code.
+/// Original (unpadded) bytes, not a serialized `Bytecode`: that serde form
+/// is revm's *analyzed* representation (padding, jump table, kind tag), an
+/// interpreter detail. `Bytecode::new_raw_checked` rebuilds it on load.
 #[derive(Serialize, Deserialize)]
 struct StoredCode {
     hash: B256,
@@ -156,10 +136,9 @@ struct StoredCode {
 
 #[derive(Serialize, Deserialize, Default)]
 struct CacheFile {
-    /// Every self-describing field is `Option` on purpose: an *absent* tag
-    /// has to be rejected with the same specific error a *wrong* tag gets,
-    /// and serde's own "missing field" error would collapse both into an
-    /// undifferentiated parse failure.
+    /// The self-describing fields are `Option` so an absent tag gets the
+    /// same specific error as a wrong one, instead of serde's generic
+    /// "missing field" parse failure.
     #[serde(default)]
     format: Option<String>,
     #[serde(default)]
@@ -178,13 +157,9 @@ struct CacheFile {
     block_hashes: Vec<(u64, B256)>,
 }
 
-/// Where cache files live when `FORKYARD_CACHE_DIR` isn't set:
-/// `$HOME/.forkyard/cache`, deliberately alongside — not inside —
-/// `~/.foundry/cache`, since the two formats are unrelated and sharing a
-/// directory would only invite one tool to trip over the other's files.
-/// Falls back to the system temp directory when there's no home to speak
-/// of (a container running as a user with no `$HOME`), which still gets a
-/// warm restart within one boot and never fails outright.
+/// `$HOME/.forkyard/cache` when `FORKYARD_CACHE_DIR` isn't set — alongside
+/// `~/.foundry/cache`, never inside it, the formats being unrelated. With
+/// no `$HOME`, the temp dir: warm within one boot, and never fatal.
 pub fn default_cache_dir() -> PathBuf {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     match home {
@@ -199,10 +174,9 @@ pub struct ForkCache {
     dir: PathBuf,
 }
 
-/// Disambiguates concurrent temp files within one process; the pid
-/// disambiguates between processes. Two forkyard instances sharing a cache
-/// directory (the whole point — one machine, many agents) must not write
-/// into each other's temp file and then rename a mixture into place.
+/// Separates concurrent temp files within a process, as the pid does
+/// between processes: two instances sharing a cache directory must not
+/// write into one temp file and rename the mixture into place.
 static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl ForkCache {
@@ -214,16 +188,14 @@ impl ForkCache {
         &self.dir
     }
 
-    /// `<dir>/<chain_id>/<block_number>.json` — the same
-    /// chain-then-block shape Foundry uses, so a human looking at both
-    /// directories can tell what they're looking at.
+    /// `<dir>/<chain_id>/<block_number>.json` — the chain-then-block shape
+    /// Foundry uses, so both directories read the same way.
     pub fn path_for(&self, key: CacheKey) -> PathBuf {
         self.dir.join(key.chain_id.to_string()).join(format!("{}.json", key.block_number))
     }
 
     /// Read back the snapshot stored for `key`, or say why it can't be
-    /// trusted. Never panics: every parse and every field check is an
-    /// `Err` the caller turns into a cold start.
+    /// trusted. Every parse and field check is an `Err`, never a panic.
     pub fn load(&self, key: CacheKey) -> Result<BaseSnapshot, CacheError> {
         let path = self.path_for(key);
         let bytes = match fs::read(&path) {
@@ -232,9 +204,8 @@ impl ForkCache {
             Err(e) => return Err(CacheError::Io(path, e)),
         };
 
-        // A truncated file (killed mid-write by something that bypassed
-        // the rename below, e.g. a full disk) lands here as a JSON syntax
-        // error, which is exactly the outcome wanted: reject, start cold.
+        // A truncated file lands here as a JSON syntax error — which is
+        // the wanted outcome: reject, start cold.
         let file: CacheFile = serde_json::from_slice(&bytes)
             .map_err(|e| CacheError::Malformed(path.clone(), e.to_string()))?;
 
@@ -259,19 +230,17 @@ impl ForkCache {
 
         let mut code = Vec::with_capacity(file.code.len());
         for entry in file.code {
-            // Undecodable code means the bytes on disk are not what was
-            // written; the rest of the file is no more trustworthy than
-            // this part of it, so refuse the lot rather than silently
-            // serving a snapshot with a hole in it.
+            // Undecodable code means the bytes on disk aren't what was
+            // written, so refuse the whole file rather than serve a
+            // snapshot with a hole in it.
             let bytecode = Bytecode::new_raw_checked(entry.bytes)
                 .map_err(|e| CacheError::Malformed(path.clone(), format!("code {}: {e}", entry.hash)))?;
             code.push((entry.hash, bytecode));
         }
 
-        // Re-attach each account's code inline. revm asks `basic` first and
-        // only falls back to `code_by_hash` when `code` is `None`, so an
-        // account handed back without it costs an extra database round trip
-        // per contract read — the exact cost this file exists to remove.
+        // Re-attach each account's code inline: revm only calls
+        // `code_by_hash` when `basic` returns `code: None`, so leaving it
+        // off costs a round trip per contract read.
         let by_hash: std::collections::HashMap<B256, Bytecode> = code.iter().cloned().collect();
         let accounts = file.accounts.into_iter().map(|a| {
             let info = AccountInfo {
@@ -292,15 +261,10 @@ impl ForkCache {
         ))
     }
 
-    /// Write `snapshot` as the cache for `key`, atomically: serialize into
-    /// a uniquely named temp file in the *same directory*, fsync it, then
-    /// `rename` it over the target. Rename within a directory is atomic on
-    /// every filesystem this runs on, so a reader either sees the whole
-    /// previous file or the whole new one — never a prefix. Writing in
-    /// place instead would mean a crash (or a SIGKILL between the harness's
-    /// SIGTERM and the process actually exiting) leaves a truncated file
-    /// that the next start has to detect and discard, turning one lost warm
-    /// start into a permanently poisoned cache entry.
+    /// Write `snapshot` as the cache for `key`: temp file in the same
+    /// directory, fsync, rename over the target. A reader sees the whole
+    /// old file or the whole new one — an in-place write would leave a
+    /// crash's truncated prefix as a permanently poisoned entry.
     pub fn store(&self, key: CacheKey, snapshot: &BaseSnapshot) -> Result<(), CacheError> {
         let path = self.path_for(key);
         let dir = path.parent().unwrap_or(&self.dir).to_path_buf();
@@ -356,9 +320,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
-    /// A scratch directory of our own rather than a `tempfile` dependency:
-    /// nothing in this workspace's lockfile provides one, and a cache
-    /// directory is exactly two `fs` calls to make and remove.
+    /// Hand-rolled rather than a `tempfile` dependency: nothing in this
+    /// workspace's lockfile provides one.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -391,8 +354,8 @@ mod tests {
         Bytecode::new_raw(Bytes::from(vec![0x60, 0x01, 0x60, 0x02, 0x01, 0x00]))
     }
 
-    /// A snapshot with one of everything a real fork cache holds: an EOA,
-    /// a contract with code, two of its slots, and a block hash.
+    /// One of everything a real fork cache holds: an EOA, a contract with
+    /// code, two of its slots, a block hash.
     fn populated() -> (BaseSnapshot, Address, Address, Bytecode) {
         let eoa = Address::from([0x11; 20]);
         let contract = Address::from([0x22; 20]);
@@ -472,9 +435,8 @@ mod tests {
         let (snapshot, ..) = populated();
         cache.store(KEY, &snapshot).unwrap();
 
-        // Same file, asked for under a different key: the path check alone
-        // would miss this (a copied or renamed file), which is why the key
-        // is written *inside* the file too.
+        // Same file under a different key — a copied or renamed file, which
+        // the path check alone would miss.
         let other_chain = CacheKey::new(137, KEY.block_number);
         fs::create_dir_all(cache.path_for(other_chain).parent().unwrap()).unwrap();
         fs::copy(cache.path_for(KEY), cache.path_for(other_chain)).unwrap();
@@ -513,8 +475,8 @@ mod tests {
         cache.store(KEY, &snapshot).unwrap();
         let path = cache.path_for(KEY);
 
-        // Truncated: what a write killed halfway through would have left
-        // behind if it hadn't gone through a temp file and a rename.
+        // Truncated: what a write killed halfway would leave without the
+        // temp file and rename.
         let full = fs::read(&path).unwrap();
         fs::write(&path, &full[..full.len() / 2]).unwrap();
         assert!(matches!(cache.load(KEY), Err(CacheError::Malformed { .. })));
@@ -523,15 +485,13 @@ mod tests {
         fs::write(&path, b"\x00\x01not json at all").unwrap();
         assert!(matches!(cache.load(KEY), Err(CacheError::Malformed { .. })));
 
-        // A Foundry `storage.json` copied to our path: valid JSON, but its
-        // `accounts` is a map where ours is a list, so it never even gets
-        // as far as the format tag.
+        // A Foundry `storage.json` at our path: valid JSON, but `accounts`
+        // is a map where ours is a list, so it fails before the format tag.
         fs::write(&path, br#"{"meta":{"chain":1},"accounts":{"0x00":{"balance":"0x0"}}}"#).unwrap();
         assert!(matches!(cache.load(KEY), Err(CacheError::Malformed { .. })));
 
-        // Well-formed JSON with nothing of ours in it — here the format
-        // tag is what refuses it, since serde ignores unknown fields and
-        // would otherwise hand back a silently empty snapshot.
+        // Well-formed JSON with nothing of ours in it: only the format tag
+        // refuses this, since serde would hand back an empty snapshot.
         fs::write(&path, br#"{"note":"some other tool's file"}"#).unwrap();
         assert!(matches!(cache.load(KEY), Err(CacheError::NotAForkyardCache { found: None, .. })));
     }
@@ -544,9 +504,8 @@ mod tests {
         cache.store(KEY, &snapshot).unwrap();
         let path = cache.path_for(KEY);
 
-        // 0xef01 is the EIP-7702 delegation prefix, which is only valid at
-        // exactly 23 bytes — a good stand-in for "these bytes are not what
-        // was written."
+        // 0xef01 is the EIP-7702 delegation prefix, valid only at exactly
+        // 23 bytes — a stand-in for bytes that aren't what was written.
         let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         file["code"][0]["bytes"] = serde_json::json!("0xef0100");
         fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
@@ -600,10 +559,8 @@ mod tests {
             .collect();
         assert!(strays.is_empty(), "a completed store must leave no temp file: {strays:?}");
 
-        // The second, *smaller* snapshot replaced the first whole rather
-        // than overwriting its prefix — an in-place write would have left
-        // the tail of the bigger file appended to the smaller one, which
-        // parses as neither.
+        // The smaller second snapshot replaced the first whole: an in-place
+        // write would leave the bigger file's tail appended to it.
         assert_eq!(cache.load(KEY).unwrap().account_count(), 0);
     }
 
@@ -614,9 +571,8 @@ mod tests {
         let (snapshot, ..) = populated();
         cache.store(KEY, &snapshot).unwrap();
 
-        // Exactly the debris a SIGKILL between `File::create` and `rename`
-        // would leave: it sits next to the real file and is invisible to
-        // `load`, which only ever opens `path_for`.
+        // The debris a SIGKILL between `File::create` and `rename` leaves.
+        // `load` only ever opens `path_for`, so it can't see this.
         let dir = cache.path_for(KEY).parent().unwrap().to_path_buf();
         fs::write(dir.join(format!("{}.99999.0.tmp", KEY.block_number)), b"half a fi").unwrap();
 
@@ -636,9 +592,8 @@ mod tests {
 
     #[test]
     fn an_unwritable_directory_errors_rather_than_panicking() {
-        // A path whose parent is a *file*, not a directory: `create_dir_all`
-        // fails, and the point is that it surfaces as an ordinary Err the
-        // shutdown path can log past.
+        // A path whose parent is a file: `create_dir_all` fails, and must
+        // surface as an ordinary Err the shutdown path can log past.
         let scratch = Scratch::new();
         let blocker = scratch.0.join("blocker");
         fs::write(&blocker, b"not a directory").unwrap();
