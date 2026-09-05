@@ -7,8 +7,8 @@ PAIRS = [f"0x{i:040x}" for i in range(20)]
 
 
 def test_selectors_match_their_signatures():
-    """Hardcoding 0x1e3dd18b / 0x0902f1ac would fail silently if wrong — an
-    unknown selector returns empty data, not an error."""
+    """An unknown selector returns empty data, not an error, so a wrong
+    hardcoded value would fail silently."""
     assert ALL_PAIRS_SELECTOR == "0x" + keccak(b"allPairs(uint256)")[:4].hex()
     assert GET_RESERVES_SELECTOR == "0x" + keccak(b"getReserves()")[:4].hex()
 
@@ -30,8 +30,7 @@ def test_disjoint_gives_every_agent_its_own_contracts():
 
 
 def test_disjoint_refuses_rather_than_silently_recycling_addresses():
-    """Recycling would make a 'disjoint' run quietly share state and read as
-    evidence for the opposite conclusion."""
+    """Recycling would make a 'disjoint' run quietly share state."""
     with pytest.raises(ValueError, match="need 30"):
         assign_contracts(PAIRS[:10], num_agents=10, per_agent=3, overlap="disjoint")
 
@@ -47,16 +46,15 @@ def test_unknown_overlap_mode_is_rejected():
 
 
 def test_word_to_address_returns_a_checksummed_address():
-    """`allPairs` answers in lowercase; web3.py refuses lowercase. Returning
-    the raw slice made every read fail client-side in under a millisecond,
-    which reads as a suspiciously fast run rather than a broken one."""
+    """`allPairs` answers in lowercase and web3.py refuses lowercase: the
+    raw slice made every read fail client-side in under a millisecond."""
     word = "0x000000000000000000000000b4e16d0168e52d35cacd2c6185b44281ec28c9dc"
     assert word_to_address(word) == "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"
 
 
 def test_eth_call_retries_a_transient_failure_then_succeeds(monkeypatch):
-    """A few hundred setup calls run back-to-back; one throttled connection
-    must not abort the sweep before any agent has run."""
+    """One throttled connection must not abort the sweep before any agent
+    has run."""
     import contracts
 
     calls = {"n": 0}

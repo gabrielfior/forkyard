@@ -17,21 +17,35 @@ import time
 from typing import Callable, IO
 
 import requests
+from pydantic import BaseModel, Field, NonNegativeFloat, NonNegativeInt
 
 from agent import ActionRecord, run_agent
 from backend import AnvilBackend, Backend, ForkyardBackend
 from contracts import assign_contracts, fetch_pair_addresses
-from rpc_proxy import CountingProxy
+from rpc_proxy import CountingProxy, ProxyStats
 
-FIELDS = ["backend", "block_height", "num_agents", "agent_id", "action", "elapsed_ms", "ok", "error"]
 
-# Written to a sibling `<out>.upstream.csv` only under --count-upstream:
-# one row per (backend, block height, agent count) combination, holding
-# what that combination cost the upstream provider.
-UPSTREAM_FIELDS = [
-    "backend", "block_height", "num_agents", "episodes",
-    "http_requests", "jsonrpc_calls", "calls_per_agent", "upstream_errors", "top_methods",
-]
+class UpstreamRow(BaseModel):
+    """One combination's cost to the upstream provider, written to a sibling
+    `<out>.upstream.csv` under --count-upstream."""
+
+    backend: str = Field(min_length=1)
+    block_height: int = Field(ge=0)
+    num_agents: int = Field(ge=1)
+    episodes: int = Field(ge=1)
+    http_requests: NonNegativeInt
+    jsonrpc_calls: NonNegativeInt
+    # The number the architectures differ on: Anvil's cache is per process
+    # so this tracks the agent count, forkyard's shared one lets it fall away.
+    calls_per_agent: NonNegativeFloat
+    upstream_errors: NonNegativeInt
+    top_methods: str
+
+
+# CSV column order is the models' field order. benchmark.md and the other
+# scripts read these columns by position, so neither may be reordered.
+FIELDS = list(ActionRecord.model_fields)
+UPSTREAM_FIELDS = list(UpstreamRow.model_fields)
 
 
 def parse_int_list(s: str) -> list[int]:
@@ -39,16 +53,7 @@ def parse_int_list(s: str) -> list[int]:
 
 
 def _row(r: ActionRecord) -> dict[str, object]:
-    return {
-        "backend": r.backend,
-        "block_height": r.block_height,
-        "num_agents": r.num_agents,
-        "agent_id": r.agent_id,
-        "action": r.action,
-        "elapsed_ms": r.elapsed_ms,
-        "ok": r.ok,
-        "error": r.error,
-    }
+    return r.model_dump()
 
 
 def write_records(out: IO[str], records: list[ActionRecord]) -> None:
@@ -58,29 +63,25 @@ def write_records(out: IO[str], records: list[ActionRecord]) -> None:
 
 
 def upstream_row(
-    backend: str, block_height: int, num_agents: int, episodes: int, stats
+    backend: str, block_height: int, num_agents: int, episodes: int, stats: ProxyStats
 ) -> dict[str, object]:
-    """`calls_per_agent` is the number the architectures actually differ
-    on: Anvil's own cache is per process, so it should track the agent
-    count, while forkyard's shared one should let it fall away."""
     top = dict(sorted(stats.by_method.items(), key=lambda kv: -kv[1])[:5])
-    return {
-        "backend": backend,
-        "block_height": block_height,
-        "num_agents": num_agents,
-        "episodes": episodes,
-        "http_requests": stats.http_requests,
-        "jsonrpc_calls": stats.jsonrpc_calls,
-        "calls_per_agent": round(stats.jsonrpc_calls / num_agents, 1),
-        "upstream_errors": stats.upstream_errors,
-        "top_methods": json.dumps(top),
-    }
+    return UpstreamRow(
+        backend=backend,
+        block_height=block_height,
+        num_agents=num_agents,
+        episodes=episodes,
+        http_requests=stats.http_requests,
+        jsonrpc_calls=stats.jsonrpc_calls,
+        calls_per_agent=round(stats.jsonrpc_calls / num_agents, 1),
+        upstream_errors=stats.upstream_errors,
+        top_methods=json.dumps(top),
+    ).model_dump()
 
 
 def _check_binaries_on_path() -> None:
-    """Fail before any sweep runs rather than deep inside a worker thread
-    on the first Anvil sweep — by which point the whole forkyard half has
-    already been run and would be thrown away."""
+    """Fail before any sweep runs: a missing binary discovered on the first
+    Anvil sweep would throw away the whole forkyard half."""
     missing = []
     if shutil.which("forkyard") is None:
         missing.append(
@@ -97,10 +98,9 @@ def _check_binaries_on_path() -> None:
 
 
 def _terminate(process: subprocess.Popen) -> None:
-    """terminate → wait → kill → wait. The kill fallback matters in a
-    `finally`: a bare `wait(timeout=...)` that expires would raise out of
-    the `finally`, masking the in-flight exception AND leaving an orphaned
-    forkyard holding the sweep's fixed port."""
+    """terminate → wait → kill → wait. Called from a `finally`, where a
+    bare expiring `wait()` would mask the in-flight exception and leave an
+    orphan holding the sweep's fixed port."""
     process.terminate()
     try:
         process.wait(timeout=10)
@@ -135,9 +135,9 @@ def _run_agents(
     episodes: int,
     contracts_per_agent: list[list[str]] | None = None,
 ) -> tuple[list[ActionRecord], float]:
-    """Run `num_agents` agents concurrently and return their records plus
-    the wall-clock they took together. Shared by both backends so the
-    timed region can't drift apart between them."""
+    """Run `num_agents` agents concurrently, returning their records and the
+    wall-clock they took together. Shared by both backends so their timed
+    regions cannot drift apart."""
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
         futures = [
@@ -184,15 +184,10 @@ def run_forkyard_sweep(
     try:
         _wait_for_forkyard(base_url)
 
-        # The timed region INCLUDES, per agent and per episode: opening a
-        # forkyard session, the whole action sequence, and the discard. It
-        # EXCLUDES the one-time `forkyard` process startup above, which is a
-        # shared cost with no Anvil analogue. This mirrors `run_anvil_sweep`
-        # exactly — there, each episode's `AnvilBackend(...)` construction
-        # (spawn + wait-until-ready) is likewise inside the timer. Keep both
-        # sides symmetric: never hoist session-open out of the agent, or
-        # forkyard stops paying its per-episode setup cost while Anvil still
-        # pays its own.
+        # Timed per agent and episode: session open, actions, discard —
+        # excluding only the one-time process start above, which has no Anvil
+        # analogue. Hoisting the session open out of the agent would break
+        # that symmetry with run_anvil_sweep.
         return _run_agents(
             lambda i: (lambda: ForkyardBackend(base_url=base_url)),
             "forkyard", num_agents, block_height, actions_per_agent, episodes,
@@ -208,15 +203,12 @@ def run_anvil_sweep(
     contracts_per_agent: list[list[str]] | None = None,
     anvil_rpc_cache: bool = False,
 ) -> tuple[list[ActionRecord], float]:
-    # The timed region INCLUDES, per agent and per episode: spawning an
-    # Anvil and waiting until it is ready, the action sequence, and the
-    # discard that kills it. Anvil has no shared one-time startup to
-    # exclude, which is exactly why `run_forkyard_sweep` excludes only
-    # forkyard's single shared process start.
+    # Timed per agent and episode: spawn + wait-until-ready, actions, and
+    # the discard that kills the process. Anvil has no shared startup to
+    # exclude, which is why run_forkyard_sweep excludes only forkyard's.
     def factory_for(agent_index: int) -> Callable[[], Backend]:
-        # A window of `episodes` ports per agent: an episode's discard kills
-        # the process, but the port it held can linger in TIME_WAIT, so the
-        # next episode must not try to reuse it.
+        # A port window per agent: a discarded process leaves its port in
+        # TIME_WAIT, so the next episode must not reuse it.
         ports = iter(range(base_port + agent_index * episodes, base_port + (agent_index + 1) * episodes))
         return lambda: AnvilBackend(next(ports), rpc_url, block_height, rpc_cache=anvil_rpc_cache)
 
@@ -265,8 +257,8 @@ def main() -> None:
 
     contract_pool: list[str] = []
     if args.state_overlap:
-        # Fetched once, from the real endpoint, before any counting starts:
-        # this is setup, not agent work.
+        # Once, from the real endpoint, before counting starts: setup, not
+        # agent work.
         needed = max(args.agents) * args.actions_per_agent if args.state_overlap == "disjoint" else args.actions_per_agent
         print(f"fetching {needed} Uniswap V2 pair addresses for the {args.state_overlap} workload", file=sys.stderr)
         contract_pool = fetch_pair_addresses(args.rpc_url, max(args.block_heights), needed)
@@ -275,9 +267,8 @@ def main() -> None:
     rpc_url = proxy.url if proxy else args.rpc_url
     upstream_path = args.out.rsplit(".", 1)[0] + ".upstream.csv"
 
-    # Flush after every (block_height, num_agents, backend) combination so
-    # a failure part-way through a long sweep keeps everything collected up
-    # to that point instead of discarding the whole run.
+    # Flushed after every combination, so a failure part-way through a long
+    # sweep keeps what it collected.
     try:
         with open(args.out, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=FIELDS)

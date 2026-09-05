@@ -869,6 +869,7 @@ dependencies = [
     { name = "eth-utils" },
     { name = "matplotlib" },
     { name = "pandas" },
+    { name = "pydantic" },
     { name = "requests" },
     { name = "web3" },
 ]
@@ -884,6 +885,7 @@ requires-dist = [
     { name = "eth-utils", specifier = ">=5.0.0" },
     { name = "matplotlib", specifier = ">=3.9.0" },
     { name = "pandas", specifier = ">=2.2.0" },
+    { name = "pydantic", specifier = ">=2" },
     { name = "requests", specifier = ">=2.32.0" },
     { name = "web3", specifier = ">=7.16.0" },
 ]

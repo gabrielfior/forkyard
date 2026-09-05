@@ -24,17 +24,16 @@ def test_cu_for_returns_the_published_weight():
 
 
 def test_an_unknown_method_falls_back_to_the_labelled_default():
-    """A method we could not verify must be priced *and* flagged, never
-    silently folded into a number someone then quotes."""
+    """An unverified method must be priced *and* flagged, never silently
+    folded into a number someone quotes."""
     assert cu_for("eth_getAccountInfo") == DEFAULT_CU
     assert is_priced("eth_getAccountInfo") is False
     assert is_priced("eth_call") is True
 
 
 def test_the_table_holds_the_methods_the_backends_actually_hammer():
-    """These five are what a fork backend spends its upstream budget on;
-    if one drops out of the table the whole cost report silently becomes
-    an average-of-defaults."""
+    """If one drops out of the table the cost report silently becomes an
+    average-of-defaults."""
     for method in [
         "eth_getBalance", "eth_getCode", "eth_getStorageAt",
         "eth_getTransactionCount", "eth_getBlockByNumber",
@@ -43,9 +42,8 @@ def test_the_table_holds_the_methods_the_backends_actually_hammer():
 
 
 def test_cost_for_weights_each_method_by_its_own_price():
-    """The reason not to bill a flat rate per call: 100 eth_chainIds and
-    100 eth_sendRawTransactions are the same call count and nowhere near
-    the same bill."""
+    """100 eth_chainIds and 100 eth_sendRawTransactions are the same call
+    count and nowhere near the same bill."""
     total_cu, usd = cost_for({"eth_call": 2, "eth_chainId": 10}, usd_per_million_cu=1.0)
     assert total_cu == 52  # 2*26 + 10*0
     assert usd == pytest.approx(52 / 1_000_000)
@@ -76,10 +74,8 @@ def test_a_complete_breakdown_is_priced_exactly():
 
 
 def test_a_truncated_breakdown_is_extrapolated_and_says_so():
-    """`top_methods` keeps only the five busiest methods, so summing it is
-    a lower bound. Pricing the uncovered calls at the covered average is a
-    better estimate than that bound, but it is an estimate — the label is
-    the load-bearing part."""
+    """`top_methods` keeps only five methods, so summing it is a lower
+    bound; the "extrapolated" label is the load-bearing part."""
     top5 = {"eth_getBalance": 30, "eth_getCode": 20, "eth_chainId": 10}  # 60 calls
     est = estimate_calls(100, top5, usd_per_million_cu=1.0)
 
@@ -132,8 +128,8 @@ def _row(backend: str, agents: int, calls: int, methods: dict[str, int]) -> dict
 
 
 def test_report_prices_both_backends_and_states_the_ratio():
-    """The measured 50-agent numbers: forkyard 387 calls against Anvil's
-    4,204. Cost has to preserve that gap, not average it away."""
+    """Real measured 50-agent numbers; cost must preserve the gap, not
+    average it away."""
     rows = [
         _row("forkyard", 50, 387, {"eth_getBalance": 100, "eth_getStorageAt": 287}),
         _row("anvil", 50, 4204, {"eth_getBalance": 1500, "eth_getCode": 1500, "eth_getStorageAt": 1204}),
@@ -167,8 +163,8 @@ def test_report_does_not_claim_extrapolation_when_the_breakdown_is_complete():
 
 
 def test_cli_reads_an_upstream_csv_and_prints_costs(tmp_path, monkeypatch, capsys):
-    """End to end over the real file format `run_benchmark.py
-    --count-upstream` writes, so a column rename there fails here."""
+    """Over the real UPSTREAM_FIELDS format, so a column rename fails
+    here."""
     from run_benchmark import UPSTREAM_FIELDS
 
     path = tmp_path / "results.upstream.csv"

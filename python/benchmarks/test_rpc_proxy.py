@@ -10,9 +10,8 @@ from rpc_proxy import RATE_LIMIT_ERROR_CODE, CountingProxy, TokenBucket
 
 
 class _StubUpstream:
-    """A minimal JSON-RPC endpoint, so these tests never touch a real
-    provider (and so the counts asserted below can only come from the
-    proxy)."""
+    """A minimal JSON-RPC endpoint, so the counts asserted below can only
+    come from the proxy."""
 
     def __init__(self):
         self.received: list[object] = []
@@ -78,9 +77,8 @@ def test_proxy_counts_calls_by_method(upstream):
 
 
 def test_a_batch_is_one_http_request_but_many_jsonrpc_calls(upstream):
-    """Providers bill per call, not per HTTP request, and both backends
-    batch. Counting only requests would understate whichever backend
-    batches harder."""
+    """Providers bill per call, so counting only requests would understate
+    whichever backend batches harder."""
     batch = [
         {"jsonrpc": "2.0", "id": 1, "method": "eth_getCode", "params": []},
         {"jsonrpc": "2.0", "id": 2, "method": "eth_getCode", "params": []},
@@ -105,8 +103,7 @@ def test_reset_zeroes_the_counters_between_combinations(upstream):
 
 
 def test_an_unreachable_upstream_is_counted_not_raised():
-    """A sweep must not die because the provider blipped: the agent sees a
-    JSON-RPC error like any other, and the blip is visible in the stats."""
+    """A sweep must not die because the provider blipped."""
     with CountingProxy("http://127.0.0.1:9") as proxy:  # port 9 = discard
         resp = _call(proxy.url)
         stats = proxy.snapshot()
@@ -117,15 +114,12 @@ def test_an_unreachable_upstream_is_counted_not_raised():
     assert stats.jsonrpc_calls == 1
 
 
-# ---------------------------------------------------------------------------
-# Rate limiting. The bucket maths is tested directly against an injected
-# clock (no sleeping, so no flakiness); only the two end-to-end tests below
-# actually wait, and they wait tenths of a second.
-# ---------------------------------------------------------------------------
+# Rate limiting. The bucket maths runs against an injected clock, so only
+# the two end-to-end tests below actually sleep.
 
 
 class _FakeClock:
-    """A hand-cranked monotonic clock, so "one second later" costs nothing."""
+    """A hand-cranked monotonic clock."""
 
     def __init__(self, t: float = 0.0):
         self.t = t
@@ -138,9 +132,6 @@ class _FakeClock:
 
 
 def test_bucket_lets_the_first_burst_through_and_delays_the_next_call():
-    """The headline property: a limiter at N rps passes N calls and makes
-    the N+1st wait. Without it the "quota" in bench_quota.py would be
-    decorative."""
     clock = _FakeClock()
     bucket = TokenBucket(rate_per_s=10, clock=clock)
 
@@ -150,9 +141,8 @@ def test_bucket_lets_the_first_burst_through_and_delays_the_next_call():
 
 
 def test_bucket_queues_rather_than_drops_so_delays_accumulate():
-    """Two calls past the budget wait twice as long as one: the debt is
-    charged under the lock before anyone sleeps, which is what makes
-    concurrent callers serialise instead of all waking together."""
+    """The debt is charged under the lock before anyone sleeps, which is
+    what makes concurrent callers serialise."""
     clock = _FakeClock()
     bucket = TokenBucket(rate_per_s=10, burst=1, clock=clock)
 
@@ -176,8 +166,7 @@ def test_bucket_refills_at_the_configured_rate_and_stops_at_the_burst():
 
 
 def test_bucket_charges_a_batch_of_m_calls_m_tokens():
-    """Providers bill and throttle per call, so a batch of M must cost M
-    tokens. Charging one per HTTP request would let a batching client walk
+    """Charging one token per HTTP request would let a batching client walk
     straight through any quota."""
     clock = _FakeClock()
     bucket = TokenBucket(rate_per_s=10, burst=10, clock=clock)
@@ -199,8 +188,8 @@ def test_try_consume_refuses_instead_of_queueing():
 
 
 def test_a_batch_bigger_than_the_burst_can_never_be_consumed():
-    """Documented behaviour, not an accident: under a per-window quota a
-    single request larger than the window is always refused."""
+    """Documented behaviour: under a per-window quota a request larger than
+    the window is always refused."""
     bucket = TokenBucket(rate_per_s=10, burst=5, clock=_FakeClock())
     assert bucket.try_consume(6) is False
 
@@ -213,8 +202,6 @@ def test_bucket_rejects_a_nonsensical_rate():
 
 
 def test_unlimited_proxy_records_no_throttling(upstream):
-    """The no-limit path must stay exactly what it was: no bucket, no clock
-    read, no delay columns moving."""
     with CountingProxy(upstream.url) as proxy:
         for _ in range(5):
             _call(proxy.url)
@@ -227,8 +214,7 @@ def test_unlimited_proxy_records_no_throttling(upstream):
 
 
 def test_delay_mode_makes_the_over_budget_call_wait_and_still_serves_it(upstream):
-    """A queueing provider turns excess volume into latency, not errors:
-    the call is slow, but it is answered and it still costs money."""
+    """A queueing provider turns excess volume into latency, not errors."""
     with CountingProxy(upstream.url, rate_limit_rps=4, limit_mode="delay") as proxy:
         for _ in range(4):  # the initial burst, straight through
             _call(proxy.url)
@@ -249,9 +235,8 @@ def test_delay_mode_makes_the_over_budget_call_wait_and_still_serves_it(upstream
 
 
 def test_reject_mode_answers_minus_32005_and_never_reaches_the_upstream(upstream):
-    """The other failure mode: the provider refuses. This is what collapses
-    an agent's success rate, and it costs the provider nothing — which is
-    why rejected calls are counted apart from delayed ones."""
+    """A refusal costs the provider nothing, which is why rejected calls
+    are counted apart from delayed ones."""
     with CountingProxy(upstream.url, rate_limit_rps=2, burst=2, limit_mode="reject") as proxy:
         _call(proxy.url)
         _call(proxy.url)
@@ -299,7 +284,6 @@ def test_reset_clears_the_throttling_counters_too(upstream):
 
 
 def test_an_unknown_limit_mode_is_refused_at_construction():
-    """Better here than three hours into a sweep that silently limited
-    nothing."""
+    """Better here than three hours into a sweep that limited nothing."""
     with pytest.raises(ValueError, match="limit_mode"):
         CountingProxy("http://127.0.0.1:9", rate_limit_rps=10, limit_mode="drop")

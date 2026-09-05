@@ -12,6 +12,7 @@ dependencies = [
     "requests>=2.32.0",
     "pandas>=2.2.0",
     "matplotlib>=3.9.0",
+    "pydantic>=2",
 ]
 
 [dependency-groups]

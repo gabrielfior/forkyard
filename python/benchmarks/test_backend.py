@@ -2,17 +2,11 @@ from backend import erc20_balance_slot
 
 
 def test_erc20_balance_slot_matches_known_dai_vector():
-    # DAI's balanceOf mapping is storage slot 2 (see the plan's Global
-    # Constraints). This is the standard Solidity mapping-slot formula:
-    # keccak256(bytes32(holder) ++ bytes32(slot)). Cross-checked against
-    # a known-good value computed independently with eth_utils.keccak
-    # for holder 0x0000000000000000000000000000000000000001, slot 2.
     holder = "0x0000000000000000000000000000000000000001"
     slot = erc20_balance_slot(holder, mapping_slot=2)
     assert isinstance(slot, bytes)
     assert len(slot) == 32
-    # Re-derive independently in the test (not copy the implementation)
-    # to actually catch a wrong formula, not just a wrong constant.
+    # Re-derived here rather than copied, so a wrong formula fails too.
     from eth_utils import keccak
     key = int(holder, 16).to_bytes(32, "big")
     mapping_slot_bytes = (2).to_bytes(32, "big")
@@ -21,10 +15,8 @@ def test_erc20_balance_slot_matches_known_dai_vector():
 
 
 def test_anvil_is_spawned_with_rpc_caching_disabled(monkeypatch):
-    """Without this, Anvil serves fork state from ~/.foundry/cache written by
-    earlier runs while forkyard refills its cache from the endpoint every
-    process start — the sweep then compares one backend's cold cache against
-    another backend's record of previous sweeps."""
+    """Without it Anvil serves fork state from ~/.foundry/cache written by
+    earlier runs, while forkyard refills from the endpoint every start."""
     import backend as backend_module
 
     spawned: dict[str, list[str]] = {}

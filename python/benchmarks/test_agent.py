@@ -6,9 +6,8 @@ from agent import ActionRecord, run_agent
 
 
 class FakeBackend:
-    """Records every backend call instead of touching a real RPC endpoint,
-    so this test proves the ordering/dependency logic in run_agent without
-    needing a live forkyard or anvil process."""
+    """Records every backend call instead of touching a real RPC endpoint.
+    Has no send_raw_transaction, so every tx-sending action fails."""
 
     name = "fake"
 
@@ -81,9 +80,8 @@ def test_run_agent_respects_the_fund_approve_swap_dependency_order():
 
 
 def test_swap_token_for_token_never_self_swaps(monkeypatch):
-    """A DAI->DAI self-swap reverts every time. With a single-entry TOKENS
-    registry the old `or [token_in]` fallback guaranteed exactly that, so
-    the action could never once succeed."""
+    """A DAI->DAI self-swap always reverts; the old `or [token_in]` fallback
+    guaranteed one on a single-entry TOKENS registry."""
     seen: list[tuple[str, str]] = []
     real_swap = agent_module.swap_token_for_token
 
@@ -107,16 +105,13 @@ def test_swap_token_for_token_never_self_swaps(monkeypatch):
 
 
 def test_a_failed_send_resyncs_the_nonce_from_the_chain(monkeypatch):
-    """Every tx-sending action on FakeBackend fails (no
-    send_raw_transaction), so the local counter would run away to 1, 2,
-    3... while the chain consumed nothing. The resync must pull it back to
-    what the chain reports."""
+    """Every tx here fails, so the local counter would run away to 1, 2, 3
+    while the chain consumed nothing."""
     chain_nonce = 7
 
     class ResyncBackend(FakeBackend):
         def web3(self):
             w3 = super().web3()
-            # Instance attribute, so it isn't bound — takes just `address`.
             w3.eth.get_transaction_count = lambda address: chain_nonce
             return w3
 
@@ -134,14 +129,10 @@ def test_a_failed_send_resyncs_the_nonce_from_the_chain(monkeypatch):
     )
 
     assert len(nonces) >= 2, "expected several transfers across 40 actions"
-    # Every transfer after the first sees the resynced value, never a
-    # locally-incremented one that the chain never accepted.
     assert nonces[1:] == [chain_nonce] * (len(nonces) - 1), nonces
 
 
 def test_run_agent_records_carry_an_error_string_for_failed_actions():
-    # FakeBackend has no send_raw_transaction, so every tx-sending action
-    # fails — which is exactly what makes the error field observable here.
     records = run_agent(
         FakeBackend, "fake", random.Random(42),
         agent_id=0, block_height=20_000_000, num_agents=1, num_actions=20,
@@ -154,10 +145,8 @@ def test_run_agent_records_carry_an_error_string_for_failed_actions():
 
 
 def test_each_episode_acquires_its_own_environment_and_discards_it():
-    """The churn workload: an agent that forks, does a little, throws the
-    fork away, and does it again. Every episode must pay its own
-    acquisition — reusing one environment across episodes would measure
-    something neither backend supports after a discard."""
+    """Reusing one environment across episodes would measure something
+    neither backend supports after a discard."""
     acquired: list[FakeBackend] = []
 
     def make_backend():
@@ -173,7 +162,7 @@ def test_each_episode_acquires_its_own_environment_and_discards_it():
     assert len(acquired) == 4, "one environment per episode"
     assert [r.action for r in records].count("acquire") == 4
     assert [r.action for r in records].count("discard") == 4
-    # Per episode: acquire + set_balance + 2 actions + discard.
+    # acquire + set_balance + 2 actions + discard, per episode.
     assert len(records) == 4 * (1 + 1 + 2 + 1)
     assert records[0].action == "acquire" and records[-1].action == "discard"
     assert all(b.calls.count("discard") == 1 for b in acquired)
@@ -181,8 +170,7 @@ def test_each_episode_acquires_its_own_environment_and_discards_it():
 
 def test_a_failed_acquisition_is_recorded_and_ends_that_episode_only():
     """An Anvil that never comes up must land in the data as a failed
-    `acquire` row, not as a crashed sweep — and must not stop the agent's
-    remaining episodes."""
+    `acquire` row, not as a crashed sweep."""
     attempts = {"n": 0}
 
     def flaky():
@@ -200,8 +188,7 @@ def test_a_failed_acquisition_is_recorded_and_ends_that_episode_only():
     assert len(failed) == 1
     assert "did not become ready" in failed[0].error
     assert failed[0].backend == "anvil" and failed[0].agent_id == 3
-    # The failed episode contributes its acquire row and nothing else; the
-    # second episode runs in full.
+    # The failed episode contributes its acquire row and nothing else.
     assert len(records) == 1 + (1 + 1 + 2 + 1)
 
 
@@ -216,9 +203,8 @@ def test_acquire_records_carry_the_backend_name_even_though_no_backend_exists():
 
 
 def test_contracts_switch_the_agent_to_the_read_only_workload():
-    """The state-overlap workload must not sign, fund or transact — any of
-    those would put per-agent-unique state back into the traffic the run is
-    trying to attribute to sharing."""
+    """Signing or funding would put per-agent-unique state back into the
+    traffic the run is trying to attribute to sharing."""
     backend = FakeBackend()
     contracts = ["0x" + "11" * 20, "0x" + "22" * 20]
 

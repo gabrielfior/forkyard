@@ -7,7 +7,7 @@ import sys
 
 import matplotlib
 
-matplotlib.use("Agg")  # headless: this script only ever writes PNGs, never shows a window
+matplotlib.use("Agg")  # headless: this script only writes PNGs
 import matplotlib.pyplot as plt
 import pandas as pd
 

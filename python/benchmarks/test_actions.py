@@ -9,7 +9,6 @@ def test_tokens_registry_has_dai_with_expected_slot():
 
 
 def test_tokens_addresses_are_checksummed():
-    """Verify that all token addresses in TOKENS are properly checksummed."""
     for token_name, token_info in TOKENS.items():
         address = token_info["address"]
         checksummed = Web3.to_checksum_address(address)
@@ -33,8 +32,6 @@ def test_timed_captures_the_exception_repr_on_failure():
 
     label, _elapsed_ms, ok, error = _timed("transfer", boom)
     assert (label, ok) == ("transfer", False)
-    # The whole point of the field: distinguish a revert from a nonce
-    # rejection from a timeout, rather than just knowing ok=False.
     assert error == "RuntimeError('transaction 0xdead reverted')"
 
 
