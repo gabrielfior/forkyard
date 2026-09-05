@@ -279,3 +279,95 @@ per (backend, N): `lag_p50`/`lag_p95`, `refresh_ms_p50`/`refresh_ms_p95`,
 it knowing that a large part of Anvil's per-reset bill is re-fetching its ten
 prefunded dev accounts, not the agent's own state — intrinsic to
 `anvil_reset`, but not a cost the agent asked for.
+
+## Quota and cost
+
+Call counts say how much traffic each backend sends the provider. Two
+things follow from that number and neither is visible in it: what the
+traffic **costs**, and what happens when the provider **caps the rate**.
+
+### Rate limiting in the counting proxy
+
+`rpc_proxy.py` takes an optional token bucket:
+
+```bash
+uv run python rpc_proxy.py --upstream $RPC_URL --rate-limit-rps 25 --limit-mode delay
+```
+
+The budget is in JSON-RPC **calls** per second and a batch of M costs M,
+because that is how providers meter. `--burst` (default: one second of the
+rate) is the bucket capacity. The two modes are the two things real
+providers do, and they produce completely different-looking benchmarks:
+
+- `--limit-mode delay` — over-budget calls are **queued**, never dropped.
+  Excess volume turns into latency: `wall_clock_ms` and `total_delay_ms`
+  climb, success stays at 100%.
+- `--limit-mode reject` — over-budget calls get JSON-RPC error `-32005`
+  ("limit exceeded") over HTTP 429, the code Infura/Alchemy/QuickNode
+  return. Excess volume turns into **failed actions**.
+
+`ProxyStats` gains `throttled_calls` (calls not let straight through),
+`rejected_calls` (the subset that never reached the upstream — a delayed
+call still costs money and still returns data, a rejected one does
+neither), `total_delay_ms` and `max_delay_ms`. `total_delay_ms` is summed
+across handler threads, so with N agents in flight it can far exceed the
+run's wall clock — that ratio is how oversubscribed the quota was, not a
+wall-clock claim. With no limit configured every one of these stays 0 and
+the request path skips the bucket entirely.
+
+### `bench_quota.py` — how many agents survive a quota
+
+```bash
+uv run python bench_quota.py --quotas 10,25,100 --agents 5,10,25,50 \
+    --block-height 25795072 --actions-per-agent 5 --rpc-url $RPC_URL --out quota.csv
+```
+
+Sweeps quota × agent count for both backends through one rate-limited
+proxy, and reports for each (backend, quota) the largest agent count still
+completing ≥99% of its actions. Ports are fixed and distinct from
+`run_benchmark.py`'s (forkyard 18640/18641, Anvil 19600+, proxy 18700) so a
+long quota sweep and an ordinary sweep can coexist. `--limit-mode reject`
+measures the failure-mode version of the same question; `--full-curve`
+keeps testing agent counts after one has already failed (off by default:
+those points cost a full sweep each and cannot raise the verdict).
+
+| Column | Meaning |
+| --- | --- |
+| `backend`, `quota_rps`, `num_agents` | Which point the row is for. `quota_rps` is the upstream budget in JSON-RPC calls/sec. |
+| `action_success_rate` | Fraction of that point's recorded actions that succeeded. `acquire` and `discard` count: under a tight quota the first thing that fails is Anvil *forking at all*, and an agent that never got an environment has failed. |
+| `wall_clock_ms` | Wall clock for the whole point, same timed region as `run_benchmark.py`'s `__total__` row. |
+| `jsonrpc_calls` | Calls the point sent upstream (a batch is many). |
+| `throttled_calls` | Calls the limiter did not pass straight through — delayed under `delay`, refused under `reject`. |
+| `total_delay_ms` | Time parked in the limiter, **summed across agents**; may exceed `wall_clock_ms`. |
+| `max_sustainable_agents` | Per (backend, quota), repeated on each of its rows: the largest tested agent count that met the threshold *with every smaller tested count also meeting it*. A pass sitting above a failure is luck, not capacity — the per-point rows keep that evidence visible. `0` means even the smallest count failed. |
+
+### `cost_model.py` — what a run cost the provider
+
+```bash
+uv run python run_benchmark.py --count-upstream ... --out results.csv
+uv run python cost_model.py results.upstream.csv --usd-per-million-cu 0.45
+```
+
+Weights each method by the provider's published compute-unit price and
+prints per-combination CU and USD plus **$/1,000 agent runs** per backend
+(an *agent run* = one agent's whole workload in that combination, i.e. its
+`episodes` acquire→act→discard cycles). Weighting matters because a call is
+not a call: `eth_chainId` is free, `eth_call` is 26 CU, `eth_sendRawTransaction`
+is 40.
+
+Two caveats travel with every number it prints:
+
+- **The table is a snapshot, not a lookup.** Weights are transcribed from
+  Alchemy's public [Compute Unit Costs](https://www.alchemy.com/docs/reference/compute-unit-costs)
+  list and the default price ($0.45/million CU) from its pay-as-you-go
+  page, both read 2026-09-04. Provider tables drift, and other providers
+  meter in different units entirely — so the CU **ratios** here are
+  Alchemy's, not universal. Anything not on the published list (e.g.
+  `eth_getAccountInfo`, ~13% of Anvil's measured traffic) is charged at a
+  clearly labelled `DEFAULT_CU` stand-in and named in the output.
+- **`top_methods` is truncated.** The upstream CSV keeps only the five
+  busiest methods, so summing it is a strict lower bound. Where it does not
+  cover a row's `jsonrpc_calls`, the remainder is priced at the covered
+  calls' average weight and the row is labelled `extrapolated`, with a
+  `cover` column showing how much of the call count the breakdown actually
+  saw.
