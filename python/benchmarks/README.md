@@ -1,70 +1,96 @@
 # forkyard benchmarks
 
-Compares forkyard (one process, N concurrent forked sessions) against
-running one standalone Anvil instance per agent, across agent counts and
-fork block heights. See `docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md`
-in the repo root for the full design.
+Compares forkyard (one process, N concurrent sessions on one shared cache)
+against one standalone Anvil per agent. What each benchmark measures, and the
+results, are in [`benchmark.md`](../../benchmark.md); this file covers layout,
+flags and CSV schemas.
 
 ## Requirements
 
-Both binaries must be **discoverable on `PATH`** — `run_benchmark.py`
-spawns them by bare name (`forkyard`, `anvil`) and refuses to start if
-either is missing:
+Both binaries must be on `PATH` — they are spawned by bare name:
 
 ```bash
 # anvil: install Foundry (https://book.getfoundry.sh/getting-started/installation)
 cargo build -p forkyard --release          # from the repo root
-export PATH="$PWD/target/release:$PATH"    # building alone isn't enough
+export PATH="$PWD/target/release:$PATH"
+uv sync
+uv run pytest                              # tests/ — no subprocesses, no network
 ```
 
-`--rpc-url` must serve historical state at the block heights you sweep
-(`--fork-block-number` on Anvil's side); some public endpoints only do
-that on a paid tier.
+`--rpc-url` must serve historical state at the blocks you sweep; some public
+endpoints only do that on a paid tier.
+
+## Layout
+
+| File | Contents |
+| --- | --- |
+| `bench.py` | entry point for every benchmark: `bench.py <command> [flags]` |
+| `bench_architecture.py` | `branching`, `checkpoint`, `writers` |
+| `bench_load.py` | `arrivals`, `freshness`, `quota` |
+| `bench_cache.py` | `warmstart`, `blocks` |
+| `bench_common.py` | process lifecycle, port allocation, RSS sampling, percentiles, CSV output |
+| `run_benchmark.py` | the standard agent-workload sweep (its own CLI) |
+| `agent.py`, `actions.py`, `backend.py`, `contracts.py` | the workload itself |
+| `rpc_proxy.py` | counting/rate-limiting JSON-RPC proxy |
+| `cost_model.py` | upstream calls → provider compute units and dollars |
+| `plot_results.py` | PNGs from a `run_benchmark.py` CSV |
+| `aggregate_runs.py` | median and spread across repeated runs of a sweep |
+| `tests/` | the unit tests; `pythonpath = ["."]` in `pyproject.toml` is what lets them import the modules above |
+
+Results are written where `--out` says and are **not** tracked in git.
 
 ## Running
 
 ```bash
-uv sync
-uv run pytest                     # unit tests (no subprocesses/network)
-uv run python run_benchmark.py --agents 1,2,5 --block-heights 20000000 --actions-per-agent 5 --rpc-url $RPC_URL --out results.csv
+uv run python bench.py                     # list the commands
+uv run python bench.py branching --help    # flags for one of them
+
+uv run python run_benchmark.py --agents 1,10,50 --block-heights 25795072 \
+  --actions-per-agent 5 --rpc-url $RPC_URL --out results.csv
 uv run python plot_results.py results.csv
 ```
 
-Rows are flushed to the CSV after each (block height, agent count,
-backend) combination, so an interrupted or failing sweep still leaves
-everything collected up to that point.
+Run one benchmark at a time: a second one sharing CPU, ports or RPC quota
+corrupts the first.
 
-## What "total simulation time" measures
+### `run_benchmark.py` flags worth knowing
 
-For **both** backends the timer covers, per agent and concurrently across
-agents: acquiring its own environment (forkyard — opening a session;
-Anvil — spawning an instance and waiting until it is ready), running its
-action sequence, and discarding that environment. It deliberately does
-**not** include forkyard's one-time `forkyard` process startup, which is a
-single shared cost with no Anvil counterpart — so the comparison is
-per-agent-cost against per-agent-cost, not "warm sessions" against "cold
-process starts".
+- `--episodes N` — acquire → act → discard cycles per agent. `--episodes 1
+  --actions-per-agent 20` is one long-lived environment; `--episodes 10
+  --actions-per-agent 2` is the same work through ten disposable forks.
+- `--state-overlap {shared,disjoint}` — read-only workload over real Uniswap V2
+  pairs, either the same contracts for every agent or its own. Run both: the
+  first measures cache sharing, the second is the control.
+- `--count-upstream` — routes both backends through `rpc_proxy.py` and writes
+  `<out>.upstream.csv`. Adds a local hop, so take counts from such a run and
+  timings from a direct one.
+- `--cold-caches` — turn **both** persistent caches off: Anvil's
+  `~/.foundry/cache` and forkyard's `FORKYARD_CACHE_DIR`. Both are on by
+  default, because both survive restarts and warm-against-warm is the
+  like-for-like comparison. Use this to measure a first-ever run at a block,
+  and warm up once before measuring otherwise — the first run at a block fills
+  both caches.
 
-## Output
-
-`plot_results.py results.csv` writes two PNGs next to the CSV:
-
-- **`results_total_time.png`** — total simulation time (ms) against
-  concurrent agent count, one line per (backend, block height). This is
-  the headline chart: how each model's cost scales as agents are added.
-- **`results_action_latency.png`** — a grouped bar chart of median
-  per-action latency by backend, so a difference in the total can be
-  attributed to specific actions rather than just "it's faster".
-
-### CSV columns
+## CSV columns
 
 | Column | Meaning |
 | --- | --- |
 | `backend` | `forkyard` or `anvil`. |
-| `block_height` | Fork block the run was pinned to. |
-| `num_agents` | Agents running concurrently in that sweep. |
-| `agent_id` | Which agent produced the row; `-1` on the synthetic total row. |
-| `action` | Action label (`set_balance`, `transfer`, `get_balance`, `fund_token`, `approve`, `swap_eth_for_token`, `swap_token_for_token`, `discard`), or `__total__` for the one whole-sweep row per combination. |
-| `elapsed_ms` | Wall-clock duration of that action — or of the whole sweep on a `__total__` row. |
-| `ok` | Whether it succeeded. On a `__total__` row, whether *every* action in that combination succeeded. |
-| `error` | `repr()` of the exception (truncated to 200 chars) when `ok` is False, empty otherwise — this is what distinguishes a revert from a nonce rejection from an HTTP timeout. |
+| `block_height`, `num_agents`, `agent_id` | Which sweep and which agent; `agent_id` is `-1` on the synthetic total row. |
+| `action` | `acquire`, `set_balance`, `transfer`, `get_balance`, `fund_token`, `approve`, `swap_eth_for_token`, `swap_token_for_token`, `read_contract`, `discard`, or `__total__` for the one whole-sweep row. `acquire` is the environment acquisition — a forkyard session open, or an Anvil spawn plus wait-until-ready — and appears once per episode, first. A failed `acquire` is the whole episode. |
+| `elapsed_ms` | Duration of that action, or of the sweep on a `__total__` row. |
+| `ok` | Whether it succeeded; on `__total__`, whether everything did. |
+| `error` | `repr()` of the exception (200 chars) when `ok` is false — what distinguishes a revert from a nonce rejection from a timeout. |
+
+### `<out>.upstream.csv` (`--count-upstream` only)
+
+One row per (backend, block height, agent count): `http_requests`,
+`jsonrpc_calls` (batch-aware — a batch is one request and many calls, and
+providers bill calls), `calls_per_agent` (the number the two architectures
+differ on: flat for a per-agent cache, falling for a shared one),
+`upstream_errors`, `throttled_calls`/`rejected_calls`/`total_delay_ms` under a
+rate limit, and `top_methods` — the five busiest methods only, so summing it
+under-counts.
+
+Each `bench.py` command documents its own columns in `--help`; several also
+write a `.summary.csv` sibling with per-sweep aggregates.

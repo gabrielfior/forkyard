@@ -18,3 +18,7 @@ docs/*
 docs/superpowers/*
 !docs/superpowers/specs/
 !docs/superpowers/plans/
+
+# Benchmark output. Regenerate with the commands in benchmark.md.
+python/benchmarks/*.csv
+python/benchmarks/results/

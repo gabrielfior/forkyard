@@ -1,8 +1,7 @@
 """One function per simulated-agent action, each timed and returning
-(label, elapsed_ms, ok, error). See docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md
-for why this specific set (no eth_call, no impersonation, no generic
-ERC-20 faucet on the RPC surface — only what forkyard_setStorageAt /
-anvil_setStorageAt make possible)."""
+(label, elapsed_ms, ok, error). The set is limited to what both backends'
+RPC surfaces support; see
+docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md."""
 
 from __future__ import annotations
 
@@ -14,10 +13,9 @@ from web3 import Web3
 
 from backend import Backend, erc20_balance_slot
 
-# (label, elapsed_ms, ok, error) — `error` is `repr(exception)` truncated
-# to _MAX_ERROR_CHARS on failure, "" on success. Without it an ok=False row
-# is indistinguishable between a revert, a nonce rejection, an HTTP
-# timeout, and a bug in the harness itself.
+# (label, elapsed_ms, ok, error). `error` is a truncated `repr(exception)`,
+# without which an ok=False row cannot be told apart from a revert, a nonce
+# rejection, a timeout or a harness bug.
 ActionResult = tuple[str, float, bool, str]
 
 _MAX_ERROR_CHARS = 200
@@ -61,7 +59,7 @@ _ROUTER_ABI = [
     },
 ]
 
-_FAR_FUTURE_DEADLINE = 9_999_999_999  # year ~2286, plenty for a benchmark run
+_FAR_FUTURE_DEADLINE = 9_999_999_999  # year ~2286
 
 
 def _timed(label: str, fn: Callable[[], None]) -> ActionResult:
@@ -154,6 +152,17 @@ def swap_token_for_token(
         )
         _send_signed(w3, signer_key, UNISWAP_V2_ROUTER, 0, bytes.fromhex(data[2:]), nonce, gas=300_000)
     return _timed("swap_token_for_token", do)
+
+
+def read_contract(backend: Backend, address: str, data_hex: str) -> ActionResult:
+    """`eth_estimateGas` rather than `eth_call`, which forkyard's HTTP
+    surface does not expose; it still executes in the EVM, so the read pulls
+    code and slots through the backend's cache."""
+    def do():
+        w3 = backend.web3()
+        w3.eth.estimate_gas({"to": address, "data": data_hex})
+        w3.eth.get_balance(address)
+    return _timed("read_contract", do)
 
 
 def discard_session(backend: Backend) -> ActionResult:

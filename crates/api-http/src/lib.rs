@@ -5,7 +5,10 @@
 //! `POST /session` opens a new session and returns its id; `POST
 //! /session/{id}` carries the actual JSON-RPC calls against that session.
 //! This is what lets N callers share one warm cache instead of each paying
-//! for their own, the way the earlier per-agent-fork example did.
+//! for their own, the way the earlier per-agent-fork example did. An
+//! optional `{"block_number": N}` body pins the session to block N, each
+//! height fetched once and shared; `forkyard_forkFrom` opens one from
+//! *this* session's current state instead of the shared base.
 //!
 //! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
 //! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
@@ -17,8 +20,8 @@
 //! which stays in-process and therefore doesn't pay this crate's JSON/HTTP
 //! serialization cost).
 //!
-//! `eth_gasPrice` is the fork's real base fee (from `SessionManager::block_env`,
-//! itself `forkyard_fetch::fork`'s actual fetched block) plus a fixed
+//! `eth_gasPrice` is the base fee of the *session's* own `BlockEnv` (not
+//! the manager's — a pinned session's block differs) plus a fixed
 //! priority-fee margin — not a made-up constant, but it's still a snapshot
 //! from whenever the fork was taken, not a live-updating fee market (that
 //! needs `forkyard-ingest` to exist first). `eth_blockNumber` is that same
@@ -63,7 +66,7 @@ const PRIORITY_FEE_WEI: u64 = 1_500_000_000;
 /// exactly the bug this constant used to have (30M vs. the real 16.7M cap).
 const ESTIMATE_GAS_LIMIT: u64 = 16_777_216;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SessionRpcState {
     receipts: HashMap<String, Value>,
     block_number: u64,
@@ -151,14 +154,29 @@ fn field_str<'a>(call: &'a Value, key: &str) -> Option<&'a str> {
     call.get(key).and_then(Value::as_str)
 }
 
-/// The fork's real starting block number plus `session_id`'s own
-/// send-count so far — see the module-level doc comment.
-fn real_block_number<F: Fallback>(state: &AppState<F>, session_id: SessionId) -> u64
+/// The block `session_id` was forked at — asked of the session, not the
+/// manager, since a pinned session would otherwise report the tip for
+/// `eth_blockNumber` and the tip's base fee for `eth_gasPrice`. An expired
+/// session falls back to the manager's block rather than erroring.
+async fn session_block_env<F: Fallback>(state: &AppState<F>, session_id: SessionId) -> revm::context::BlockEnv
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    state
+        .manager
+        .session_block_env(session_id)
+        .await
+        .unwrap_or_else(|_| state.manager.block_env())
+}
+
+/// The session's own real starting block number plus its send-count so far
+/// — see the module-level doc comment.
+async fn real_block_number<F: Fallback>(state: &AppState<F>, session_id: SessionId) -> u64
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let local = state.rpc_state.lock().unwrap().get(&session_id).map(|s| s.block_number).unwrap_or(0);
-    state.manager.block_env().number.to::<u64>() + local
+    session_block_env(state, session_id).await.number.to::<u64>() + local
 }
 
 /// Builds a standard-shaped JSON-RPC transaction receipt. `block_number`
@@ -229,12 +247,12 @@ where
 
         // The fork's real starting block number plus this session's own
         // send-count — see module doc.
-        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id)))),
+        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id).await))),
 
         // Real base fee (from the fork's actual block) plus a fixed
         // priority-fee margin — see module doc.
         "eth_gasPrice" => {
-            let gas_price = state.manager.block_env().basefee as u64 + PRIORITY_FEE_WEI;
+            let gas_price = session_block_env(state, session_id).await.basefee as u64 + PRIORITY_FEE_WEI;
             Ok(json!(format!("0x{gas_price:x}")))
         }
 
@@ -288,6 +306,22 @@ where
             Ok(json!(true))
         }
 
+        // Branches off *this* session's current state rather than the shared
+        // base. A method, not a `/session/{id}/fork` route: the id is already
+        // this endpoint's routing key, and the result is the same
+        // `{"session_id": ...}` shape `POST /session` returns.
+        "forkyard_forkFrom" => {
+            let child = state.manager.fork_from(session_id).await?;
+            // The block counter and receipts live in our side table, not the
+            // session, so a branch would otherwise report a lower block than
+            // the client just saw on its parent.
+            let mut guard = state.rpc_state.lock().unwrap();
+            if let Some(inherited) = guard.get(&session_id).cloned() {
+                guard.insert(child, inherited);
+            }
+            Ok(json!({ "session_id": child }))
+        }
+
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
         // surface — the HTTP-side counterpart to the `discard` MCP tool
         // (`crates/api-mcp`), which has no equivalent route here today.
@@ -329,7 +363,7 @@ where
             // Advance this session's own block counter and store a
             // receipt for it — this is what makes `eth_getTransactionReceipt`
             // (and so `web3.py`'s `wait_for_transaction_receipt`) work.
-            let real_start = state.manager.block_env().number.to::<u64>();
+            let real_start = session_block_env(state, session_id).await.number.to::<u64>();
             let mut guard = state.rpc_state.lock().unwrap();
             let entry = guard.entry(session_id).or_default();
             entry.block_number += 1;
@@ -395,14 +429,52 @@ where
     }
 }
 
-async fn open_session_handler<F: Fallback>(State(state): State<Arc<AppState<F>>>) -> Json<Value>
+/// Optional body of `POST /session` — body and fields both optional,
+/// because the common request is a bodyless POST meaning "a session at
+/// whatever block this server is on."
+#[derive(Deserialize, Default)]
+struct OpenSessionRequest {
+    #[serde(default)]
+    block_number: Option<u64>,
+}
+
+/// Opens a session, honouring an optional `{"block_number": N}` body.
+/// Parses raw bytes rather than `Option<Json<_>>`: a bodyless POST, an
+/// empty JSON body, and a literal `null` must all mean "default block",
+/// and axum's Json extractor accepts only one of the three.
+async fn open_session<F: Fallback>(state: &AppState<F>, body: &[u8]) -> Value
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    match state.manager.fork().await {
-        Ok(id) => Json(json!({ "session_id": id })),
-        Err(e) => Json(json!({ "error": e.to_string() })),
+    let request = if body.iter().all(u8::is_ascii_whitespace) {
+        OpenSessionRequest::default()
+    } else {
+        match serde_json::from_slice::<Option<OpenSessionRequest>>(body) {
+            Ok(parsed) => parsed.unwrap_or_default(),
+            Err(e) => return json!({ "error": format!("invalid POST /session body: {e}") }),
+        }
+    };
+
+    let opened = match request.block_number {
+        Some(number) => state.manager.fork_at_block(number).await,
+        None => state.manager.fork().await,
+    };
+    match opened {
+        Ok(id) => json!({ "session_id": id }),
+        Err(e) => json!({ "error": e.to_string() }),
     }
+}
+
+// `axum::body::Bytes` spelled out: `Bytes` in this module is
+// `alloy_primitives::Bytes`, a different type entirely.
+async fn open_session_handler<F: Fallback>(
+    State(state): State<Arc<AppState<F>>>,
+    body: axum::body::Bytes,
+) -> Json<Value>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    Json(open_session(&state, &body).await)
 }
 
 async fn rpc_handler<F: Fallback>(
@@ -706,6 +778,68 @@ mod tests {
         );
     }
 
+    async fn balance_of(state: &AppState<TestFallback>, id: SessionId, address: Address) -> Value {
+        dispatch(state, id, "eth_getBalance", &[json!(address.to_string())]).await.unwrap()
+    }
+
+    async fn set_balance(state: &AppState<TestFallback>, id: SessionId, address: Address, hex: &str) {
+        dispatch(state, id, "forkyard_setBalance", &[json!(address.to_string()), json!(hex)])
+            .await
+            .unwrap();
+    }
+
+    async fn fork_from(state: &AppState<TestFallback>, id: SessionId) -> SessionId {
+        let result = dispatch(state, id, "forkyard_forkFrom", &[]).await.unwrap();
+        result["session_id"].as_u64().expect("fork_from must answer in POST /session's shape")
+    }
+
+    #[tokio::test]
+    async fn fork_from_opens_a_session_holding_the_parents_current_state() {
+        let state = test_state();
+        let parent = state.manager.fork().await.unwrap();
+        let funded = Address::from([0x31; 20]);
+        set_balance(&state, parent, funded, "0x64").await;
+
+        let child = fork_from(&state, parent).await;
+        assert_eq!(balance_of(&state, child, funded).await, json!("0x64"));
+
+        // Writes after the branch stay on the side that made them.
+        set_balance(&state, child, funded, "0x1").await;
+        set_balance(&state, parent, funded, "0x2").await;
+        assert_eq!(balance_of(&state, child, funded).await, json!("0x1"));
+        assert_eq!(balance_of(&state, parent, funded).await, json!("0x2"));
+    }
+
+    /// The branch continues the parent's timeline: the block height a
+    /// client already observed on the parent must not go backwards on the
+    /// child, and a receipt from before the branch must still resolve.
+    #[tokio::test]
+    async fn fork_from_inherits_the_parents_block_height_and_receipts() {
+        let state = test_state();
+        let parent = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, parent, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw_hex = signed_transfer_hex(&sender, Address::from([9u8; 20]), 1, 0);
+        let tx_hash = dispatch(&state, parent, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+        assert_eq!(dispatch(&state, parent, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
+
+        let child = fork_from(&state, parent).await;
+        assert_eq!(dispatch(&state, child, "eth_blockNumber", &[]).await.unwrap(), json!("0x1"));
+        let receipt = dispatch(&state, child, "eth_getTransactionReceipt", &[tx_hash]).await.unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+    }
+
+    #[tokio::test]
+    async fn fork_from_a_discarded_session_is_an_rpc_error_not_a_panic() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        dispatch(&state, id, "forkyard_discard", &[]).await.unwrap();
+
+        let err = dispatch(&state, id, "forkyard_forkFrom", &[]).await.unwrap_err();
+        assert_eq!(err.code, -32001);
+    }
+
     #[tokio::test]
     async fn unknown_receipt_returns_null_not_an_error() {
         let state = test_state();
@@ -794,6 +928,110 @@ mod tests {
 
         let after = dispatch(&state, id, "eth_getBalance", &[json!(Address::ZERO.to_string())]).await;
         assert!(after.is_err(), "expected the discarded session to be gone");
+    }
+
+    /// Block N's stub fallback reports balance N for `PINNED_PROBE`, so
+    /// "which block did this session open at" is answerable over the
+    /// ordinary RPC surface, with no network.
+    const PINNED_PROBE: Address = Address::new([0x5A; 20]);
+
+    #[derive(Clone)]
+    struct BlockValueFallback(u64);
+
+    impl DatabaseRef for BlockValueFallback {
+        type Error = TestFallbackError;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            let balance = if address == PINNED_PROBE { U256::from(self.0) } else { U256::ZERO };
+            Ok(Some(AccountInfo { balance, ..Default::default() }))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    fn pinning_state() -> AppState<BlockValueFallback> {
+        let manager = SessionManager::new(
+            BlockValueFallback(0),
+            revm::context::BlockEnv::default(),
+            1,
+            Duration::from_secs(60),
+        )
+        .with_block_forks(
+            |number: u64| -> forkyard_session::BlockForkFuture<BlockValueFallback> {
+                Box::pin(async move {
+                    if number == 0 {
+                        return Err("upstream RPC returned no block for the requested id".to_string());
+                    }
+                    Ok((
+                        BlockValueFallback(number),
+                        revm::context::BlockEnv { number: U256::from(number), ..Default::default() },
+                    ))
+                })
+            },
+            4,
+        );
+        AppState { manager: Arc::new(manager), chain_id: 1, rpc_state: Mutex::new(HashMap::new()) }
+    }
+
+    fn opened_id(response: &Value) -> SessionId {
+        response["session_id"].as_u64().unwrap_or_else(|| panic!("expected a session id, got {response}"))
+    }
+
+    /// The compatibility case that matters most: every existing client —
+    /// the benchmark harness, `python/examples` — posts no body at all.
+    #[tokio::test]
+    async fn open_session_with_no_body_still_opens_at_the_default_block() {
+        let state = pinning_state();
+        for body in [b"".as_slice(), b"  ".as_slice(), b"null".as_slice(), b"{}".as_slice()] {
+            let response = open_session(&state, body).await;
+            let id = opened_id(&response);
+            assert_eq!(
+                balance_of_pinned(&state, id, PINNED_PROBE).await,
+                json!("0x0"),
+                "a bodyless (or empty/null/{{}}) POST /session must mean the manager's own block, as before"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_session_with_a_block_number_pins_that_session_to_that_block() {
+        let state = pinning_state();
+        let at_100 = opened_id(&open_session(&state, br#"{"block_number": 100}"#).await);
+        let at_200 = opened_id(&open_session(&state, br#"{"block_number": 200}"#).await);
+
+        // Two sessions, two blocks, one process — and each reads its own
+        // block's state.
+        assert_eq!(balance_of_pinned(&state, at_100, PINNED_PROBE).await, json!("0x64"));
+        assert_eq!(balance_of_pinned(&state, at_200, PINNED_PROBE).await, json!("0xc8"));
+
+        // ...and reports its own block, not the manager's, over the plain
+        // RPC surface a client actually uses.
+        assert_eq!(dispatch(&state, at_100, "eth_blockNumber", &[]).await.unwrap(), json!("0x64"));
+        assert_eq!(dispatch(&state, at_200, "eth_blockNumber", &[]).await.unwrap(), json!("0xc8"));
+    }
+
+    #[tokio::test]
+    async fn open_session_at_an_unreachable_block_reports_an_error_not_a_session() {
+        let state = pinning_state();
+        let response = open_session(&state, br#"{"block_number": 0}"#).await;
+        assert!(response.get("session_id").is_none(), "no session may be handed out for a block we can't fork");
+        assert!(response["error"].as_str().unwrap().contains("block 0"));
+
+        // A malformed body is reported the same way rather than panicking
+        // or silently opening a default session.
+        let response = open_session(&state, br#"{"block_number": "latest"}"#).await;
+        assert!(response.get("session_id").is_none());
+        assert!(response["error"].as_str().unwrap().contains("invalid POST /session body"));
+    }
+
+    async fn balance_of_pinned(state: &AppState<BlockValueFallback>, id: SessionId, address: Address) -> Value {
+        dispatch(state, id, "eth_getBalance", &[json!(address.to_string())]).await.unwrap()
     }
 
     #[tokio::test]

@@ -1,7 +1,6 @@
 """Backend abstraction so the same agent/action code drives forkyard's
 shared-cache session model and Anvil's one-instance-per-agent model
-identically. See docs/superpowers/specs/2026-08-26-agent-fork-benchmark-design.md.
-"""
+identically."""
 
 from __future__ import annotations
 
@@ -15,11 +14,9 @@ from web3 import Web3
 
 
 def erc20_balance_slot(holder: str, mapping_slot: int) -> bytes:
-    """Solidity's mapping storage slot formula: keccak256(bytes32(key) ++
-    bytes32(mapping_slot)). Standard for a simple `mapping(address =>
-    uint256) balances` declared at `mapping_slot` — not valid for a proxy
-    contract with a different layout (that's why USDC is excluded from
-    the default TOKENS registry — see actions.py)."""
+    """keccak256(bytes32(key) ++ bytes32(mapping_slot)). Only valid for a
+    plain `mapping(address => uint256)`, not for a proxy with its own layout
+    — which is why USDC is absent from actions.TOKENS."""
     key = int(holder, 16).to_bytes(32, "big")
     slot = mapping_slot.to_bytes(32, "big")
     return keccak(key + slot)
@@ -35,24 +32,18 @@ class Backend(Protocol):
 
 
 def open_forkyard_session(base_url: str, timeout_s: float = 30.0) -> str:
-    """Open a fresh session on an already-running forkyard process and
-    return its JSON-RPC URL. Split out of `ForkyardBackend.__init__` so a
-    caller can measure the session-open cost inside its own timed region
-    (see run_benchmark.py: this is forkyard's per-agent analogue of
-    `AnvilBackend.__init__` spawning + waiting for an Anvil process)."""
+    """Split out of `ForkyardBackend.__init__` so a caller can time the
+    session open on its own — forkyard's analogue of Anvil's process
+    spawn."""
     resp = requests.post(f"{base_url}/session", timeout=timeout_s)
     resp.raise_for_status()
     return f"{base_url}/session/{resp.json()['session_id']}"
 
 
 class ForkyardBackend:
-    """One forkyard session, opened against an already-running forkyard
-    process's shared cache. `discard()` calls forkyard_discard rather than
-    tearing down any process — the process outlives every session.
-
-    Pass `base_url` (e.g. `http://127.0.0.1:18555`) to have the session
-    opened here, mirroring how `AnvilBackend.__init__` acquires its own
-    environment; pass `session_url` to reuse an already-open session."""
+    """One session on an already-running forkyard process's shared cache.
+    Pass `base_url` to open the session here (mirroring how AnvilBackend
+    acquires its environment), or `session_url` to reuse an open one."""
 
     name = "forkyard"
 
@@ -78,14 +69,16 @@ class ForkyardBackend:
 
 
 class AnvilBackend:
-    """One standalone Anvil instance, forked at a specific block, owned
-    entirely by this agent. `discard()` kills the process — Anvil has no
-    lighter-weight session-close concept than "the instance is the
-    session", so tearing it down is the fair equivalent action."""
+    """One standalone Anvil forked at a block, owned by a single agent.
+    Anvil has no session-close lighter than killing the process, so that is
+    what `discard()` does."""
 
     name = "anvil"
 
-    def __init__(self, port: int, fork_url: str, fork_block_number: int, startup_timeout_s: float = 20.0):
+    def __init__(
+        self, port: int, fork_url: str, fork_block_number: int,
+        startup_timeout_s: float = 20.0, rpc_cache: bool = True,
+    ):
         try:
             self._process = subprocess.Popen(
                 [
@@ -94,6 +87,12 @@ class AnvilBackend:
                     "--fork-block-number", str(fork_block_number),
                     "--port", str(port),
                     "--silent",
+                    # Foundry's ~/.foundry/cache is on by default here because
+                    # forkyard now persists its own per-(chain, block) cache:
+                    # the like-for-like comparison is warm against warm. Pass
+                    # rpc_cache=False, and FORKYARD_CACHE_DISABLED on the other
+                    # side, to measure both cold.
+                    *([] if rpc_cache else ["--no-storage-caching"]),
                 ],
             )
         except FileNotFoundError as e:
@@ -105,16 +104,15 @@ class AnvilBackend:
         try:
             self._wait_until_ready(startup_timeout_s)
         except BaseException:
-            # Never leave an orphaned anvil holding `port`: the sweep
-            # assigns ports as `base_port + agent_index`, so a survivor
-            # here would poison that index for every later sweep.
+            # An orphan holding `port` would poison that port index for
+            # every later sweep.
             self._terminate_process()
             raise
         self._w3 = Web3(Web3.HTTPProvider(self._url))
 
     def _terminate_process(self) -> None:
-        """terminate → wait → kill → wait, so this always returns with the
-        process confirmed dead (or raises, having tried both signals)."""
+        """terminate → wait → kill → wait: returns only with the process
+        confirmed dead."""
         self._process.terminate()
         try:
             self._process.wait(timeout=5)

@@ -1,5 +1,6 @@
 import csv
 import io
+import json
 
 import pytest
 
@@ -66,8 +67,38 @@ def test_check_binaries_on_path_passes_when_both_are_present(monkeypatch):
 
 
 def test_fields_and_row_stay_in_lockstep():
-    """The incremental writer in main() drives a DictWriter with FIELDS
-    directly, so a field added to one and not the other would raise only
-    mid-sweep, after real work had already been done."""
+    """main()'s incremental writer drives a DictWriter with FIELDS directly,
+    so a mismatch would only raise mid-sweep."""
     record = ActionRecord("forkyard", 20_000_000, 1, 0, "transfer", 1.0, True)
     assert list(run_benchmark._row(record).keys()) == FIELDS
+
+
+def test_upstream_row_reports_calls_per_agent_and_the_busiest_methods():
+    """`calls_per_agent` stays flat for a shared cache and climbs for a
+    per-agent one."""
+    from rpc_proxy import ProxyStats
+    from run_benchmark import UPSTREAM_FIELDS, upstream_row
+
+    stats = ProxyStats(
+        http_requests=40,
+        jsonrpc_calls=100,
+        by_method={"eth_getStorageAt": 60, "eth_getCode": 30, "eth_getBalance": 10},
+        upstream_errors=2,
+    )
+    row = upstream_row("anvil", 20_000_000, 10, 3, stats)
+
+    assert list(row.keys()) == UPSTREAM_FIELDS, "row and header must stay in lockstep"
+    assert row["calls_per_agent"] == 10.0
+    assert row["episodes"] == 3
+    assert row["upstream_errors"] == 2
+    assert json.loads(row["top_methods"])["eth_getStorageAt"] == 60
+
+
+def test_upstream_row_keeps_only_the_five_busiest_methods():
+    from rpc_proxy import ProxyStats
+    from run_benchmark import upstream_row
+
+    stats = ProxyStats(jsonrpc_calls=28, by_method={f"m{i}": i for i in range(1, 8)})
+    top = json.loads(upstream_row("forkyard", 1, 1, 1, stats)["top_methods"])
+
+    assert list(top) == ["m7", "m6", "m5", "m4", "m3"]

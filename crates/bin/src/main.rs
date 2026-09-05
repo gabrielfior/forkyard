@@ -18,16 +18,68 @@
 //! logging to stdout would corrupt the MCP protocol stream for whatever
 //! harness launched this process.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use forkyard_api_mcp::ForkyardMcpServer;
+use forkyard_engine::persist::{default_cache_dir, CacheKey, ForkCache};
+use forkyard_engine::BaseSnapshot;
+use forkyard_fetch::Fork;
 use forkyard_ingest::ChainTipFollower;
-use forkyard_session::SessionManager;
+use forkyard_session::{BlockForkFuture, SessionManager, DEFAULT_MAX_PINNED_BLOCKS};
 use tracing_subscriber::EnvFilter;
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Accepts what people actually type, not just `bool::from_str`:
+/// `FORKYARD_CACHE_DISABLED=1` parsing as "not disabled" would silently
+/// make a cold-vs-warm measurement meaningless.
+fn env_flag(key: &str) -> bool {
+    match std::env::var(key) {
+        Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
+/// Fold what this process fetched into what a previous one cached, and
+/// write it out atomically. The merge stops a warm restart from eroding
+/// the cache: seeded reads never reach the fetch backend, so
+/// `cache_snapshot` alone returns only the new misses. Guarded on the
+/// block still matching, since a tip refresh moves the seeded snapshot's
+/// block. Failures are logged and swallowed; this is the shutdown path.
+fn persist_cache(
+    cache: &ForkCache,
+    manager: &SessionManager<Fork>,
+    chain_id: u64,
+    seeded: Option<&(CacheKey, BaseSnapshot)>,
+) {
+    let Ok(block_number) = u64::try_from(manager.block_env().number) else {
+        tracing::warn!("current block number does not fit a u64; not persisting the fork cache");
+        return;
+    };
+    let key = CacheKey::new(chain_id, block_number);
+
+    let fetched = forkyard_fetch::cache_snapshot(&manager.current_fallback());
+    let snapshot = match seeded {
+        Some((seeded_key, seeded_base)) if *seeded_key == key => seeded_base.merged_with(&fetched),
+        _ => fetched,
+    };
+
+    match cache.store(key, &snapshot) {
+        Ok(()) => tracing::info!(
+            path = %cache.path_for(key).display(),
+            accounts = snapshot.account_count(),
+            storage_slots = snapshot.storage_count(),
+            contracts = snapshot.code_count(),
+            "persisted the fork cache — a restart at this block starts warm"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "could not persist the fork cache; the next start at this block will be cold")
+        }
+    }
 }
 
 #[tokio::main]
@@ -50,22 +102,83 @@ async fn main() -> eyre::Result<()> {
     let fork_block_number: Option<u64> =
         std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
+    // Explicitly pinned blocks kept warm at once, on top of the default
+    // one. Each costs its own fetch backend — cache plus background thread
+    // — so this is a memory bound, not a tidy-up.
+    let max_pinned_blocks: usize = env_or("FORKYARD_MAX_PINNED_BLOCKS", DEFAULT_MAX_PINNED_BLOCKS);
+
+    // `FORKYARD_CACHE_DISABLED` exists so a benchmark can still measure a
+    // cold start: without it, every run after the first is warm.
+    let cache = if env_flag("FORKYARD_CACHE_DISABLED") {
+        tracing::info!("FORKYARD_CACHE_DISABLED is set — every start is a cold start");
+        None
+    } else {
+        let dir = std::env::var_os("FORKYARD_CACHE_DIR").map(PathBuf::from).unwrap_or_else(default_cache_dir);
+        Some(ForkCache::new(dir))
+    };
+    // 0 (the default) means "only at shutdown". A non-zero interval trades
+    // serializing the whole snapshot that often for surviving a SIGKILL.
+    let cache_flush_secs: u64 = env_or("FORKYARD_CACHE_FLUSH_SECS", 0);
+
     let (fork, block_env) = match fork_block_number {
         Some(n) => forkyard_fetch::fork_at(&rpc_url, n).await?,
         None => forkyard_fetch::fork(&rpc_url).await?,
     };
-    let manager = Arc::new(SessionManager::new(
-        fork,
-        block_env,
-        num_workers,
-        Duration::from_secs(ttl_secs),
-    ));
-    tracing::info!(num_workers, ttl_secs, "forked upstream chain, session manager ready");
+
+    // Before any session exists, so even the first read of a restarted
+    // process is warm. Any unusable cache file (missing, truncated, wrong
+    // chain or block, older format) is logged and ignored — never fatal.
+    let seeded = cache.as_ref().zip(u64::try_from(block_env.number).ok()).and_then(|(cache, block_number)| {
+        let key = CacheKey::new(chain_id, block_number);
+        match cache.load(key) {
+            Ok(base) => {
+                tracing::info!(
+                    path = %cache.path_for(key).display(),
+                    accounts = base.account_count(),
+                    storage_slots = base.storage_count(),
+                    contracts = base.code_count(),
+                    "loaded a persisted fork cache — this start is warm"
+                );
+                Some((key, base))
+            }
+            Err(error) if error.is_missing() => {
+                tracing::info!(path = %cache.path_for(key).display(), "no persisted fork cache for this block yet — cold start");
+                None
+            }
+            Err(error) => {
+                tracing::warn!(%error, "ignoring the persisted fork cache and starting cold");
+                None
+            }
+        }
+    });
+    // The factory is the only thing that knows the RPC URL —
+    // `forkyard-session` deliberately doesn't, which keeps it testable
+    // against an in-memory fallback with no network.
+    let fork_rpc_url = rpc_url.clone();
+    let mut manager = SessionManager::new(fork, block_env, num_workers, Duration::from_secs(ttl_secs))
+        .with_block_forks(
+            move |number: u64| -> BlockForkFuture<Fork> {
+                let rpc_url = fork_rpc_url.clone();
+                Box::pin(async move {
+                    forkyard_fetch::fork_at(&rpc_url, number).await.map_err(|e| e.to_string())
+                })
+            },
+            max_pinned_blocks,
+        );
+    if let Some((_, base)) = &seeded {
+        manager = manager.with_base(base.clone());
+    }
+    let manager = Arc::new(manager);
+    let seeded = seeded.map(Arc::new);
+    tracing::info!(num_workers, ttl_secs, max_pinned_blocks, "forked upstream chain, session manager ready");
 
     // Background chain-tip follower — only when the fork isn't pinned to an
     // explicit block. A pinned historical block and "keep following the
     // tip" are contradictory: re-forking to a newer block would silently
     // defeat the whole point of FORKYARD_FORK_BLOCK_NUMBER.
+    //
+    // `refresh_fallback` touches the default base only: a session pinned to
+    // block N must not be dragged to the tip underneath its agent.
     let ingest_handle = match fork_block_number {
         Some(n) => {
             tracing::info!(block = n, "fork pinned to an explicit block; chain-tip following disabled");
@@ -108,14 +221,57 @@ async fn main() -> eyre::Result<()> {
         }
     });
 
+    // Optional interval flush, off by default. On a blocking thread:
+    // serializing a large snapshot is CPU and file I/O, and stalling a
+    // runtime worker shows up as latency for whoever shares it.
+    let flush_handle = match (&cache, cache_flush_secs) {
+        (Some(cache), secs) if secs > 0 => {
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let cache = cache.clone();
+            let flush_manager = Arc::clone(&manager);
+            let flush_seeded = seeded.clone();
+            let task = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(secs));
+                ticker.tick().await; // fires immediately; nothing to save yet
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        _ = ticker.tick() => {
+                            let (cache, manager, seeded) =
+                                (cache.clone(), Arc::clone(&flush_manager), flush_seeded.clone());
+                            let _ = tokio::task::spawn_blocking(move || {
+                                persist_cache(&cache, &manager, chain_id, seeded.as_deref());
+                            })
+                            .await;
+                        }
+                    }
+                }
+            });
+            tracing::info!(every_secs = secs, "periodic fork-cache flush enabled");
+            Some((stop_tx, task))
+        }
+        _ => None,
+    };
+
     wait_for_shutdown_signal().await;
 
     if let Some((stop_tx, task)) = ingest_handle {
         let _ = stop_tx.send(());
         let _ = task.await;
     }
+    if let Some((stop_tx, task)) = flush_handle {
+        let _ = stop_tx.send(());
+        let _ = task.await;
+    }
     http_handle.shutdown().await;
     mcp_http_handle.shutdown().await;
+
+    // After both surfaces are down, so nothing is still fetching into the
+    // backend while it's read. On the SIGTERM path deliberately: that is
+    // how the benchmark harness stops the process.
+    if let Some(cache) = &cache {
+        persist_cache(cache, &manager, chain_id, seeded.as_deref());
+    }
 
     Ok(())
 }
