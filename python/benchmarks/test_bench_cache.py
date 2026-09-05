@@ -1,30 +1,22 @@
-"""Unit tests for the multi-block benchmark.
-
-No network, no subprocesses: the block maths, the agent assignment, the
-correctness verdicts and one agent's whole life are all exercised against
-fakes. The parts that genuinely need a forkyard process (the pinned-session
-POST) are covered by the smoke run documented in README.md.
-"""
-
-from __future__ import annotations
-
+import bench_cache
 import csv
 import io
-
 import pytest
 
-import bench_blocks
-from bench_blocks import (
-    FIELDS,
-    SUMMARY_FIELDS,
+from bench_cache import (
     AgentOutcome,
+    BLOCKS_FIELDS,
     BlockRecord,
+    SUMMARY_FIELDS,
     SummaryRow,
+    WARMSTART_FIELDS,
     _row,
     _summary_row,
     assign_agent_blocks,
     block_heights,
+    clear_dir,
     distinct_state_verified,
+    foundry_cache_dir,
     group_agents_by_block,
     open_pinned_session,
     parse_args,
@@ -34,7 +26,126 @@ from bench_blocks import (
     write_records,
     write_summaries,
 )
+from pathlib import Path
 
+
+# --- from test_bench_warmstart
+
+class _FakeBackend:
+    def web3(self):
+        class Eth:
+            def estimate_gas(self, tx):
+                return 21_000
+
+            def get_balance(self, address):
+                return 0
+
+        class W3:
+            eth = Eth()
+
+        return W3()
+
+    def discard(self):
+        pass
+
+
+class _FakeProcess:
+    pid = 1
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
+
+
+def test_foundry_cache_is_cleared_per_block_not_wholesale():
+    """Clearing all of ~/.foundry/cache would throw away the user's own
+    unrelated work; the benchmark only owns the block it pinned."""
+    path = foundry_cache_dir(25_795_072)
+
+    assert path.name == "25795072"
+    assert path.parent.name == "mainnet"
+    assert "cache" in path.parts and ".foundry" in path.parts
+
+
+def test_clear_dir_is_a_noop_on_a_missing_directory(tmp_path):
+    clear_dir(tmp_path / "never-existed")  # the cold run must not need one to exist
+
+
+def test_clear_dir_removes_a_populated_cache(tmp_path):
+    block_dir = tmp_path / "1"
+    block_dir.mkdir()
+    (block_dir / "25795072.json").write_text("{}")
+
+    clear_dir(tmp_path)
+
+    assert not tmp_path.exists()
+
+
+def test_forkyard_run_never_inherits_the_cache_kill_switch(monkeypatch):
+    """The measurement pass exports FORKYARD_CACHE_DISABLED=1 so every other
+    benchmark stays cold-vs-cold. Leaking it in here would make the warm row
+    a second cold row — the finding would read as "persistence does nothing"."""
+    captured: dict[str, dict[str, str]] = {}
+
+    monkeypatch.setenv("FORKYARD_CACHE_DISABLED", "1")
+    monkeypatch.setattr(
+        bench_cache.subprocess, "Popen",
+        lambda argv, env=None, **kw: (captured.__setitem__("env", env), _FakeProcess())[1],
+    )
+    monkeypatch.setattr(bench_cache, "_wait_for_forkyard", lambda url, **kw: None)
+    monkeypatch.setattr(bench_cache, "_terminate", lambda process: None)
+    monkeypatch.setattr(bench_cache, "ForkyardBackend", lambda **kw: _FakeBackend())
+
+    bench_cache.run_forkyard("http://rpc", 1, 1, ["0xabc"], Path("/tmp/x"))
+
+    assert "FORKYARD_CACHE_DISABLED" not in captured["env"]
+    assert captured["env"]["FORKYARD_CACHE_DIR"] == "/tmp/x"
+
+
+def test_forkyard_is_stopped_politely_so_its_cache_actually_lands(monkeypatch):
+    """SIGKILL would skip the save path, leaving the warm run cold."""
+    terminated: list[object] = []
+
+    monkeypatch.setattr(
+        bench_cache.subprocess, "Popen", lambda argv, env=None, **kw: _FakeProcess()
+    )
+    monkeypatch.setattr(bench_cache, "_wait_for_forkyard", lambda url, **kw: None)
+    monkeypatch.setattr(bench_cache, "_terminate", lambda process: terminated.append(process))
+    monkeypatch.setattr(bench_cache, "ForkyardBackend", lambda **kw: _FakeBackend())
+
+    bench_cache.run_forkyard("http://rpc", 1, 2, ["0xabc"], Path("/tmp/x"))
+
+    assert len(terminated) == 1, "the process must go through _terminate, not be leaked or killed"
+
+
+def test_anvil_runs_with_foundrys_cache_enabled(monkeypatch):
+    """Every other benchmark passes --no-storage-caching. Here the cache is
+    the subject, so this arm must opt back in or the warm row is meaningless."""
+    seen: list[bool] = []
+
+    def fake_anvil(port, fork_url, block, rpc_cache=False):
+        seen.append(rpc_cache)
+        return _FakeBackend()
+
+    monkeypatch.setattr(bench_cache, "AnvilBackend", fake_anvil)
+
+    bench_cache.run_anvil("http://rpc", 1, 3, ["0xabc"])
+
+    assert seen == [True, True, True]
+
+
+def test_fields_cover_both_the_cost_and_the_outcome_columns():
+    assert WARMSTART_FIELDS[:4] == ["backend", "condition", "agents", "contracts"]
+    assert "jsonrpc_calls" in WARMSTART_FIELDS
+    assert WARMSTART_FIELDS[-2:] == ["ok", "error"]
+
+
+# --- from test_bench_blocks
 
 class FakeEth:
     def __init__(self, block_number: int, balance: int, gas_price: int):
@@ -85,11 +196,6 @@ def _outcome(agent_id: int, block: int, reported: int | None, fingerprint: str |
     return AgentOutcome(agent_id, block, reported, fingerprint, [], True)
 
 
-# --------------------------------------------------------------------------
-# Block selection
-# --------------------------------------------------------------------------
-
-
 def test_block_heights_steps_backwards_and_stays_distinct():
     assert block_heights(25_795_072, 1_000, 4) == [25_795_072, 25_794_072, 25_793_072, 25_792_072]
 
@@ -106,11 +212,6 @@ def test_block_heights_rejects_nonsense(base, stride, count):
     inside an arm, long after the sweep committed to it."""
     with pytest.raises(ValueError):
         block_heights(base, stride, count)
-
-
-# --------------------------------------------------------------------------
-# Agent assignment
-# --------------------------------------------------------------------------
 
 
 def test_assign_agent_blocks_is_round_robin_and_even_when_divisible():
@@ -136,11 +237,6 @@ def test_group_agents_by_block_inverts_the_assignment_in_block_order():
     groups = group_agents_by_block(assign_agent_blocks(6, [10, 20, 30]))
     assert list(groups) == [10, 20, 30]
     assert groups == {10: [0, 3], 20: [1, 4], 30: [2, 5]}
-
-
-# --------------------------------------------------------------------------
-# Correctness verdicts
-# --------------------------------------------------------------------------
 
 
 def test_distinct_state_verified_when_each_block_has_its_own_fingerprint():
@@ -189,11 +285,6 @@ def test_summarize_round_is_clean_when_every_session_reports_its_own_block():
     assert summarize_round("forkyard", 2, 8, 2, outcomes, 3, 80.0, 500.0).block_mismatches == 0
 
 
-# --------------------------------------------------------------------------
-# One agent's life
-# --------------------------------------------------------------------------
-
-
 def test_run_block_agent_acquires_reads_every_contract_and_discards():
     backend = FakeBackend(block_number=777, balance=5, gas_price=2)
     outcome = run_block_agent(
@@ -220,7 +311,7 @@ def test_run_block_agent_reads_get_reserves_on_each_contract():
     )
     calls = backend._eth.estimate_gas_calls
     assert [c["to"] for c in calls] == ["0xA", "0xB"]
-    assert all(c["data"] == bench_blocks.GET_RESERVES_SELECTOR for c in calls)
+    assert all(c["data"] == bench_cache.GET_RESERVES_SELECTOR for c in calls)
 
 
 def test_run_block_agent_records_a_failed_acquire_and_stops_there():
@@ -285,11 +376,6 @@ def test_probe_environment_swallows_failures_rather_than_aborting_a_round():
     assert probe_environment(FakeBackend(fail_reads=True)) == (None, None)
 
 
-# --------------------------------------------------------------------------
-# The pinned-session POST
-# --------------------------------------------------------------------------
-
-
 class FakeResponse:
     def __init__(self, payload):
         self._payload = payload
@@ -308,7 +394,7 @@ def test_open_pinned_session_posts_the_block_number_body(monkeypatch):
         seen.update(url=url, json=json, timeout=timeout)
         return FakeResponse({"session_id": 7})
 
-    monkeypatch.setattr(bench_blocks.requests, "post", fake_post)
+    monkeypatch.setattr(bench_cache.requests, "post", fake_post)
     url = open_pinned_session("http://127.0.0.1:18660", 25_706_811)
 
     assert seen["url"] == "http://127.0.0.1:18660/session"
@@ -320,21 +406,16 @@ def test_open_pinned_session_raises_on_the_error_payload(monkeypatch):
     """forkyard answers a refused block with HTTP 200 and {"error": ...}, so
     raise_for_status alone would sail straight past it."""
     monkeypatch.setattr(
-        bench_blocks.requests, "post",
+        bench_cache.requests, "post",
         lambda *a, **k: FakeResponse({"error": "cannot open a session at block 1: too old"}),
     )
     with pytest.raises(RuntimeError, match="cannot open a session at block 1"):
         open_pinned_session("http://127.0.0.1:18660", 1)
 
 
-# --------------------------------------------------------------------------
-# CSV shape and CLI
-# --------------------------------------------------------------------------
-
-
 def test_row_and_fields_stay_in_lockstep():
     record = BlockRecord("forkyard", 4, 24, 2, 3, 25_795_072, "read", 1.25, True, "")
-    assert list(_row(record).keys()) == FIELDS
+    assert list(_row(record).keys()) == BLOCKS_FIELDS
 
 
 def test_summary_row_and_fields_stay_in_lockstep():
@@ -364,9 +445,9 @@ def test_defaults_put_max_pinned_blocks_above_the_largest_b():
 
 def test_blocks_for_prefers_an_explicit_block_list():
     args = parse_args(["--rpc-url", "http://x", "--block-list", "500,400,300"])
-    assert bench_blocks.blocks_for(args, 2) == [500, 400]
+    assert bench_cache.blocks_for(args, 2) == [500, 400]
     with pytest.raises(ValueError):
-        bench_blocks.blocks_for(args, 4)
+        bench_cache.blocks_for(args, 4)
 
 
 def test_anvil_shared_arm_is_off_by_default():

@@ -82,7 +82,7 @@ read the pinned block. Everything here is from the fixed binary.
 cargo build -p forkyard --release && export PATH="$PWD/target/release:$PATH"
 cd python/benchmarks && uv sync
 export RPC_URL=...                 # an archive endpoint, for historical blocks
-export FORKYARD_CACHE_DISABLED=1   # except for bench_warmstart.py
+export FORKYARD_CACHE_DISABLED=1   # except for `bench.py warmstart`
 ```
 
 | Section | Command |
@@ -91,14 +91,14 @@ export FORKYARD_CACHE_DISABLED=1   # except for bench_warmstart.py
 | Long-lived vs churn | as above with `--actions-per-agent 20 --episodes 1`, then `--actions-per-agent 2 --episodes 10` |
 | Upstream load | add `--count-upstream`; then `uv run python cost_model.py core.upstream.csv` |
 | State sharing | `--actions-per-agent 8 --state-overlap shared --count-upstream`, then `--state-overlap disjoint` |
-| Branching | `uv run python bench_branching.py --branches 2,4,8,16,32 --prefix-actions 5 --branch-actions 3 --no-proxy --rpc-url $RPC_URL --out branching.csv` (drop `--no-proxy` for call counts) |
-| Checkpoint | `uv run python bench_checkpoint.py --state-sizes 100,1000,10000 --repeats 3 --rpc-url $RPC_URL --out checkpoint.csv` |
-| Memory | `uv run python bench_writers.py --writers 1,5,10,25,50 --rounds 10 --rpc-url $RPC_URL --out writers.csv` |
-| Arrivals | `uv run python bench_arrivals.py --arrival-rates 1,5,20 --duration 20 --rpc-url $RPC_URL --out arrivals.csv` |
-| Freshness | `uv run python bench_freshness.py --agents 5,25 --duration 120 --refresh-secs 30 --poll-secs 4 --anvil-base-port 21000 --rpc-url $RPC_URL --out freshness.csv` |
-| Quota | `uv run python bench_quota.py --quotas 10,50 --agents 5,25 --rpc-url $RPC_URL --out quota.csv` (add `--limit-mode reject --burst 200`) |
-| Restart | `uv run python bench_warmstart.py --agents 5 --contracts 8 --rpc-url $RPC_URL --out warmstart.csv` |
-| Many blocks | `uv run python bench_blocks.py --agents 24 --blocks 1,2,4,8 --base-block 25795072 --block-stride 1000 --rounds 2 --rpc-url $RPC_URL --out blocks.csv` |
+| Branching | `uv run python bench.py branching --branches 2,4,8,16,32 --prefix-actions 5 --branch-actions 3 --no-proxy --rpc-url $RPC_URL --out branching.csv` (drop `--no-proxy` for call counts) |
+| Checkpoint | `uv run python bench.py checkpoint --state-sizes 100,1000,10000 --repeats 3 --rpc-url $RPC_URL --out checkpoint.csv` |
+| Memory | `uv run python bench.py writers --writers 1,5,10,25,50 --rounds 10 --rpc-url $RPC_URL --out writers.csv` |
+| Arrivals | `uv run python bench.py arrivals --arrival-rates 1,5,20 --duration 20 --rpc-url $RPC_URL --out arrivals.csv` |
+| Freshness | `uv run python bench.py freshness --agents 5,25 --duration 120 --refresh-secs 30 --poll-secs 4 --anvil-base-port 21000 --rpc-url $RPC_URL --out freshness.csv` |
+| Quota | `uv run python bench.py quota --quotas 10,50 --agents 5,25 --rpc-url $RPC_URL --out quota.csv` (add `--limit-mode reject --burst 200`) |
+| Restart | `uv run python bench.py warmstart --agents 5 --contracts 8 --rpc-url $RPC_URL --out warmstart.csv` |
+| Many blocks | `uv run python bench.py blocks --agents 24 --blocks 1,2,4,8 --base-block 25795072 --block-stride 1000 --rounds 2 --rpc-url $RPC_URL --out blocks.csv` |
 
 Each command writes to `--out`; some also write a `.summary.csv` sibling, and
 `--count-upstream` adds a `.upstream.csv`. Column meanings are in

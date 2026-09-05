@@ -1,55 +1,4 @@
-"""N agents spread over B *different* fork blocks, in one process.
-
-Every other benchmark here pins the whole sweep to one block. This one asks
-the question that only became answerable with per-session block pinning
-(`POST /session {"block_number": N}`): what does it cost to serve a fleet
-whose agents each need a *different* historical block?
-
-The architectures answer it differently by construction:
-
-  * forkyard: one process. A session names its block in the open request;
-    sessions naming the same block share one fetched base and one fallback,
-    so the fleet's upstream cost scales with the number of distinct *blocks*,
-    not the number of agents. `FORKYARD_MAX_PINNED_BLOCKS` caps how many
-    bases stay warm (LRU past that), and this harness sets it above B on
-    purpose — see `--max-pinned-blocks`.
-  * Anvil: `--fork-block-number` is a process-level flag. B blocks therefore
-    means at least B processes, and because an Anvil instance *is* the unit
-    of isolation, N isolated agents means **N processes** — one per agent,
-    grouped B ways by block. That is the `anvil` arm, and it is the only
-    apples-to-apples one.
-  * `anvil-shared-unsafe` is the cheaper thing you could do instead: B
-    processes total, with the N/B agents at a block all pointing at the same
-    Anvil. It is recorded because it is what a cost-conscious operator would
-    try, and labelled `unsafe` because those agents are **not isolated from
-    each other** — one agent's `anvil_setBalance` or landed transaction is
-    visible to every other agent in its group. Read its numbers as "what you
-    would pay if you gave up isolation", never as a peer of the other two.
-
-Two rounds are run against the same blocks. Round 1 is cold. Round 2 opens
-fresh sessions (forkyard) or spawns fresh processes (Anvil) at the *same*
-blocks: forkyard's per-block bases are still resident, so round 2 should
-cost it almost nothing upstream, while every new Anvil refetches from
-scratch. That gap is the point of the whole file.
-
-Correctness is checked, not assumed. Two facts must hold or the cost
-numbers mean nothing:
-
-  * `eth_blockNumber` on each agent's environment equals the block it asked
-    for (`block_mismatches`, which must be 0);
-  * environments at different blocks really see different state
-    (`distinct_state_verified`).
-
-The state fingerprint is WETH's own ETH balance (plus the block's gas
-price), *not* a pair's reserves, for a boring reason: forkyard's per-session
-RPC has no `eth_call`, `eth_getCode` or `eth_getStorageAt`, so the only
-state a session can hand back is an account's balance and nonce. A Uniswap
-V2 pair holds its reserves in storage and holds no ETH, so its account state
-is byte-identical at every block. WETH's balance is the ETH backing every
-one of those pairs' WETH side and moves essentially every block, so it is
-the strongest cross-block state signal this RPC surface can actually return.
-The pairs are still what the timed read workload touches.
-"""
+"""Benchmarks of cached state: restart cost and many blocks in one process."""
 
 from __future__ import annotations
 
@@ -58,55 +7,214 @@ import concurrent.futures
 import csv
 import itertools
 import os
+import requests
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from typing import Callable, IO, Iterator
-
-import requests
-from web3 import Web3
 
 from actions import ActionResult, WETH, read_contract
 from backend import AnvilBackend, Backend, ForkyardBackend
-from bench_writers import RssSampler, process_pids
+from bench_common import (
+    DEFAULT_BLOCK_HEIGHT,
+    MAX_ERROR_CHARS,
+    RssSampler,
+    parse_int_list,
+    process_pids,
+    summary_path,
+)
 from contracts import GET_RESERVES_SELECTOR, fetch_pair_addresses
+from dataclasses import dataclass
+from pathlib import Path
 from rpc_proxy import CountingProxy
-from run_benchmark import _terminate, _wait_for_forkyard, parse_int_list
+from run_benchmark import _terminate, _wait_for_forkyard
+from typing import Callable, IO, Iterator
+from web3 import Web3
 
-FIELDS = [
+
+# --- bench_warmstart: What a *restart* costs, now that both backends can persist a fetch cache.
+
+WARMSTART_FIELDS = [
+    "backend", "condition", "agents", "contracts",
+    "jsonrpc_calls", "http_requests", "wall_clock_ms", "ok", "error",
+]
+
+
+WARMSTART_FORKYARD_PORT = 18670
+
+
+WARMSTART_FORKYARD_MCP_PORT = 18671
+
+
+WARMSTART_ANVIL_BASE_PORT = 23000
+
+
+def foundry_cache_dir(block_height: int, chain: str = "mainnet") -> Path:
+    """Where Foundry keeps the cache this benchmark clears. It is written
+    per resolved block, so clearing one block leaves the rest of the
+    machine's Foundry cache — possibly the user's real work — alone."""
+    return Path.home() / ".foundry" / "cache" / "rpc" / chain / str(block_height)
+
+
+def clear_dir(path: Path) -> None:
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def run_forkyard(
+    rpc_url: str, block_height: int, agents: int, contracts: list[str], cache_dir: Path
+) -> tuple[float, bool, str]:
+    """One forkyard process, `agents` sessions, each reading every contract."""
+    env = {
+        **os.environ,
+        "RPC_URL": rpc_url,
+        "WARMSTART_FORKYARD_PORT": str(WARMSTART_FORKYARD_PORT),
+        "FORKYARD_MCP_HTTP_PORT": str(WARMSTART_FORKYARD_MCP_PORT),
+        "FORKYARD_FORK_BLOCK_NUMBER": str(block_height),
+        "FORKYARD_CACHE_DIR": str(cache_dir),
+    }
+    # The rest of the measurement pass exports this to keep every other
+    # benchmark cold-vs-cold. Inheriting it here would make the warm row a
+    # second cold row.
+    env.pop("FORKYARD_CACHE_DISABLED", None)
+    process = subprocess.Popen(["forkyard"], env=env)
+    base_url = f"http://127.0.0.1:{WARMSTART_FORKYARD_PORT}"
+    try:
+        _wait_for_forkyard(base_url)
+        start = time.monotonic()
+        ok, error = True, ""
+        for _ in range(agents):
+            backend = ForkyardBackend(base_url=base_url)
+            for address in contracts:
+                _, _, action_ok, action_error = read_contract(backend, address, GET_RESERVES_SELECTOR)
+                if not action_ok:
+                    ok, error = False, action_error
+            backend.discard()
+        return (time.monotonic() - start) * 1000, ok, error
+    finally:
+        _terminate(process)
+
+
+def run_anvil(
+    rpc_url: str, block_height: int, agents: int, contracts: list[str]
+) -> tuple[float, bool, str]:
+    """`agents` Anvil processes — its only unit of isolation — each reading
+    every contract. `rpc_cache=True` because Foundry's on-disk cache is
+    exactly what is under test; every other benchmark in this directory
+    disables it."""
+    start = time.monotonic()
+    ok, error = True, ""
+    for i in range(agents):
+        backend = AnvilBackend(WARMSTART_ANVIL_BASE_PORT + i, rpc_url, block_height, rpc_cache=True)
+        try:
+            for address in contracts:
+                _, _, action_ok, action_error = read_contract(backend, address, GET_RESERVES_SELECTOR)
+                if not action_ok:
+                    ok, error = False, action_error
+        finally:
+            backend.discard()
+    return (time.monotonic() - start) * 1000, ok, error
+
+
+def warmstart_main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--rpc-url", default=os.environ.get("RPC_URL"))
+    parser.add_argument("--block-height", type=int, default=DEFAULT_BLOCK_HEIGHT)
+    parser.add_argument("--agents", type=int, default=5)
+    parser.add_argument("--contracts", type=int, default=8)
+    parser.add_argument("--cache-dir", default="/tmp/forkyard-warmstart-cache")
+    parser.add_argument("--out", default="warmstart.csv")
+    args = parser.parse_args()
+    if not args.rpc_url:
+        parser.error("--rpc-url is required (or set RPC_URL)")
+
+    cache_dir = Path(args.cache_dir)
+    # Fetched straight from the endpoint rather than through the proxy:
+    # benchmark setup must not land in the counts it is about to take.
+    contracts = fetch_pair_addresses(args.rpc_url, args.block_height, args.contracts)
+
+    rows: list[dict[str, object]] = []
+    proxy = CountingProxy(args.rpc_url).start()
+    try:
+        for backend, condition in [
+            ("forkyard", "cold"), ("forkyard", "warm"),
+            ("anvil", "cold"), ("anvil", "warm"),
+        ]:
+            if condition == "cold":
+                clear_dir(cache_dir if backend == "forkyard" else foundry_cache_dir(args.block_height))
+            proxy.reset()
+            if backend == "forkyard":
+                elapsed_ms, ok, error = run_forkyard(
+                    proxy.url, args.block_height, args.agents, contracts, cache_dir
+                )
+            else:
+                elapsed_ms, ok, error = run_anvil(proxy.url, args.block_height, args.agents, contracts)
+            stats = proxy.snapshot()
+            rows.append({
+                "backend": backend, "condition": condition, "agents": args.agents,
+                "contracts": len(contracts), "jsonrpc_calls": stats.jsonrpc_calls,
+                "http_requests": stats.http_requests, "wall_clock_ms": round(elapsed_ms, 1),
+                "ok": ok, "error": error,
+            })
+            print(
+                f"{backend:9s} {condition:5s}: {stats.jsonrpc_calls:5d} upstream calls, "
+                f"{elapsed_ms / 1000:.2f}s, ok={ok}",
+                file=sys.stderr,
+            )
+    finally:
+        proxy.stop()
+
+    with open(args.out, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=WARMSTART_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# --- bench_blocks: N agents spread over B *different* fork blocks, in one process.
+
+BLOCKS_FIELDS = [
     "arm", "blocks", "agents", "round", "agent_id", "block_number",
     "phase", "elapsed_ms", "ok", "error",
 ]
 
-# Written to a sibling `<out>.summary.csv`: one row per (arm, B, round),
-# carrying everything that is a property of the *fleet* rather than of one
-# agent. Upstream calls and RSS cannot be attributed to a single agent in a
-# concurrent arm, so they live only here.
+
 SUMMARY_FIELDS = [
     "arm", "blocks", "agents", "round", "jsonrpc_calls", "peak_rss_mb",
     "wall_clock_ms", "block_mismatches", "distinct_state_verified",
 ]
 
+
 ARMS = ("forkyard", "anvil", "anvil-shared-unsafe")
+
+
 DEFAULT_ARMS = ["forkyard", "anvil"]
 
+
 DEFAULT_BASE_BLOCK = 25_795_072
+
+
 DEFAULT_BLOCK_STRIDE = 1_000
+
+
 DEFAULT_BLOCKS = [1, 2, 4, 8]
+
+
 DEFAULT_AGENTS = 24
+
+
 DEFAULT_PAIRS = 3
 
-# Fixed and distinct from every other bench_*.py, so a multi-block sweep can
-# be left running without colliding with an ordinary one in another shell.
-FORKYARD_PORT = 18660
-FORKYARD_MCP_PORT = 18661
-ANVIL_BASE_PORT = 22000
 
-_MAX_ERROR_CHARS = 200
+BLOCKS_FORKYARD_PORT = 18660
 
-# Generous: the first session at a cold block does the base fetch inline, and
-# at B=8 several of those are in flight at once against one upstream.
+
+BLOCKS_FORKYARD_MCP_PORT = 18661
+
+
+BLOCKS_ANVIL_BASE_PORT = 22000
+
+
 SESSION_OPEN_TIMEOUT_S = 120.0
 
 
@@ -179,19 +287,8 @@ def _summary_row(s: SummaryRow) -> dict[str, object]:
     }
 
 
-# --------------------------------------------------------------------------
-# Block selection and agent assignment — pure, so the sweep's shape can be
-# tested without a network or a subprocess anywhere near it.
-# --------------------------------------------------------------------------
-
-
 def block_heights(base_block: int, stride: int, count: int) -> list[int]:
-    """`count` distinct blocks, stepping *backwards* from `base_block`.
-
-    Backwards because forward would run past the chain tip. The stride has
-    to be wide enough that state actually moved between neighbours — 1000
-    blocks is ~3.3 hours of mainnet, which is plenty for WETH's balance and
-    for the pairs' reserves."""
+    """`count` distinct blocks, stepping *backwards* from `base_block`."""
     if count < 1:
         raise ValueError(f"need at least one block, got {count}")
     if stride < 1:
@@ -205,14 +302,7 @@ def block_heights(base_block: int, stride: int, count: int) -> list[int]:
 
 
 def assign_agent_blocks(num_agents: int, blocks: list[int]) -> list[int]:
-    """Round-robin, so agent i gets `blocks[i % B]`.
-
-    Round-robin rather than contiguous chunks because the arms interleave
-    differently: forkyard opens all N sessions at once and contiguous chunks
-    would have every agent at a given block starting simultaneously, hiding
-    whether the *second* session at a block really reuses the first's base.
-    A non-divisible N/B is allowed — the leading blocks just carry one extra
-    agent — but it makes the anvil groups uneven, so prefer N % B == 0."""
+    """Round-robin, so agent i gets `blocks[i % B]`."""
     if num_agents < 1:
         raise ValueError(f"need at least one agent, got {num_agents}")
     if not blocks:
@@ -223,11 +313,7 @@ def assign_agent_blocks(num_agents: int, blocks: list[int]) -> list[int]:
 
 
 def group_agents_by_block(assignment: list[int]) -> dict[int, list[int]]:
-    """Invert `assign_agent_blocks`: block -> the agent ids pinned to it.
-
-    This is the anvil arms' unit of work — one process group per block —
-    and insertion order follows first appearance, so the groups come out in
-    the same order as `blocks`."""
+    """Invert `assign_agent_blocks`: block -> the agent ids pinned to it."""
     groups: dict[int, list[int]] = {}
     for agent_id, block in enumerate(assignment):
         groups.setdefault(block, []).append(agent_id)
@@ -235,13 +321,7 @@ def group_agents_by_block(assignment: list[int]) -> dict[int, list[int]]:
 
 
 def distinct_state_verified(outcomes: list[AgentOutcome]) -> str:
-    """"yes" / "no" / "n/a" — did agents at different blocks see different state?
-
-    "n/a" when fewer than two blocks produced a fingerprint at all: B=1 has
-    nothing to distinguish, and saying "no" there would read as a failure
-    rather than as the absence of a question. "no" means either two distinct
-    blocks agreed on their state (so the pinning did nothing) or two agents
-    at the *same* block disagreed (so the sharing is not sharing)."""
+    """"yes" / "no" / "n/a" — did agents at different blocks see different state?"""
     per_block: dict[int, set[str]] = {}
     for o in outcomes:
         if o.fingerprint is not None:
@@ -259,11 +339,7 @@ def summarize_round(
     outcomes: list[AgentOutcome], jsonrpc_calls: int,
     peak_rss_mb: float, wall_clock_ms: float,
 ) -> SummaryRow:
-    """Pure reduction of one (arm, B, round) into its summary row.
-
-    A `reported_block` of None counts as a mismatch: a session whose block
-    could not be read is not a session known to be at the right block, and
-    the cost numbers on this row are only worth quoting if that column is 0."""
+    """Pure reduction of one (arm, B, round) into its summary row."""
     mismatches = sum(1 for o in outcomes if o.reported_block != o.block_number)
     return SummaryRow(
         arm=arm,
@@ -278,20 +354,9 @@ def summarize_round(
     )
 
 
-# --------------------------------------------------------------------------
-# One agent's life
-# --------------------------------------------------------------------------
-
-
 def open_pinned_session(base_url: str, block_number: int, timeout_s: float = SESSION_OPEN_TIMEOUT_S) -> str:
     """`POST /session {"block_number": N}` — the pinned-session variant of
-    `backend.open_forkyard_session`.
-
-    Kept here rather than in backend.py because it is the one call this
-    benchmark exists to exercise. Note the explicit `error` check: forkyard
-    answers a refused block with HTTP 200 and `{"error": ...}`, so
-    `raise_for_status()` alone would sail past it and the failure would
-    surface much later as a KeyError on `session_id`."""
+    `backend.open_forkyard_session`."""
     resp = requests.post(f"{base_url}/session", json={"block_number": block_number}, timeout=timeout_s)
     resp.raise_for_status()
     payload = resp.json()
@@ -302,11 +367,7 @@ def open_pinned_session(base_url: str, block_number: int, timeout_s: float = SES
 
 def probe_environment(backend: Backend) -> tuple[int | None, str | None]:
     """The correctness half: which block does this environment think it is
-    at, and what does its state look like?
-
-    Not recorded as a timed row — it is instrumentation, like the marker
-    writes in bench_branching.py — but it does cost a few upstream calls,
-    identically in every arm, so it cannot skew the comparison."""
+    at, and what does its state look like?"""
     try:
         w3 = backend.web3()
         reported = int(w3.eth.block_number)
@@ -320,12 +381,7 @@ def probe_environment(backend: Backend) -> tuple[int | None, str | None]:
 
 
 class SharedAnvilBackend:
-    """A `Backend` view onto an Anvil somebody else owns.
-
-    Only used by `anvil-shared-unsafe`, where N/B agents share one process:
-    `discard()` must not kill it out from under the others, so it is a no-op
-    and the group tears its own Anvil down. That no-op is precisely the lost
-    isolation this arm is named for — nothing separates these agents' writes."""
+    """A `Backend` view onto an Anvil somebody else owns."""
 
     name = "anvil-shared"
 
@@ -352,19 +408,7 @@ def run_block_agent(
     block_number: int, contracts: list[str],
     acquire_override: ActionResult | None = None, emit_discard: bool = True,
 ) -> AgentOutcome:
-    """acquire -> probe -> read every contract -> discard.
-
-    `acquire_override` exists for `anvil-shared-unsafe`, where the process
-    the agent attaches to was spawned by its group rather than by itself:
-    the group's spawn cost is passed in and charged to every agent that
-    waited on it, because each of them really did wait that long before it
-    could issue a single call. `emit_discard=False` goes with it: there,
-    `discard()` is a no-op by design and a 0 ms row per agent would read as
-    a teardown that never happened, so the group records the one real kill
-    itself.
-
-    Exceptions are captured into rows rather than raised, so one agent
-    failing at B=8 still leaves the other 23 measurable."""
+    """acquire -> probe -> read every contract -> discard."""
     records: list[BlockRecord] = []
 
     def record(result: ActionResult, phase: str) -> bool:
@@ -387,7 +431,7 @@ def run_block_agent(
             backend = make_backend()
             acquire: ActionResult = ("acquire", (time.monotonic() - start) * 1000, True, "")
         except Exception as e:
-            acquire = ("acquire", (time.monotonic() - start) * 1000, False, repr(e)[:_MAX_ERROR_CHARS])
+            acquire = ("acquire", (time.monotonic() - start) * 1000, False, repr(e)[:MAX_ERROR_CHARS])
         if not record(acquire, "acquire"):
             return AgentOutcome(agent_id, block_number, None, None, records, False)
 
@@ -406,7 +450,7 @@ def run_block_agent(
             backend.discard()
             discard: ActionResult = ("discard", (time.monotonic() - start) * 1000, True, "")
         except Exception as e:
-            discard = ("discard", (time.monotonic() - start) * 1000, False, repr(e)[:_MAX_ERROR_CHARS])
+            discard = ("discard", (time.monotonic() - start) * 1000, False, repr(e)[:MAX_ERROR_CHARS])
         if emit_discard:
             record(discard, "discard")
 
@@ -416,11 +460,7 @@ def run_block_agent(
 def _run_concurrently(
     tasks: list[Callable[[], AgentOutcome]]
 ) -> tuple[list[AgentOutcome], float]:
-    """Run every agent at once and return the wall clock they took together.
-
-    Concurrency is the whole point — B blocks served *simultaneously* out of
-    one process is the capability — so the pool is always as wide as the
-    fleet rather than bounded."""
+    """Run every agent at once and return the wall clock they took together."""
     start = time.monotonic()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(tasks))) as pool:
         futures = [pool.submit(t) for t in tasks]
@@ -429,31 +469,18 @@ def _run_concurrently(
     return outcomes, (time.monotonic() - start) * 1000
 
 
-# --------------------------------------------------------------------------
-# Arms
-# --------------------------------------------------------------------------
-
-
 def run_forkyard_arm(
     rpc_url: str, assignment: list[int], num_blocks: int, rounds: int,
     contracts: list[str], max_pinned_blocks: int, proxy: CountingProxy | None,
     sample_interval_s: float = 0.1,
 ) -> tuple[list[BlockRecord], list[SummaryRow]]:
-    """ONE process for every round and every block.
-
-    `FORKYARD_FORK_BLOCK_NUMBER` is deliberately NOT set: it pins the whole
-    process and disables the tip follower, which is a different feature
-    entirely. Every session here names its own block in the open request.
-
-    The process survives round 2 on purpose — that is what makes round 2
-    "warm", and the comparison it supports is against Anvil, which has no
-    way to keep anything across a process it must respawn."""
+    """ONE process for every round and every block."""
     pre_existing = process_pids("forkyard")
     env = {
         **os.environ,
         "RPC_URL": rpc_url,
-        "FORKYARD_PORT": str(FORKYARD_PORT),
-        "FORKYARD_MCP_HTTP_PORT": str(FORKYARD_MCP_PORT),
+        "BLOCKS_FORKYARD_PORT": str(BLOCKS_FORKYARD_PORT),
+        "FORKYARD_MCP_HTTP_PORT": str(BLOCKS_FORKYARD_MCP_PORT),
         # Above B, always: at or below it the LRU starts evicting bases
         # mid-round and the arm would measure eviction-and-refetch rather
         # than the sharing it is supposed to measure. Eviction behaviour is
@@ -467,7 +494,7 @@ def run_forkyard_arm(
             "the `forkyard` binary was not found on PATH — build it with "
             "`cargo build -p forkyard --release` and add target/release to PATH"
         ) from e
-    base_url = f"http://127.0.0.1:{FORKYARD_PORT}"
+    base_url = f"http://127.0.0.1:{BLOCKS_FORKYARD_PORT}"
     records: list[BlockRecord] = []
     summaries: list[SummaryRow] = []
     try:
@@ -506,15 +533,7 @@ def run_anvil_arm(
     contracts: list[str], ports: Iterator[int], proxy: CountingProxy | None,
     startup_timeout_s: float = 120.0, sample_interval_s: float = 0.1,
 ) -> tuple[list[BlockRecord], list[SummaryRow]]:
-    """N processes, grouped B ways by block.
-
-    Not N/B and not B: `--fork-block-number` is per process, so B blocks
-    already forces B processes, and an Anvil instance is Anvil's only unit
-    of isolation, so N isolated agents forces one each. Both rounds spawn a
-    fresh set — Anvil has nothing to keep warm between them, which is
-    exactly the asymmetry being measured. Ports are drawn from a single
-    monotonic counter and never reused: a killed Anvil's port sits in
-    TIME_WAIT and would fail the next bind."""
+    """N processes, grouped B ways by block."""
     pre_existing = process_pids("anvil")
     records: list[BlockRecord] = []
     summaries: list[SummaryRow] = []
@@ -546,19 +565,13 @@ def _run_shared_group(
     num_agents: int, round_index: int, contracts: list[str], startup_timeout_s: float,
 ) -> list[AgentOutcome]:
     """One block's group: spawn a single Anvil, run its agents against it
-    concurrently, kill it.
-
-    The spawn is charged in full to every agent in the group — each of them
-    really did wait for it before it could work. The kill is charged to the
-    group's lowest agent id only and recorded as 0 ms for the rest, since
-    exactly one teardown happened and inflating it N/B-fold would flatter
-    the isolated arm."""
+    concurrently, kill it."""
     start = time.monotonic()
     try:
         owner = AnvilBackend(port, rpc_url, block, startup_timeout_s=startup_timeout_s)
         spawn: ActionResult = ("acquire", (time.monotonic() - start) * 1000, True, "")
     except Exception as e:
-        spawn = ("acquire", (time.monotonic() - start) * 1000, False, repr(e)[:_MAX_ERROR_CHARS])
+        spawn = ("acquire", (time.monotonic() - start) * 1000, False, repr(e)[:MAX_ERROR_CHARS])
         return [
             AgentOutcome(i, block, None, None, [BlockRecord(
                 "anvil-shared-unsafe", num_blocks, num_agents, round_index, i, block,
@@ -584,7 +597,7 @@ def _run_shared_group(
             teardown: ActionResult = ("discard", (time.monotonic() - teardown_start) * 1000, True, "")
         except Exception as e:
             teardown = ("discard", (time.monotonic() - teardown_start) * 1000, False,
-                        repr(e)[:_MAX_ERROR_CHARS])
+                        repr(e)[:MAX_ERROR_CHARS])
     for o in outcomes:
         if o.agent_id == min(agent_ids):
             o.records.append(BlockRecord(
@@ -599,14 +612,7 @@ def run_anvil_shared_arm(
     contracts: list[str], ports: Iterator[int], proxy: CountingProxy | None,
     startup_timeout_s: float = 120.0, sample_interval_s: float = 0.1,
 ) -> tuple[list[BlockRecord], list[SummaryRow]]:
-    """B processes, N/B agents each — and NO isolation within a group.
-
-    Recorded because it is the honest cheap alternative an operator would
-    reach for, and because its upstream cost is the floor Anvil could reach
-    if isolation were free to give up. It is not a peer of the `anvil` arm:
-    every agent in a group shares one mutable state, so a single write by
-    one of them is visible to all. Never quote it as a comparison unless
-    that sentence is quoted with it."""
+    """B processes, N/B agents each — and NO isolation within a group."""
     pre_existing = process_pids("anvil")
     groups = group_agents_by_block(assignment)
     records: list[BlockRecord] = []
@@ -640,13 +646,8 @@ def run_anvil_shared_arm(
     return records, summaries
 
 
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
-
-
 def write_records(out: IO[str], records: list[BlockRecord]) -> None:
-    writer = csv.DictWriter(out, fieldnames=FIELDS)
+    writer = csv.DictWriter(out, fieldnames=BLOCKS_FIELDS)
     writer.writeheader()
     writer.writerows(_row(r) for r in records)
 
@@ -724,7 +725,7 @@ def blocks_for(args: argparse.Namespace, count: int) -> list[int]:
     return block_heights(args.base_block, args.block_stride, count)
 
 
-def main(argv: list[str] | None = None) -> None:
+def blocks_main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     if not args.rpc_url:
         raise SystemExit("--rpc-url is required (or set RPC_URL)")
@@ -746,12 +747,12 @@ def main(argv: list[str] | None = None) -> None:
 
     proxy = None if args.no_proxy else CountingProxy(args.rpc_url).start()
     rpc_url = proxy.url if proxy else args.rpc_url
-    summary_path = args.out.rsplit(".", 1)[0] + ".summary.csv"
-    ports = itertools.count(ANVIL_BASE_PORT)
+    summary_csv = args.out.rsplit(".", 1)[0] + ".summary.csv"
+    ports = itertools.count(BLOCKS_ANVIL_BASE_PORT)
 
     try:
-        with open(args.out, "w", newline="") as f, open(summary_path, "w", newline="") as sf:
-            writer = csv.DictWriter(f, fieldnames=FIELDS)
+        with open(args.out, "w", newline="") as f, open(summary_csv, "w", newline="") as sf:
+            writer = csv.DictWriter(f, fieldnames=BLOCKS_FIELDS)
             writer.writeheader()
             summary_writer = csv.DictWriter(sf, fieldnames=SUMMARY_FIELDS)
             summary_writer.writeheader()
@@ -796,7 +797,3 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if proxy:
             proxy.stop()
-
-
-if __name__ == "__main__":
-    main()
