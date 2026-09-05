@@ -371,3 +371,94 @@ Two caveats travel with every number it prints:
   calls' average weight and the row is labelled `extrapolated`, with a
   `cover` column showing how much of the call count the breakdown actually
   saw.
+
+## Branching benchmark
+
+### `bench_branching.py` — exploring K what-ifs from one starting state
+
+```bash
+# wall clocks (no proxy hop in the path)
+uv run python bench_branching.py --branches 2,4,8,16,32 --prefix-actions 5 \
+  --branch-actions 3 --rpc-url $RPC_URL --no-proxy --out branching.csv
+
+# upstream call counts (same sweep, through the counting proxy)
+uv run python bench_branching.py --branches 2,4,8,16,32 --prefix-actions 5 \
+  --branch-actions 3 --rpc-url $RPC_URL --out branching.proxied.csv
+```
+
+An agent gets somewhere interesting — fund an account, seed a token balance,
+approve, swap — and then wants to try K mutually-exclusive continuations from
+exactly that point. Three ways to do it, all doing the **same total work**
+(one prefix plus K x B branch actions):
+
+| Arm | How it branches | Branches coexist? |
+| --- | --- | --- |
+| `forkyard-branch` | prefix once, then `forkyard_forkFrom` K times; the K children run concurrently | yes, all K at once |
+| `anvil-snapshot` | one Anvil, `evm_snapshot`, then per branch: run the actions, `evm_revert` back | **no — one at a time** |
+| `anvil-processes` | K Anvils, each spawning and replaying the whole prefix, then diverging | yes, at K spawns + K prefixes |
+
+`anvil-snapshot` is **sequential by construction, and that is the finding
+rather than a flaw in the harness**: `evm_revert` invalidates every snapshot
+taken after the one it restores, so the K branches share a single mutable EVM
+and can only be visited one after another. Putting them on a thread pool would
+not make two of them coexist, it would make them corrupt each other. The two
+Anvil arms are therefore the two halves of the same trade: serialise the
+exploration, or pay for the prefix K times.
+
+Isolation is asserted, not assumed. The prefix writes a known marker balance;
+every branch first reads it back — proving the branch really inherited the
+parent's overlay, since a fork that had silently started from the shared base
+would read 0 — and then overwrites it with a value only that branch uses. For
+the forkyard arm the markers are re-read **after** every branch has finished,
+with all K children and the parent still alive, which is the check the
+snapshot stack cannot even be asked to perform. Any disagreement lands in
+`isolation_violations`, and a row with a non-zero count is reported `ok=False`
+however fast it was.
+
+Ports: forkyard 18650/18651, anvil 19700+ (a fresh port for every Anvil in a
+run — a killed Anvil's port lingers in TIME_WAIT). The forkyard process is
+restarted **per K**, not once for the sweep: its base cache is shared across
+sessions and would otherwise stay warm from K=2 all the way to K=32, so every
+later K would be reading state an earlier K paid for while the Anvil arms
+(running `--no-storage-caching`) refetch from cold every time.
+
+| Column | Meaning |
+| --- | --- |
+| `arm` | `forkyard-branch`, `anvil-snapshot` or `anvil-processes`. |
+| `branches` | K for that sweep. |
+| `phase` | `prefix`, `branch_create`, `branch_action` or `total`. |
+| `branch_id` | Which branch the row belongs to; `-1` for the shared prefix and for the arm total. |
+| `elapsed_ms` | Wall clock for that row. For `branch_create`: `forkyard_forkFrom` (forkyard), `evm_snapshot` + `evm_revert` for that branch (anvil-snapshot), or spawn + prefix replay (anvil-processes). |
+| `ok` / `error` | Whether it succeeded, and `repr()` of the exception truncated to 200 chars. |
+| `isolation_violations` | Marker read-backs that returned the wrong value. On a `branch_action` row: that branch's own inline checks. On the `total` row: the arm's whole count, forkyard's post-hoc sweep across all live children included. **Must be 0.** |
+| `jsonrpc_calls` | Upstream JSON-RPC calls the whole arm made, from `CountingProxy`. Only the `total` row carries it — the proxy is per-process, so a call cannot be attributed to one branch of a concurrent arm. Empty means "not attributable here", which is not the same claim as 0. |
+
+Three things to know before quoting a number:
+
+* **`total` is the only row comparable across arms.** `anvil-processes` emits
+  its per-branch `prefix` rows *and* a `branch_create` row that spans spawn +
+  that same prefix, so its phases deliberately overlap.
+* **Timings and call counts come from two different runs.** The counting proxy
+  (on by default) inserts a local hop into every upstream call. Quote wall
+  clocks from a `--no-proxy` run and `jsonrpc_calls` from a proxied one. A
+  proxied run also prints `ConnectionResetError`/`BrokenPipeError` tracebacks
+  from `rpc_proxy.py` as killed Anvils drop their connections; they are noise
+  and do not affect the counts.
+* **The CSV has no per-action label.** Rows are written in execution order and
+  the action cycles are fixed, so the i-th `prefix` row is
+  `PREFIX_STEPS[i % 5]` (with a trailing `parent_marker` write, which is
+  instrumentation and is not counted against `--prefix-actions`) and the i-th
+  `branch_action` row is `BRANCH_STEPS[i % 3]` (after one leading
+  `inherit_check`).
+
+A K=2 smoke run (P=5, B=3, `--no-proxy`, block 25795072) gives the shape:
+`branch_create` was **1.1-1.4 ms** for `forkyard_forkFrom`, **4.5-5.1 ms** for
+`evm_snapshot`+`evm_revert`, and **4.6 s** for an Anvil spawn plus prefix
+replay — and totals of 2.9 s / 6.1 s / 5.5 s with zero isolation violations
+everywhere. Through the proxy at P=3, B=2 the upstream cost was 21 / 75 / 138
+JSON-RPC calls. Read the *slope* across K rather than one row: forkyard's
+branch cost is O(parent overlay) and is paid K times, `anvil-snapshot`'s total
+grows linearly in K because the branches cannot overlap at all, and
+`anvil-processes` pays K spawns and K prefixes but does at least run them
+concurrently — so at small K it can beat the snapshot stack, and the arm to
+watch as K grows is which of the two Anvil failure modes gets worse faster.
