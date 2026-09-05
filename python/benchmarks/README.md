@@ -113,3 +113,88 @@ One row per (backend, block height, agent count) combination.
 | `calls_per_agent` | `jsonrpc_calls / num_agents`. The number the two architectures actually differ on: flat for a per-agent cache, falling for a shared one. |
 | `upstream_errors` | Forwarded requests the upstream refused or dropped; the agent sees a JSON-RPC error and the sweep continues. |
 | `top_methods` | JSON object of the five busiest methods and their counts. |
+
+## Architecture benchmarks
+
+Two standalone scripts alongside the main sweep. Each one isolates a single
+architectural claim, writes its own CSV, and uses its own port range so it
+can never be confused with `run_benchmark.py`'s processes (18555/18556 and
+19000+). Both take `--rpc-url` (defaulting to `$RPC_URL`), `--block-height`
+(default 25795072) and `--out`; run them **one at a time** — concurrent load
+corrupts both the timings and the RSS samples.
+
+### `bench_checkpoint.py` — checkpoint cost vs. state size
+
+```bash
+uv run python bench_checkpoint.py --state-sizes 100,1000,10000 --repeats 3 --rpc-url $RPC_URL --out checkpoint.csv
+```
+
+Dirties X storage slots on a real mainnet contract, then times each
+backend's checkpoint. Anvil's is a serialization — `evm_snapshot`/
+`evm_revert` in memory, `anvil_dumpState`/`anvil_loadState` into a blob whose
+size is recorded. forkyard has **no snapshot RPC at all**, so its equivalent
+is branching another session off the shared base (`POST /session`) and
+discarding it.
+
+Read that asymmetry honestly: forkyard's new session does *not* carry the X
+writes — it branches from the base, not from the dirtied session — so it has
+less to move by construction. That is the architectural difference (forkyard's
+unit of work is "another fork of the same base", not "a copy of my current
+state"), not a measurement trick, but the two `elapsed_ms` columns are not
+the same operation. The sweep over `--state-sizes` is what makes it legible:
+what matters is the *shape* of each curve, Anvil's bending upward with X and
+forkyard's staying flat. Ports: forkyard 18600/18601, anvil 19200+.
+
+| Column | Meaning |
+| --- | --- |
+| `backend` | `forkyard` or `anvil`. |
+| `operation` | `snapshot`, `revert`, `dump`, `load` (Anvil) or `fork`, `discard` (forkyard). |
+| `state_size` | Storage slots dirtied before the checkpoint ran. |
+| `elapsed_ms` | Wall clock for that one operation. |
+| `blob_bytes` | Bytes the operation moved: the `anvil_dumpState` blob, and the same blob on the matching `load`. **0 means no blob exists** — `evm_snapshot`/`evm_revert` keep state in memory and forkyard's fork/discard serializes nothing. |
+| `ok` / `error` | Whether it succeeded, and `repr()` of the exception (truncated to 200 chars) if not. |
+
+`--repeats N` (default 3) emits N rows per (backend, operation, state_size)
+so a consumer can take a median instead of trusting one sample. Dirtying
+10000 slots is one RPC call per slot on both backends and is the dominant
+part of the runtime; it sits outside every timed region.
+
+### `bench_writers.py` — isolated concurrent writers per GB
+
+```bash
+uv run python bench_writers.py --writers 1,5,10,25,50 --rounds 10 --rpc-url $RPC_URL --out writers.csv
+```
+
+K writers run concurrently — forkyard as K sessions in one process, Anvil as
+K processes. Every writer writes a value only it uses to the **same** account
+and the **same** storage slot as every other writer, then reads it back and
+asserts it sees its own. That read-back is the isolation check: if the
+environments leak, `isolation_violations` is non-zero and the memory number
+means nothing, so such a row is reported `ok=False` however fast it was. The
+assertion travels over `eth_getBalance` because forkyard's per-session RPC
+has no `eth_getStorageAt`; the shared-slot write is part of the write load
+but cannot itself be read back. RSS is sampled every 100 ms
+(`--sample-interval`) by summing `ps` over every process of that name this
+run started — pids already running are captured before the sweep and
+excluded. Ports: forkyard 18610/18611, anvil 19300+ (never reused across
+sweeps; a killed Anvil's port lingers in TIME_WAIT).
+
+| Column | Meaning |
+| --- | --- |
+| `backend` | `forkyard` or `anvil`. |
+| `writers` | Concurrent isolated writers in that sweep. |
+| `peak_rss_mb` | Highest sampled sum of resident memory across this run's processes — for Anvil the moment all K coexisted, for forkyard the single process holding K sessions. |
+| `wall_clock_ms` | The whole concurrent region, **including** each writer acquiring its environment (a session open, or an Anvil spawn plus wait-until-ready) — the same timed region `run_benchmark.py` uses. |
+| `writes_per_sec` | Total writes (two per round: balance + storage) over that wall clock. At low `--rounds` this is mostly acquisition cost; raise `--rounds` to push it toward steady state. |
+| `writers_per_gb` | `writers * 1024 / peak_rss_mb`. The headline number. `0.0` means RSS could not be sampled — not "infinitely many". |
+| `isolation_violations` | Read-backs that returned someone else's (or a stale) value. **Must be 0.** |
+| `ok` | No violations, and every writer completed. |
+
+Read `writers_per_gb` off the *sweep*, not off one row. A single K conflates
+forkyard's fixed cost (one process plus one shared base cache, tens of MB
+before any session exists) with its marginal cost per session, so small K
+understates it badly — at K=2 forkyard measured ~122 writers/GB against
+Anvil's ~32, a 4x gap that should widen as K grows and the fixed cost
+amortises. The slope across K is the number the claim is actually about. One
+more caveat: `_wait_for_forkyard` probes readiness by opening a session it
+never discards, so forkyard is holding K+1 sessions, not K.
