@@ -462,3 +462,120 @@ grows linearly in K because the branches cannot overlap at all, and
 `anvil-processes` pays K spawns and K prefixes but does at least run them
 concurrently — so at small K it can beat the snapshot stack, and the arm to
 watch as K grows is which of the two Anvil failure modes gets worse faster.
+
+## Multi-block benchmark
+
+`bench_blocks.py` — N agents spread over B **different** fork blocks at once.
+
+Every other benchmark here pins the whole sweep to one block. This one exists
+because per-session block pinning (`POST /session {"block_number": N}`) made a
+new question answerable: what does it cost to serve a fleet whose agents each
+need a *different* historical block?
+
+* **forkyard**: one process. Sessions naming the same block share one fetched
+  base and one fallback, so upstream cost tracks the number of distinct
+  *blocks*, not the number of agents.
+* **anvil**: `--fork-block-number` is a process-level flag, so B blocks forces
+  at least B processes — and because an Anvil instance *is* Anvil's unit of
+  isolation, N isolated agents forces **N processes**, grouped B ways by
+  block. This is the only apples-to-apples arm.
+* **anvil-shared-unsafe** (opt-in, `--arms ...,anvil-shared-unsafe`): B
+  processes total, with the N/B agents at a block all pointing at one Anvil.
+  Recorded because it is the cheap thing an operator would actually try, and
+  labelled `unsafe` because **those agents are not isolated from each other** —
+  one agent's `anvil_setBalance` or landed transaction is visible to every
+  other agent in its group. Never quote it beside the other two without that
+  sentence.
+
+Two rounds are run against the same blocks. Round 1 is cold; round 2 opens
+fresh sessions (forkyard, same process) or spawns fresh processes (Anvil) at
+the same blocks. forkyard's per-block bases are still resident; every new
+Anvil refetches from scratch. That gap is the point of the file.
+
+```bash
+cd python/benchmarks
+PATH=../../target/release:$PATH uv run python bench_blocks.py \
+  --rpc-url "$RPC_URL" \
+  --agents 24 --blocks 1,2,4,8 \
+  --base-block 25795072 --block-stride 1000 \
+  --rounds 2 --out results/blocks.csv
+```
+
+Expect roughly 15-25 minutes: the forkyard arm is seconds per round, and
+essentially all of the wall clock is Anvil spawning 24 forking processes eight
+times over (4 values of B x 2 rounds). `--arms forkyard` alone runs in about a
+minute. Do **not** set `FORKYARD_FORK_BLOCK_NUMBER`: it pins the whole process
+and disables the tip follower, which is a different feature.
+
+Correctness is checked rather than assumed, because a cheap benchmark that
+forked everything at the same block would look identical to a correct one:
+
+* `eth_blockNumber` on every agent's environment must equal the block it asked
+  for — `block_mismatches`, which **must be 0** for a row to mean anything (an
+  environment whose block could not be read counts as a mismatch, not as a
+  pass);
+* environments at different blocks must see different state —
+  `distinct_state_verified`, which is also `no` if two agents at the *same*
+  block disagree, since that would falsify the one-cache-per-block claim.
+
+### Output
+
+`--out` gets one row per agent phase; `<out>.summary.csv` gets the per-fleet
+numbers, which cannot be attributed to a single agent in a concurrent arm.
+
+| Column | Meaning |
+| --- | --- |
+| `arm` | `forkyard`, `anvil` or `anvil-shared-unsafe`. |
+| `blocks` | B — how many distinct fork blocks the fleet spans. |
+| `agents` | N — total agents, spread round-robin over those blocks. |
+| `round` | 1 = cold, 2 = warm (same blocks, fresh sessions/processes). |
+| `agent_id` | 0..N-1; agent i is pinned to `blocks[i % B]`. |
+| `block_number` | The block that agent asked for. |
+| `phase` | `acquire` (session open, or Anvil spawn + wait-until-ready), `read` (one row per Uniswap V2 pair), `discard`. |
+| `elapsed_ms` / `ok` / `error` | Wall clock, success, and `repr()` of the exception truncated to 200 chars. |
+
+Summary CSV, one row per (`arm`, `blocks`, `round`): `jsonrpc_calls` (upstream
+JSON-RPC calls that whole round made, from `CountingProxy`), `peak_rss_mb`
+(sampled across every process this run started, excluding pre-existing ones),
+`wall_clock_ms`, `block_mismatches`, `distinct_state_verified`
+(`yes`/`no`/`n/a`).
+
+A smoke run at N=2, B=2, one round, blocks 25795072 and 25794072 gives the
+shape: forkyard **32** upstream JSON-RPC calls / 14.5 MB peak / 1.3 s, against
+**114** calls / 67.4 MB / 8.0 s for `anvil` — 0 block mismatches and
+`distinct_state_verified=yes` everywhere. Probed directly, a session asking for
+25795072 reports `eth_blockNumber` 25795072 and a WETH balance of
+2136162.610202074692260002 ETH, one asking for 25794072 reports 25794072 and
+2132325.280900491438384367 ETH, and a second session at 25795072 reports the
+first one's numbers exactly — different blocks really are different state, and
+the same block really is one shared base.
+
+Five things that make the claim weaker than it looks:
+
+* **The state fingerprint is WETH's account balance, not a pair's reserves.**
+  forkyard's per-session RPC has no `eth_call`, `eth_getCode` or
+  `eth_getStorageAt`, so the only state a session can hand back is an
+  account's balance and nonce — and a Uniswap V2 pair holds its reserves in
+  storage and no ETH at all, making its account state byte-identical at every
+  block. WETH's balance is the ETH backing every one of those pairs' WETH side
+  and moves essentially every block, so it is the strongest cross-block signal
+  this surface can return. The pairs are still what the timed reads touch.
+* **At N = B the two Anvil arms are the same thing.** One agent per block means
+  one process per agent either way; `anvil-shared-unsafe` only diverges once
+  N/B > 1. The smoke run above is exactly that degenerate case, which is why
+  both arms cost 114 calls there.
+* **Round 2 is deliberately asymmetric, and that asymmetry is the finding, not
+  a bug.** forkyard keeps its process (and so its per-block bases) across
+  rounds; Anvil cannot, because a fork block is chosen at spawn. Anvil's own
+  on-disk cache is left disabled (`--no-storage-caching`, `backend.py`'s
+  default) so the sweep does not measure earlier sweeps.
+* **`FORKYARD_MAX_PINNED_BLOCKS` is set above B on purpose** (`max(B) + 2` by
+  default, `--max-pinned-blocks` to change it). At or below B the LRU starts
+  evicting a base mid-round and the arm would measure eviction-and-refetch
+  instead of sharing. Eviction is worth benchmarking; it is not what this file
+  claims.
+* **Timings and call counts come from two different runs.** The counting proxy
+  (on by default) adds a local hop to every upstream call — quote wall clocks
+  from `--no-proxy` and `jsonrpc_calls` from a proxied run. A proxied run also
+  prints `BrokenPipeError` tracebacks from `rpc_proxy.py` as killed Anvils drop
+  their connections; they are noise and do not affect the counts.
