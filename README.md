@@ -66,39 +66,41 @@ The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, bu
 
 ## Benchmark
 
-[Anvil](https://book.getfoundry.sh/anvil/) is the standard for forked-state
-simulation and an excellent one — it is what forkyard is measured against
-precisely because it is the tool everyone already reaches for, and for a single
-agent it remains the simpler choice. The benchmarks exist to find where a
-*shared-cache, many-session* design changes the numbers, not to argue anyone
-should stop using Anvil.
+[Anvil](https://book.getfoundry.sh/anvil/) is the standard tool for forked-state
+simulation and a very good one — it is what forkyard measures itself against
+because it is what everyone already reaches for, and for a single agent it stays
+the simpler choice. The difference the benchmarks probe is narrow: Anvil's unit
+of isolation is an OS process with its own cache; forkyard's is a session inside
+one process sharing one warm cache. That should be invisible for one agent, and
+start to matter as agents multiply.
 
-Three results, measured on an Apple M3 Pro against a mainnet archive endpoint,
-both backends starting cold:
+Three measurements, on an Apple M3 Pro against a mainnet archive endpoint, both
+tools starting cold:
 
-**Concurrent isolated agents fit in one process.** At 50 agents writing
-concurrently, each verifying it reads back its own value, forkyard used **18.9 MB
-across one process** against **1,546 MB across 50 Anvil instances** — because
-Anvil's unit of isolation is an OS process and forkyard's is a session. forkyard's
-footprint moved 16.8 → 18.9 MB going from 1 agent to 50.
+**One shared cache, flat upstream traffic.** With every agent reading the same
+contracts, forkyard sent **37 upstream JSON-RPC calls whether 1 agent or 50 were
+running** — identical across independent runs — against 76 → 2,125 for
+process-per-agent. When agents read *disjoint* state instead, the gap narrows to
+about 2×, which is the control that shows the first number is really measuring
+cache sharing.
 
-**Exploring K what-ifs from one state stays flat.** With `forkyard_forkFrom`, 32
-branches off a common prefix finished in **4.72s**, against **30.27s** through
-Anvil's `evm_snapshot`/`evm_revert` stack (which explores one branch at a time by
-design) and **9.81s** across 32 Anvil processes each replaying the prefix.
+**Isolated agents are cheap in memory.** At 50 agents writing concurrently, each
+verifying it reads back its own value, forkyard used **18.9 MB in one process**
+against **1,546 MB across 50 Anvil instances** — its footprint moved 16.8 → 18.9
+MB going from 1 agent to 50, because a session is not a process.
 
-**One shared cache means the provider sees far less traffic.** 50 concurrent
-agents cost **387 upstream JSON-RPC calls** against **3,062** — per-agent cost
-*falls* as agents are added (33 → 7.7) where a process-per-agent design pays in
-full every time. Under a 50 calls/sec provider quota, forkyard sustained 25 agents
-at 100% action success; Anvil sustained 5.
+**Restarts stay warm.** Both tools persist a fetch cache; on a second run at the
+same block forkyard needed **1 upstream call** against 15, having refetched
+everything on every start before that feature existed.
 
-Anvil is ahead in other regimes — notably per-interaction latency past a few tens
-of concurrent agents, and rewinding a single timeline, where `evm_snapshot` costs
-about 1ms regardless of how much state is dirty.
+Anvil is the better tool in other regimes — rewinding a single timeline
+(`evm_snapshot` costs ~1 ms regardless of dirty state), per-interaction latency
+past a few tens of concurrent agents, cold unshared state, and anything with one
+agent.
 
 **[benchmark.md](benchmark.md)** has the full set: methodology, every result
-including the ones that favour Anvil, and commands to reproduce each one.
+including those that favour Anvil, measured variance, and commands to reproduce
+each one.
 
 ## Build from source
 

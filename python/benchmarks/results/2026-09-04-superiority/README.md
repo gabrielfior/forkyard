@@ -33,5 +33,18 @@ pinned — earlier results in `../2026-09-04/` compared two different chain stat
 | `warmstart.csv` | 9 | Restart cost, cold → warm, for **both** backends with **both** caches enabled. |
 | `blocks.csv`, `blocks.summary.csv` | 10 | 24 agents spread over B ∈ {1,2,4,8} blocks, two rounds. Several Anvil rows hit the 120s cap with nonzero `block_mismatches` — those wall clocks are a timeout, not a measurement. |
 
+Files whose name starts `core_` are the standard-workload sweeps
+(`core_headline`, `core_longlived`, `core_churn`, `core_shared`,
+`core_disjoint`). `freshness`, `arrivals`, `quota_*` and `upstream*` were
+re-measured after a leaked-process incident (see below) and hold the clean pass.
+
+**Two passes, and why they differ.** The first pass leaked 24 Anvil processes
+when the freshness benchmark crashed spawning its 25th; they stayed resident for
+hours underneath every later step. That is fixed (`da5ce48`), and the affected
+steps were re-run. The second pass then ran while the host carried unrelated
+load. Between the two, forkyard's upstream call counts were byte-identical while
+wall clocks moved by up to 7x — so quote the counts from these files, not the
+timings, unless you repeat the run on an idle machine.
+
 Idea 8 (`fork_from`) has no file of its own: it is the capability the
 `forkyard-branch` arm of `branching.csv` exercises.
