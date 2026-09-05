@@ -13,6 +13,8 @@ use revm::primitives::{Address, AddressMap, StorageKey, StorageValue, B256};
 use revm::state::{Account, AccountInfo, Bytecode};
 use revm::{Database, DatabaseCommit};
 
+pub mod persist;
+
 /// The shared, immutable working-set cache for one chain. Cloning it is a
 /// pointer bump (`imbl`'s structural sharing) — O(1), not a copy of the
 /// underlying state. Only accounts/slots some session has actually touched
@@ -24,6 +26,100 @@ pub struct BaseSnapshot {
     code: ImHashMap<B256, Bytecode>,
     storage: ImHashMap<(Address, StorageKey), StorageValue>,
     block_hashes: ImHashMap<u64, B256>,
+}
+
+impl BaseSnapshot {
+    /// Build a snapshot from state that came from somewhere other than a
+    /// session — a cache file (`persist`) or a fetch backend's own cache
+    /// (`forkyard_fetch::cache_snapshot`). The fields stay private because
+    /// nothing may *mutate* a base once it's shared; handing over the four
+    /// maps at construction time is the only way state legitimately enters
+    /// one.
+    pub fn from_parts(
+        accounts: impl IntoIterator<Item = (Address, AccountInfo)>,
+        code: impl IntoIterator<Item = (B256, Bytecode)>,
+        storage: impl IntoIterator<Item = ((Address, StorageKey), StorageValue)>,
+        block_hashes: impl IntoIterator<Item = (u64, B256)>,
+    ) -> Self {
+        Self {
+            accounts: accounts.into_iter().collect(),
+            code: code.into_iter().collect(),
+            storage: storage.into_iter().collect(),
+            block_hashes: block_hashes.into_iter().collect(),
+        }
+    }
+
+    /// This snapshot with `newer`'s entries laid over it, `newer` winning
+    /// on any key both hold. Used at shutdown to fold what this run
+    /// actually fetched back into what a previous run had already cached:
+    /// reads served out of the base never reach the fetch backend, so
+    /// saving only the backend's own cache would shrink the file on every
+    /// warm restart until it was empty again. Only ever called with two
+    /// snapshots of the *same* block — state at one height is one value,
+    /// so which side wins is a tie-break, not a policy.
+    pub fn merged_with(&self, newer: &BaseSnapshot) -> Self {
+        Self {
+            accounts: newer.accounts.clone().union(self.accounts.clone()),
+            code: newer.code.clone().union(self.code.clone()),
+            storage: newer.storage.clone().union(self.storage.clone()),
+            block_hashes: newer.block_hashes.clone().union(self.block_hashes.clone()),
+        }
+    }
+
+    pub fn account(&self, address: &Address) -> Option<&AccountInfo> {
+        self.accounts.get(address)
+    }
+
+    pub fn code_by_hash(&self, code_hash: &B256) -> Option<&Bytecode> {
+        self.code.get(code_hash)
+    }
+
+    pub fn storage_slot(&self, address: &Address, key: &StorageKey) -> Option<StorageValue> {
+        self.storage.get(&(*address, *key)).copied()
+    }
+
+    pub fn block_hash(&self, number: &u64) -> Option<B256> {
+        self.block_hashes.get(number).copied()
+    }
+
+    pub fn accounts(&self) -> impl Iterator<Item = (&Address, &AccountInfo)> {
+        self.accounts.iter()
+    }
+
+    pub fn code(&self) -> impl Iterator<Item = (&B256, &Bytecode)> {
+        self.code.iter()
+    }
+
+    pub fn storage(&self) -> impl Iterator<Item = (&(Address, StorageKey), &StorageValue)> {
+        self.storage.iter()
+    }
+
+    pub fn block_hashes(&self) -> impl Iterator<Item = (&u64, &B256)> {
+        self.block_hashes.iter()
+    }
+
+    pub fn account_count(&self) -> usize {
+        self.accounts.len()
+    }
+
+    pub fn code_count(&self) -> usize {
+        self.code.len()
+    }
+
+    pub fn storage_count(&self) -> usize {
+        self.storage.len()
+    }
+
+    pub fn block_hash_count(&self) -> usize {
+        self.block_hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty()
+            && self.code.is_empty()
+            && self.storage.is_empty()
+            && self.block_hashes.is_empty()
+    }
 }
 
 /// A fallback that never resolves anything — for local/unit-test sessions

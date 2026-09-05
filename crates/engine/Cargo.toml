@@ -7,4 +7,9 @@ publish.workspace = true
 
 [dependencies]
 imbl = "7.0.1"
-revm.workspace = true
+# The `serde` feature is what makes the `persist` module possible at all:
+# it pulls serde impls for revm's own `Address`/`B256`/`U256`/`Bytes`
+# primitives, which the cache file is written in terms of.
+revm = { workspace = true, features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"

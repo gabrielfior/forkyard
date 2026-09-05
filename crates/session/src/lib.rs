@@ -242,7 +242,13 @@ where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     fallback: Arc<RwLock<F>>,
-    base: Arc<BaseSnapshot>,
+    /// Swappable, not fixed, since `with_base` can seed it from a cache
+    /// file and `refresh_fallback` has to drop it again when the chain
+    /// moves — a base holds one block's account balances and storage, and
+    /// serving those after a tip refresh would be stale state, not a warm
+    /// cache. The `Arc` inside is what sessions actually fork from, so a
+    /// swap never disturbs a session already holding the old one.
+    base: RwLock<Arc<BaseSnapshot>>,
     block_env: Arc<RwLock<BlockEnv>>,
     workers: Vec<std_mpsc::Sender<Job<F>>>,
     counts: Vec<Arc<AtomicUsize>>,
@@ -276,7 +282,7 @@ where
         }
         Self {
             fallback: Arc::new(RwLock::new(fallback)),
-            base: Arc::new(BaseSnapshot::default()),
+            base: RwLock::new(Arc::new(BaseSnapshot::default())),
             block_env: Arc::new(RwLock::new(block_env)),
             workers,
             counts,
@@ -300,6 +306,44 @@ where
         self.block_forks = Some(Arc::new(factory));
         self.pinned.get_mut().unwrap().cap = max_pinned_blocks.max(1);
         self
+    }
+
+    /// Start with `base` already warm instead of empty — how
+    /// `forkyard-bin` replays a cache file written by a previous run
+    /// (`forkyard_engine::persist`), so the first session of a restarted
+    /// process reads accounts and slots the last one already paid for
+    /// rather than refetching them all. Anvil gets this from
+    /// `~/.foundry/cache`; without it, forkyard's cache died with the
+    /// process and a restart was always cold.
+    ///
+    /// The caller is responsible for the base actually describing
+    /// `block_env`'s block: a snapshot of another block's accounts is
+    /// wrong, not merely stale, which is why `persist` refuses to load a
+    /// file whose recorded block doesn't match.
+    ///
+    /// Consuming builder, for the same reason as `with_block_forks`: the
+    /// four-argument `new` is used by both API crates and every test here,
+    /// and keeps meaning what it meant.
+    pub fn with_base(self, base: BaseSnapshot) -> Self {
+        *self.base.write().unwrap() = Arc::new(base);
+        self
+    }
+
+    /// The shared base new sessions currently fork from — an `Arc` clone,
+    /// O(1). Exposed so a caller can fold it back into what it writes to
+    /// disk at shutdown.
+    pub fn base(&self) -> Arc<BaseSnapshot> {
+        Arc::clone(&self.base.read().unwrap())
+    }
+
+    /// A clone of the fallback new sessions currently read through — the
+    /// same cheap shared-cache handle every session gets. `forkyard-bin`
+    /// needs it at shutdown to snapshot what the fetch backend actually
+    /// fetched; it is deliberately the *current* one, since
+    /// `refresh_fallback` may have replaced the one the process started
+    /// with.
+    pub fn current_fallback(&self) -> F {
+        self.fallback.read().unwrap().clone()
     }
 
     /// The real block new sessions from this manager are pinned to right
@@ -335,6 +379,14 @@ where
     pub fn refresh_fallback(&self, fallback: F, block_env: BlockEnv) {
         *self.fallback.write().unwrap() = fallback;
         *self.block_env.write().unwrap() = block_env;
+        // The base has to go with it. Once `with_base` exists the base can
+        // hold real balances and slots read at the *old* block, and those
+        // are checked before the fallback is ever consulted — so a base
+        // that outlived its block would keep serving pre-refresh state
+        // forever, and the refresh would silently do nothing for exactly
+        // the accounts anyone cared about. Cheap: the next session's reads
+        // repopulate through the new fallback.
+        *self.base.write().unwrap() = Arc::new(BaseSnapshot::default());
     }
 
     /// A cloned `Sender`, not a borrowed one — `Sender::clone` is a cheap
@@ -355,7 +407,7 @@ where
         self.worker_for(id)
             .send(Job::Fork {
                 id,
-                base: Arc::clone(&self.base),
+                base: self.base(),
                 fallback: self.fallback.read().unwrap().clone(),
                 block_env: self.block_env(),
                 reply,
@@ -1277,5 +1329,152 @@ mod tests {
             U256::from(100),
             "a session forked before refresh_fallback must keep reading its own old fallback, unaffected"
         );
+    }
+
+    /// Stands in for the fetch backend, counting every read that reaches
+    /// it. That count is the whole point of the cache-seeding tests below:
+    /// "the process restarted warm" is only provable as "a read that used
+    /// to cost an upstream call no longer makes one."
+    #[derive(Clone)]
+    struct CountingFallback {
+        balance: u64,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl DatabaseRef for CountingFallback {
+        type Error = FundedFallbackError;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let balance = if address == WATCHED { U256::from(self.balance) } else { U256::ZERO };
+            Ok(Some(AccountInfo { balance, ..Default::default() }))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(B256::ZERO)
+        }
+    }
+
+    /// The state a previous run of this process would have left in its
+    /// cache file: `WATCHED` already resolved, at this block.
+    fn cached_base(balance: u64) -> BaseSnapshot {
+        BaseSnapshot::from_parts(
+            [(WATCHED, AccountInfo { balance: U256::from(balance), ..Default::default() })],
+            [],
+            [],
+            [],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_seeded_base_answers_reads_that_would_otherwise_have_hit_the_fallback() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let fallback = CountingFallback { balance: 100, reads: Arc::clone(&reads) };
+        let mgr = SessionManager::new(fallback, BlockEnv::default(), 2, Duration::from_secs(60))
+            .with_base(cached_base(100));
+
+        // Ten sessions, the multi-agent shape — cold, every one of these
+        // reads is an upstream call for the first agent and a shared-cache
+        // hit for the other nine. Warm, not even the first one costs
+        // anything.
+        for _ in 0..10 {
+            let id = mgr.fork().await.unwrap();
+            assert_eq!(mgr.basic(id, WATCHED).await.unwrap().unwrap().balance, U256::from(100));
+        }
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            0,
+            "a base seeded from a previous run's cache must not go back to the network at all"
+        );
+
+        // An address the cache file never held still resolves normally,
+        // through the fallback — a seeded base is a cache, not a whitelist.
+        let id = mgr.fork().await.unwrap();
+        assert_eq!(mgr.basic(id, FUNDED).await.unwrap().unwrap().balance, U256::ZERO);
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn a_tip_refresh_discards_a_seeded_base_instead_of_serving_its_old_block() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mgr = SessionManager::new(
+            CountingFallback { balance: 100, reads: Arc::clone(&reads) },
+            BlockEnv::default(),
+            2,
+            Duration::from_secs(60),
+        )
+        .with_base(cached_base(100));
+
+        // The chain moved and the fallback moved with it. The seeded base
+        // describes the *old* block, and it is checked before the fallback
+        // — so if it survived, every session from here on would read the
+        // old balance forever and the refresh would be a no-op for exactly
+        // the accounts anyone had already touched.
+        mgr.refresh_fallback(
+            CountingFallback { balance: 999, reads: Arc::clone(&reads) },
+            BlockEnv { number: U256::from(2), ..Default::default() },
+        );
+
+        let after = mgr.fork().await.unwrap();
+        assert_eq!(mgr.basic(after, WATCHED).await.unwrap().unwrap().balance, U256::from(999));
+        assert_eq!(reads.load(Ordering::Relaxed), 1, "the read had to reach the new fallback to be correct");
+        assert!(mgr.base().is_empty());
+    }
+
+    /// The whole restart story end to end, minus the network: one manager
+    /// resolves an account through its fallback, what it resolved is
+    /// written to a cache file, and a *second* manager built from that file
+    /// answers the same read without its fallback being touched. This is
+    /// the dimension Anvil won on — `anvil` warm made 30 upstream calls
+    /// against forkyard's 37 every run, because Foundry's cache outlives
+    /// the process and forkyard's didn't.
+    #[tokio::test]
+    async fn a_cache_file_written_by_one_run_warms_the_next_one() {
+        use forkyard_engine::persist::{CacheKey, ForkCache};
+
+        let dir = std::env::temp_dir().join(format!("forkyard-session-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cache = ForkCache::new(&dir);
+        let key = CacheKey::new(1, 23_000_000);
+
+        // First run: a real read, paid upstream, then persisted.
+        let first_reads = Arc::new(AtomicUsize::new(0));
+        let first = SessionManager::new(
+            CountingFallback { balance: 100, reads: Arc::clone(&first_reads) },
+            BlockEnv::default(),
+            2,
+            Duration::from_secs(60),
+        );
+        let id = first.fork().await.unwrap();
+        let info = first.basic(id, WATCHED).await.unwrap().unwrap();
+        assert_eq!(first_reads.load(Ordering::Relaxed), 1, "a cold run pays for the read");
+        cache.store(key, &BaseSnapshot::from_parts([(WATCHED, info)], [], [], [])).unwrap();
+
+        // Second run: same block, same chain, seeded from the file.
+        let second_reads = Arc::new(AtomicUsize::new(0));
+        let second = SessionManager::new(
+            CountingFallback { balance: 100, reads: Arc::clone(&second_reads) },
+            BlockEnv::default(),
+            2,
+            Duration::from_secs(60),
+        )
+        .with_base(cache.load(key).unwrap());
+
+        let id = second.fork().await.unwrap();
+        assert_eq!(second.basic(id, WATCHED).await.unwrap().unwrap().balance, U256::from(100));
+        assert_eq!(
+            second_reads.load(Ordering::Relaxed),
+            0,
+            "the restarted run must answer from the file rather than refetching"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

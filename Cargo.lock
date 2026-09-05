@@ -1972,6 +1972,7 @@ dependencies = [
  "eyre",
  "forkyard-api-http",
  "forkyard-api-mcp",
+ "forkyard-engine",
  "forkyard-fetch",
  "forkyard-ingest",
  "forkyard-session",
@@ -2024,6 +2025,8 @@ version = "0.1.0"
 dependencies = [
  "imbl",
  "revm",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@ dotenvy = "0.15.7"
 eyre = "0.6.14"
 forkyard-api-http = { version = "0.1.0", path = "../api-http" }
 forkyard-api-mcp = { version = "0.1.0", path = "../api-mcp" }
+forkyard-engine = { version = "0.1.0", path = "../engine" }
 forkyard-fetch = { version = "0.1.0", path = "../fetch" }
 forkyard-ingest = { version = "0.1.0", path = "../ingest" }
 forkyard-session = { version = "0.1.0", path = "../session" }

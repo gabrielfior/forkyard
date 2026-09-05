@@ -6,6 +6,7 @@
 use alloy_network::Ethereum;
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_rpc_types::BlockId;
+use forkyard_engine::BaseSnapshot;
 use foundry_fork_db::cache::BlockchainDbMeta;
 use foundry_fork_db::{BlockchainDb, SharedBackend};
 use revm::context::BlockEnv;
@@ -91,4 +92,50 @@ pub async fn fork(rpc_url: &str) -> eyre::Result<(Fork, BlockEnv)> {
 /// instead of whatever happens to be current.
 pub async fn fork_at(rpc_url: &str, block_number: u64) -> eyre::Result<(Fork, BlockEnv)> {
     fork_impl(rpc_url, BlockId::number(block_number)).await
+}
+
+/// Everything this fork has actually fetched from upstream so far, as a
+/// `BaseSnapshot` — the form `forkyard_engine::persist` writes to disk and
+/// `SessionManager::with_base` reads back at startup.
+///
+/// This has to come from the fetch backend rather than from the manager's
+/// own base: a session caches a resolved read in its private overlay and
+/// the shared base is only ever seeded, never grown (see `Session`'s
+/// `TODO(fetch)`), so the backend's cache is the one place holding
+/// everything every session ever paid for. It is also pure chain state —
+/// nothing in this workspace ever commits an execution diff into the
+/// backend, so a session's `advance` writes cannot leak into what gets
+/// persisted.
+///
+/// Copies the backend's maps under its own locks; paid once, at shutdown.
+pub fn cache_snapshot(fork: &Fork) -> BaseSnapshot {
+    let backend = &fork.0;
+    let accounts = backend.accounts();
+
+    // The backend keeps code inline on each `AccountInfo` and has no
+    // hash-keyed map of its own, so build one here: `Session::code_by_hash`
+    // looks code up by hash, and code that only ever existed inline would
+    // send that lookup upstream for a contract we already hold.
+    let code: Vec<_> = accounts
+        .values()
+        .filter_map(|info| info.code.as_ref())
+        .filter(|code| !code.is_empty())
+        .map(|code| (code.hash_slow(), code.clone()))
+        .collect();
+
+    let storage = backend
+        .storage()
+        .into_iter()
+        .flat_map(|(address, slots)| slots.into_iter().map(move |(key, value)| ((address, key), value)));
+
+    // The engine keys block hashes by `u64` where the backend keys them by
+    // `U256`. A height that doesn't fit a u64 can't have been asked for
+    // through the engine in the first place, so drop it rather than invent
+    // a truncated key that would answer for some other block.
+    let block_hashes = backend
+        .block_hashes()
+        .into_iter()
+        .filter_map(|(number, hash)| u64::try_from(number).ok().map(|number| (number, hash)));
+
+    BaseSnapshot::from_parts(accounts.clone(), code, storage, block_hashes)
 }
