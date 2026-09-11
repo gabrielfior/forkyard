@@ -229,6 +229,55 @@ fn build_receipt(
     })
 }
 
+/// Every JSON-RPC method this surface implements.
+///
+/// Dispatch matches on this rather than on string literals so the
+/// compiler checks the surface is covered: a new variant that nobody
+/// handles is a build error, where a mistyped `"eth_getcode"` arm would
+/// just fall through to `method_not_found` and look like an unimplemented
+/// method. The wire names live here and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcMethod {
+    EthChainId,
+    EthBlockNumber,
+    EthGasPrice,
+    EthGetBalance,
+    EthGetTransactionCount,
+    EthCall,
+    EthGetStorageAt,
+    EthGetCode,
+    EthSendRawTransaction,
+    EthGetTransactionReceipt,
+    EthEstimateGas,
+    ForkyardSetBalance,
+    ForkyardSetStorageAt,
+    ForkyardForkFrom,
+    ForkyardDiscard,
+}
+
+impl RpcMethod {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "eth_chainId" => Some(Self::EthChainId),
+            "eth_blockNumber" => Some(Self::EthBlockNumber),
+            "eth_gasPrice" => Some(Self::EthGasPrice),
+            "eth_getBalance" => Some(Self::EthGetBalance),
+            "eth_getTransactionCount" => Some(Self::EthGetTransactionCount),
+            "eth_call" => Some(Self::EthCall),
+            "eth_getStorageAt" => Some(Self::EthGetStorageAt),
+            "eth_getCode" => Some(Self::EthGetCode),
+            "eth_sendRawTransaction" => Some(Self::EthSendRawTransaction),
+            "eth_getTransactionReceipt" => Some(Self::EthGetTransactionReceipt),
+            "eth_estimateGas" => Some(Self::EthEstimateGas),
+            "forkyard_setBalance" => Some(Self::ForkyardSetBalance),
+            "forkyard_setStorageAt" => Some(Self::ForkyardSetStorageAt),
+            "forkyard_forkFrom" => Some(Self::ForkyardForkFrom),
+            "forkyard_discard" => Some(Self::ForkyardDiscard),
+            _ => None,
+        }
+    }
+}
+
 /// Handles one JSON-RPC call against `session_id`'s session on the shared
 /// manager. Every real read/write goes through `SessionManager`, which
 /// routes it to whichever worker thread owns that session — nothing here
@@ -242,21 +291,25 @@ async fn dispatch<F: Fallback>(
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
+    let Some(method) = RpcMethod::parse(method) else {
+        return Err(RpcErrorObj::method_not_found(method));
+    };
+
     match method {
-        "eth_chainId" => Ok(json!(format!("0x{:x}", state.chain_id))),
+        RpcMethod::EthChainId => Ok(json!(format!("0x{:x}", state.chain_id))),
 
         // The fork's real starting block number plus this session's own
         // send-count — see module doc.
-        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id).await))),
+        RpcMethod::EthBlockNumber => Ok(json!(format!("0x{:x}", real_block_number(state, session_id).await))),
 
         // Real base fee (from the fork's actual block) plus a fixed
         // priority-fee margin — see module doc.
-        "eth_gasPrice" => {
+        RpcMethod::EthGasPrice => {
             let gas_price = session_block_env(state, session_id).await.basefee as u64 + PRIORITY_FEE_WEI;
             Ok(json!(format!("0x{gas_price:x}")))
         }
 
-        "eth_getBalance" => {
+        RpcMethod::EthGetBalance => {
             let address = parse_address(params, 0)?;
             let balance = state
                 .manager
@@ -267,7 +320,7 @@ where
             Ok(json!(format!("0x{balance:x}")))
         }
 
-        "eth_getTransactionCount" => {
+        RpcMethod::EthGetTransactionCount => {
             let address = parse_address(params, 0)?;
             let nonce = state
                 .manager
@@ -283,7 +336,7 @@ where
         // usage doesn't get this; it exists so an RPC client can set up a
         // scenario (e.g. a freshly generated signer) without needing a
         // whale's private key.
-        "forkyard_setBalance" => {
+        RpcMethod::ForkyardSetBalance => {
             let address = parse_address(params, 0)?;
             let balance = parse_u256_hex_str(param_str(params, 1)?)?;
 
@@ -298,7 +351,7 @@ where
         // overlay only. Exists so an RPC client can fund an ERC-20
         // balance (or set up any other storage-dependent scenario)
         // without needing impersonation, which forkyard doesn't support.
-        "forkyard_setStorageAt" => {
+        RpcMethod::ForkyardSetStorageAt => {
             let address = parse_address(params, 0)?;
             let key = parse_u256_hex_str(param_str(params, 1)?)?;
             let value = parse_u256_hex_str(param_str(params, 2)?)?;
@@ -310,7 +363,7 @@ where
         // base. A method, not a `/session/{id}/fork` route: the id is already
         // this endpoint's routing key, and the result is the same
         // `{"session_id": ...}` shape `POST /session` returns.
-        "forkyard_forkFrom" => {
+        RpcMethod::ForkyardForkFrom => {
             let child = state.manager.fork_from(session_id).await?;
             // The block counter and receipts live in our side table, not the
             // session, so a branch would otherwise report a lower block than
@@ -325,7 +378,7 @@ where
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
         // surface — the HTTP-side counterpart to the `discard` MCP tool
         // (`crates/api-mcp`), which has no equivalent route here today.
-        "forkyard_discard" => {
+        RpcMethod::ForkyardDiscard => {
             state.manager.discard(session_id).await?;
             // Drop this session's block counter and receipts too. The
             // manager forgets the session, but `rpc_state` is our own
@@ -335,7 +388,7 @@ where
             Ok(json!(true))
         }
 
-        "eth_sendRawTransaction" => {
+        RpcMethod::EthSendRawTransaction => {
             let raw = parse_raw_tx(params, 0)?;
             let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
             let TxEnvelope::Legacy(signed) = &envelope else {
@@ -373,7 +426,7 @@ where
             Ok(json!(format!("{tx_hash:#x}")))
         }
 
-        "eth_getTransactionReceipt" => {
+        RpcMethod::EthGetTransactionReceipt => {
             let hash = param_str(params, 0)?.to_lowercase();
             let receipt = state
                 .rpc_state
@@ -392,7 +445,7 @@ where
         // money. A revert comes back as an RPC error carrying the revert
         // data, which is how a client tells "returned nothing" from
         // "failed".
-        "eth_call" => {
+        RpcMethod::EthCall => {
             let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
             let from = field_str(call, "from")
                 .map(|s| s.parse())
@@ -446,14 +499,14 @@ where
             }
         }
 
-        "eth_getStorageAt" => {
+        RpcMethod::EthGetStorageAt => {
             let address = parse_address(params, 0)?;
             let slot = parse_u256_hex_str(param_str(params, 1)?)?;
             let value = state.manager.storage(session_id, address, slot).await?;
             Ok(json!(format!("0x{value:064x}")))
         }
 
-        "eth_getCode" => {
+        RpcMethod::EthGetCode => {
             let address = parse_address(params, 0)?;
             let code = state.manager.code(session_id, address).await?;
             Ok(json!(format!("0x{}", alloy_primitives::hex::encode(code))))
@@ -462,7 +515,7 @@ where
         // Dry-runs the call via `simulate` (no commit) with a generous gas
         // cap and reports the actual gas used — real estimation, not a
         // fixed constant, since we already have the machinery for it.
-        "eth_estimateGas" => {
+        RpcMethod::EthEstimateGas => {
             let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
             let from = field_str(call, "from").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?.unwrap_or_default();
             let to = field_str(call, "to").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?;
@@ -497,8 +550,6 @@ where
             }
             Ok(json!(format!("0x{:x}", result.tx_gas_used())))
         }
-
-        other => Err(RpcErrorObj::method_not_found(other)),
     }
 }
 
@@ -1266,5 +1317,19 @@ mod tests {
         let code = dispatch(&state, id, "eth_getCode", &[json!(Address::ZERO.to_string())]).await.unwrap();
 
         assert_eq!(code, json!("0x"));
+    }
+
+    /// Pins the fallthrough the enum dispatch has to preserve: anything
+    /// outside the implemented surface is `method_not_found` (-32601), not
+    /// a panic and not a silent success.
+    #[tokio::test]
+    async fn an_unimplemented_method_is_method_not_found() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        for method in ["eth_getLogs", "evm_snapshot", "eth_getcode", ""] {
+            let err = dispatch(&state, id, method, &[]).await.expect_err("should be rejected");
+            assert_eq!(err.code, -32601, "{method:?} should be method_not_found, got {err:?}");
+        }
     }
 }
