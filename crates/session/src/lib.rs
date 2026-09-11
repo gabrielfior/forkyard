@@ -28,7 +28,7 @@ use forkyard_engine::{BaseSnapshot, Session};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
-use revm::primitives::{Address, StorageKey, StorageValue};
+use revm::primitives::{Address, Bytes, StorageKey, StorageValue, KECCAK_EMPTY};
 use revm::state::AccountInfo;
 use revm::{Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::{oneshot, OnceCell};
@@ -182,6 +182,21 @@ enum Job<F: DatabaseRef> {
     Discard {
         id: SessionId,
         reply: oneshot::Sender<()>,
+    },
+    /// Read one storage slot. The read-only counterpart to `SetStorage`,
+    /// resolving overlay, then base, then fallback exactly the way
+    /// execution does.
+    Storage {
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+        reply: oneshot::Sender<Result<StorageValue, SessionError>>,
+    },
+    /// Read an account's deployed bytecode.
+    Code {
+        id: SessionId,
+        address: Address,
+        reply: oneshot::Sender<Result<Bytes, SessionError>>,
     },
     Basic {
         id: SessionId,
@@ -491,6 +506,35 @@ where
         rx.await.map_err(|_| SessionError::WorkerGone)?
     }
 
+    /// Read one storage slot out of `id`'s view of the chain — overlay,
+    /// then base, then the fetch fallback, the same resolution order
+    /// `basic` follows. The read-only counterpart to `set_storage`, and
+    /// what lets a caller inspect contract state (an ERC-20 `balanceOf`
+    /// entry, say) without executing a transaction.
+    pub async fn storage(
+        &self,
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+    ) -> Result<StorageValue, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Storage { id, address, key, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
+    /// Read an account's deployed bytecode in `id`'s view — empty for an
+    /// EOA. Resolved by code hash through the same overlay/base/fallback
+    /// chain execution uses, so it never reaches past the session.
+    pub async fn code(&self, id: SessionId, address: Address) -> Result<Bytes, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Code { id, address, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
     /// Run `tx` read-only against `id`'s session — no commit, nothing
     /// persists — with balance and base-fee checks enforced, same as
     /// `advance`. Answers "would this really work right now." See
@@ -503,6 +547,16 @@ where
     /// session's private overlay only.
     pub async fn advance(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
         self.dispatch(id, tx, true, false).await
+    }
+
+    /// Run `tx` read-only for its *return data* — `eth_call` semantics.
+    /// Like `simulate` in that nothing is committed, but balance and
+    /// base-fee checks are disabled: reading a contract shouldn't require
+    /// the caller to hold gas money, and a client asking `balanceOf` has
+    /// no signer at all. Use `simulate` instead to ask "would this
+    /// transaction really work right now."
+    pub async fn call(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
+        self.dispatch(id, tx, false, true).await
     }
 
     /// Dry-run `tx` for a gas estimate, the same way real Ethereum nodes'
@@ -597,6 +651,26 @@ where
     }
 }
 
+/// Resolve an account's bytecode the way the EVM does: the account's own
+/// inlined code if the fallback supplied it, otherwise a lookup by code
+/// hash. `KECCAK_EMPTY` short-circuits, because asking the fallback for
+/// the empty-code hash is how an EOA read turns into a spurious
+/// `CodeMiss` error.
+fn code_of<F: Fallback>(session: &mut Session<F>, address: Address) -> Result<Bytes, SessionError> {
+    let info = Database::basic(session, address)
+        .map_err(|e| SessionError::Execution(format!("{e}")))?
+        .unwrap_or_default();
+    if let Some(code) = info.code {
+        return Ok(code.original_bytes());
+    }
+    if info.code_hash == KECCAK_EMPTY {
+        return Ok(Bytes::new());
+    }
+    Database::code_by_hash(session, info.code_hash)
+        .map(|code| code.original_bytes())
+        .map_err(|e| SessionError::Execution(format!("{e}")))
+}
+
 fn handle_job<F: Fallback>(sessions: &mut HashMap<SessionId, (Session<F>, Instant)>, job: Job<F>)
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -633,6 +707,27 @@ where
         Job::Discard { id, reply } => {
             sessions.remove(&id);
             let _ = reply.send(());
+        }
+        Job::Storage { id, address, key, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    Database::storage(session, address, key)
+                        .map_err(|e| SessionError::Execution(format!("{e}")))
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
+        }
+        Job::Code { id, address, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    code_of(session, address)
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
         }
         Job::Basic { id, address, reply } => {
             let result = match sessions.get_mut(&id) {
@@ -1216,12 +1311,48 @@ mod tests {
 
         mgr.set_storage(id, address, key, value).await.unwrap();
 
-        // No direct storage-read accessor exists on SessionManager today,
-        // so this only proves set_storage doesn't error and reaches the
-        // right session (the wrong-id case would surface as
-        // SessionError::Unknown from the .unwrap() above). A full
-        // write-then-read-back is covered at the forkyard-engine level
-        // (Task 3's test).
+        assert_eq!(mgr.storage(id, address, key).await.unwrap(), value);
+    }
+
+    /// A slot nobody wrote resolves through to the fallback rather than
+    /// erroring — the same overlay-then-base-then-fallback order `basic`
+    /// already follows.
+    #[tokio::test]
+    async fn storage_falls_through_to_the_fallback_for_an_untouched_slot() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+
+        let value = mgr.storage(id, Address::from([0x33; 20]), U256::from(1u64)).await.unwrap();
+
+        assert_eq!(value, U256::ZERO);
+    }
+
+    /// Reads are per-session: writing a slot in one session must not be
+    /// visible from another, the same isolation `set_balance` has.
+    #[tokio::test]
+    async fn storage_is_isolated_between_sessions() {
+        let mgr = manager();
+        let (a, b) = (mgr.fork().await.unwrap(), mgr.fork().await.unwrap());
+        let address = Address::from([0x44; 20]);
+        let key = U256::from(7u64);
+
+        mgr.set_storage(a, address, key, U256::from(42u64)).await.unwrap();
+
+        assert_eq!(mgr.storage(a, address, key).await.unwrap(), U256::from(42u64));
+        assert_eq!(mgr.storage(b, address, key).await.unwrap(), U256::ZERO);
+    }
+
+    /// `code` answers with the account's deployed bytecode, resolved the
+    /// same way execution resolves it (overlay, base, then fallback by
+    /// code hash) — what an agent needs to tell a contract from an EOA.
+    #[tokio::test]
+    async fn code_returns_empty_bytes_for_an_account_with_no_code() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+
+        let code = mgr.code(id, FUNDED).await.unwrap();
+
+        assert!(code.is_empty(), "an EOA has no code, got {} bytes", code.len());
     }
 
     #[tokio::test]

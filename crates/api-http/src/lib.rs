@@ -386,6 +386,79 @@ where
             Ok(receipt)
         }
 
+        // The read path every client uses for contract state. Runs through
+        // `SessionManager::call` — no commit, and balance/basefee checks
+        // disabled, since a read shouldn't require the caller to hold gas
+        // money. A revert comes back as an RPC error carrying the revert
+        // data, which is how a client tells "returned nothing" from
+        // "failed".
+        "eth_call" => {
+            let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
+            let from = field_str(call, "from")
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?
+                .unwrap_or_default();
+            let to = field_str(call, "to")
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?;
+            let value = field_str(call, "value").map(parse_u256_hex_str).transpose()?.unwrap_or_default();
+            let data = field_str(call, "data")
+                .or_else(|| field_str(call, "input"))
+                .map(|s| alloy_primitives::hex::decode(s.trim_start_matches("0x")))
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?
+                .unwrap_or_default();
+            let gas_limit = field_str(call, "gas")
+                .map(parse_u256_hex_str)
+                .transpose()?
+                .map(|g| g.saturating_to::<u64>())
+                // Same EIP-7825 per-transaction cap `eth_estimateGas`'s
+                // dry run uses; a higher value fails validation outright.
+                .unwrap_or(ESTIMATE_GAS_LIMIT);
+
+            let tx_env = TxEnv::builder()
+                .caller(from)
+                .kind(match to {
+                    Some(addr) => TxKind::Call(addr),
+                    None => TxKind::Create,
+                })
+                .value(value)
+                .data(Bytes::from(data))
+                .gas_limit(gas_limit)
+                .gas_price(0)
+                .chain_id(Some(state.chain_id))
+                .build_fill();
+
+            let result = state.manager.call(session_id, tx_env).await?;
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    Ok(json!(format!("0x{}", alloy_primitives::hex::encode(output.data()))))
+                }
+                ExecutionResult::Revert { output, .. } => Err(RpcErrorObj::execution(format!(
+                    "execution reverted: 0x{}",
+                    alloy_primitives::hex::encode(output)
+                ))),
+                ExecutionResult::Halt { reason, .. } => {
+                    Err(RpcErrorObj::execution(format!("execution halted: {reason:?}")))
+                }
+            }
+        }
+
+        "eth_getStorageAt" => {
+            let address = parse_address(params, 0)?;
+            let slot = parse_u256_hex_str(param_str(params, 1)?)?;
+            let value = state.manager.storage(session_id, address, slot).await?;
+            Ok(json!(format!("0x{value:064x}")))
+        }
+
+        "eth_getCode" => {
+            let address = parse_address(params, 0)?;
+            let code = state.manager.code(session_id, address).await?;
+            Ok(json!(format!("0x{}", alloy_primitives::hex::encode(code))))
+        }
+
         // Dry-runs the call via `simulate` (no commit) with a generous gas
         // cap and reports the actual gas used — real estimation, not a
         // fixed constant, since we already have the machinery for it.
@@ -1049,5 +1122,149 @@ mod tests {
             !state.rpc_state.lock().unwrap().contains_key(&id),
             "discarding a session must not leave its receipts/block counter behind"
         );
+    }
+
+    /// The counter contract the MCP surface's tests use: reverts with the
+    /// word `0xbb` on empty calldata, otherwise stores the first calldata
+    /// word in slot 0 and returns it.
+    const COUNTER_RUNTIME: &str =
+        "36600e5760bb60005260206000fd5b6000358060005560005260206000f3";
+
+    fn counter_state(addr: Address) -> AppState<TestFallback> {
+        let code = alloy_primitives::hex::decode(COUNTER_RUNTIME).unwrap();
+        test_state_with_contract(addr, Bytecode::new_raw(Bytes::from(code)))
+    }
+
+    fn word_hex(n: u64) -> String {
+        format!("0x{n:064x}")
+    }
+
+    /// `eth_call` is what every client (cast, web3.py, alloy) uses to read
+    /// contract state, and README advertised it while `dispatch` answered
+    /// `method_not_found`.
+    #[tokio::test]
+    async fn eth_call_returns_the_contracts_return_data() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        let result = dispatch(
+            &state,
+            id,
+            "eth_call",
+            &[json!({ "to": contract.to_string(), "data": word_hex(42) })],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, json!(word_hex(42)));
+    }
+
+    /// A read must not persist: `eth_call` runs through `simulate`, so the
+    /// slot the contract writes is gone the moment the call returns.
+    #[tokio::test]
+    async fn eth_call_does_not_commit_the_calls_writes() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        dispatch(&state, id, "eth_call", &[json!({ "to": contract.to_string(), "data": word_hex(42) })])
+            .await
+            .unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(contract.to_string()), json!("0x0")])
+            .await
+            .unwrap();
+        assert_eq!(slot, json!(word_hex(0)), "eth_call must not have committed");
+    }
+
+    /// A reverting call is an error, not a success with empty data — the
+    /// distinction a client needs to tell "returned nothing" from "failed".
+    #[tokio::test]
+    async fn eth_call_reports_a_revert_as_an_error() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        // Empty calldata makes the counter contract revert.
+        let result = dispatch(&state, id, "eth_call", &[json!({ "to": contract.to_string() })]).await;
+
+        let err = result.expect_err("a revert should surface as an error");
+        // Guard against passing for the wrong reason: before eth_call
+        // existed this assertion was satisfied by `method_not_found`.
+        assert_ne!(err.code, -32601, "should be a revert, not an unimplemented method: {err:?}");
+        assert!(
+            err.message.contains("revert") || err.message.contains("Revert"),
+            "error should name the revert, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eth_get_storage_at_reads_a_slot_written_by_a_transaction() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw = signed_tx_hex(
+            &sender,
+            TxKind::Call(contract),
+            0,
+            200_000,
+            alloy_primitives::hex::decode(word_hex(42).trim_start_matches("0x")).unwrap(),
+        );
+        dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)]).await.unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(contract.to_string()), json!("0x0")])
+            .await
+            .unwrap();
+
+        assert_eq!(slot, json!(word_hex(42)));
+    }
+
+    /// Reads the slot `forkyard_setStorageAt` wrote — the cheatcode had no
+    /// read-back counterpart on this surface at all.
+    #[tokio::test]
+    async fn eth_get_storage_at_reads_back_the_set_storage_cheatcode() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let address = Address::from([0x77; 20]);
+
+        dispatch(
+            &state,
+            id,
+            "forkyard_setStorageAt",
+            &[json!(address.to_string()), json!("0x5"), json!(word_hex(9))],
+        )
+        .await
+        .unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(address.to_string()), json!("0x5")])
+            .await
+            .unwrap();
+
+        assert_eq!(slot, json!(word_hex(9)));
+    }
+
+    #[tokio::test]
+    async fn eth_get_code_returns_the_deployed_bytecode() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        let code = dispatch(&state, id, "eth_getCode", &[json!(contract.to_string())]).await.unwrap();
+
+        assert_eq!(code, json!(format!("0x{COUNTER_RUNTIME}")));
+    }
+
+    #[tokio::test]
+    async fn eth_get_code_returns_empty_for_an_account_with_no_code() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        let code = dispatch(&state, id, "eth_getCode", &[json!(Address::ZERO.to_string())]).await.unwrap();
+
+        assert_eq!(code, json!("0x"));
     }
 }
