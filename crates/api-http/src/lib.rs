@@ -47,7 +47,7 @@ use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use forkyard_session::{Fallback, SessionError, SessionId, SessionManager};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{ExecutionResult, InvalidTransaction};
 use revm::context::TxEnv;
 use revm::primitives::{TxKind, U256};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,27 @@ impl From<SessionError> for RpcErrorObj {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Unknown(id) => Self { code: -32001, message: format!("unknown or expired session {id}") },
+            // The two fee rejections are the ones a caller can actually
+            // fix, so they say how — in this surface's own terms, since a
+            // JSON-RPC client reaches for `eth_gasPrice`, not for an MCP
+            // argument. Everything else keeps revm's wording.
+            SessionError::InvalidTransaction(ref reason) => match &**reason {
+                InvalidTransaction::GasPriceLessThanBasefee => RpcErrorObj::execution(format!(
+                    "{e} - read eth_gasPrice for a valid price on this fork (it includes a \
+                     priority-fee margin over the basefee) and re-sign at that price"
+                )),
+                // revm's `fee` here is its `max_balance_spending`: the
+                // value sent *plus* gas_limit * gas_price, not the gas
+                // alone, so it is reported as the total it is.
+                InvalidTransaction::LackOfFundForMaxFee { fee, balance } => {
+                    RpcErrorObj::execution(format!(
+                        "sender holds {balance} wei but this transaction needs {fee} wei in \
+                         total - the value sent plus gas_limit * gas_price; fund it with \
+                         forkyard_setBalance, or lower the gas limit or price"
+                    ))
+                }
+                _ => RpcErrorObj::execution(e),
+            },
             other => RpcErrorObj::execution(other),
         }
     }
@@ -1331,5 +1352,51 @@ mod tests {
             let err = dispatch(&state, id, method, &[]).await.expect_err("should be rejected");
             assert_eq!(err.code, -32601, "{method:?} should be method_not_found, got {err:?}");
         }
+    }
+
+    /// Same typed rejection the MCP surface explains, reported in this
+    /// surface's own terms: a client here reaches for `eth_gasPrice`, not
+    /// for an MCP argument.
+    #[tokio::test]
+    async fn an_underpriced_transaction_is_rejected_with_advice() {
+        // Above the 20 gwei `signed_tx_hex` signs at.
+        let block_env = revm::context::BlockEnv { basefee: 100_000_000_000, ..Default::default() };
+        let state = test_state_with_block_env(block_env);
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw = signed_tx_hex(&sender, TxKind::Call(Address::ZERO), 0, 21_000, vec![]);
+        let err = dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)])
+            .await
+            .expect_err("an underpriced transaction must be rejected");
+
+        assert!(err.message.contains("basefee"), "should name the problem, got {err:?}");
+        assert!(
+            err.message.contains("eth_gasPrice"),
+            "should point at the method that answers it, got {err:?}"
+        );
+    }
+
+    /// The funds rejection names this surface's cheatcode, and states the
+    /// total and the gas cost as separate numbers — revm's `fee` is the
+    /// value sent plus the gas, not the gas alone.
+    #[tokio::test]
+    async fn an_unaffordable_transaction_names_the_cheatcode_that_fixes_it() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0x3e8").await; // 1000 wei
+
+        let raw = signed_tx_hex(&sender, TxKind::Call(Address::ZERO), 0, 21_000, vec![]);
+        let err = dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)])
+            .await
+            .expect_err("an unaffordable transaction must be rejected");
+
+        assert!(err.message.contains("1000"), "should state what the sender holds, got {err:?}");
+        assert!(
+            err.message.contains("forkyard_setBalance"),
+            "should name the cheatcode, got {err:?}"
+        );
     }
 }

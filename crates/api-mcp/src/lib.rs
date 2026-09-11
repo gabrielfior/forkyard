@@ -24,8 +24,8 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use forkyard_session::{Fallback, SessionId, SessionManager};
-use revm::context::result::ExecutionResult;
+use forkyard_session::{Fallback, SessionError, SessionId, SessionManager};
+use revm::context::result::{ExecutionResult, InvalidTransaction};
 use revm::context::TxEnv;
 use revm::primitives::{hex, Address, Bytes, TxKind, U256};
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -360,15 +360,15 @@ where
     manager.session_block_env(id).await.map(|env| env.basefee).map_err(tool_err)
 }
 
-/// Turns revm's two fee rejections into something an agent can act on.
-/// Both arrive as opaque text (`Transaction(GasPriceLessThanBasefee)`),
-/// because the typed error does not survive `SessionError::Execution`, so
-/// they are matched on that text and re-stated with the numbers involved.
-/// Every other error passes through untouched.
+/// Turns revm's two fee rejections into advice an agent can act on,
+/// naming this surface's own tools. Matched on the typed rejection
+/// `SessionError::InvalidTransaction` carries, so the numbers come from
+/// the error itself rather than from parsing its text. Every other error
+/// passes through untouched.
 async fn explain_fee_error<F: Fallback>(
     manager: &SessionManager<F>,
     id: SessionId,
-    error: forkyard_session::SessionError,
+    error: SessionError,
     caller: Address,
     gas_price: u64,
     gas_limit: u64,
@@ -376,40 +376,39 @@ async fn explain_fee_error<F: Fallback>(
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    let text = error.to_string();
-    if text.contains("GasPriceLessThanBasefee") {
-        let basefee = manager.session_block_env(id).await.map(|e| e.basefee).unwrap_or_default();
-        return ErrorData::invalid_params(
-            format!(
-                "gas_price {gas_price} is below this fork's basefee of {basefee} - pass \
-                 gas_price of at least {basefee}, or omit gas_price entirely to price at \
-                 the basefee automatically"
-            ),
-            None,
-        );
+    let SessionError::InvalidTransaction(reason) = &error else {
+        return tool_err(error);
+    };
+    match &**reason {
+        InvalidTransaction::GasPriceLessThanBasefee => {
+            let basefee = manager.session_block_env(id).await.map(|e| e.basefee).unwrap_or_default();
+            ErrorData::invalid_params(
+                format!(
+                    "gas_price {gas_price} is below this fork's basefee of {basefee} - pass \
+                     gas_price of at least {basefee}, or omit gas_price entirely to price at \
+                     the basefee automatically"
+                ),
+                None,
+            )
+        }
+        // The rejection carries the balance and the total, so there is
+        // nothing to look up. `fee` is revm's `max_balance_spending`: the
+        // value sent *plus* the gas, which is why the gas cost is computed
+        // and labelled separately rather than presented as the total.
+        InvalidTransaction::LackOfFundForMaxFee { fee, balance } => {
+            let gas_cost = (gas_limit as u128) * (gas_price as u128);
+            ErrorData::invalid_params(
+                format!(
+                    "sender {caller:#x} holds {balance} wei, but this transaction needs {fee} \
+                     wei in total: gas_limit * gas_price = {gas_limit} * {gas_price} = \
+                     {gas_cost} wei of gas, plus the value sent; fund it with set_balance, or \
+                     lower gas_limit"
+                ),
+                None,
+            )
+        }
+        _ => tool_err(error),
     }
-    if text.contains("LackOfFundForMaxFee") || text.contains("lack of funds") {
-        let cost = (gas_limit as u128) * (gas_price as u128);
-        // Read the balance rather than quoting revm's message, so the
-        // error reads as one explanation instead of an internal enum name
-        // with a gloss attached.
-        let balance = manager
-            .basic(id, caller)
-            .await
-            .ok()
-            .flatten()
-            .map(|info| info.balance.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        return ErrorData::invalid_params(
-            format!(
-                "sender {caller:#x} holds {balance} wei, but this transaction needs \
-                 gas_limit * gas_price = {gas_limit} * {gas_price} = {cost} wei for gas on \
-                 top of the value sent; fund it with set_balance, or lower gas_limit"
-            ),
-            None,
-        );
-    }
-    tool_err(error)
 }
 
 /// The JSON one `simulate`/`advance` call reports back. `output` carries
@@ -1296,6 +1295,42 @@ mod tests {
         assert!(
             !text.contains("LackOfFundForMaxFee"),
             "should not leak revm's internal variant name, got {text}"
+        );
+
+        client.cancel().await.expect("cancel");
+        task.await.expect("server task").expect("server");
+    }
+
+    /// revm's `fee` is the *total* it needs — the value sent plus the gas
+    /// — so a message that prints it as `gas_limit * gas_price` is simply
+    /// wrong once any value is attached. Both numbers have to appear, each
+    /// labelled as what it is.
+    #[tokio::test]
+    async fn the_funds_error_separates_the_gas_cost_from_the_value_sent() {
+        let basefee = 1_000_000_000u64;
+        let gas_limit = 21_000u64;
+        let (client, task, session_id, sender) = client_with_basefee(basefee, 1_000).await;
+
+        let result = client
+            .call_tool(call(
+                "simulate",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "from": sender.to_string(),
+                    "to": Address::from([0x31; 20]).to_string(),
+                    "value": "0x64", // 100 wei, so total != gas cost
+                    "gas_limit": gas_limit,
+                }),
+            ))
+            .await
+            .expect_err("an unaffordable transaction must be rejected");
+
+        let text = result.to_string();
+        let gas_cost = (gas_limit as u128) * (basefee as u128);
+        assert!(text.contains(&gas_cost.to_string()), "should state the gas cost, got {text}");
+        assert!(
+            text.contains(&(gas_cost + 100).to_string()),
+            "should state the true total, which includes the value sent, got {text}"
         );
 
         client.cancel().await.expect("cancel");

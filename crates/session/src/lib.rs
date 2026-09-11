@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use forkyard_engine::{BaseSnapshot, Session};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{EVMError, ExecutionResult, InvalidTransaction};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
 use revm::primitives::{Address, Bytes, StorageKey, StorageValue, KECCAK_EMPTY};
@@ -119,6 +119,15 @@ where
 pub enum SessionError {
     Unknown(SessionId),
     Execution(String),
+    /// revm rejected the transaction during validation, before any of its
+    /// code ran — an underpriced `gas_price`, a nonce that doesn't line
+    /// up, a sender who can't cover the fee. Kept as revm's own type
+    /// rather than flattened into a string so a surface can build real
+    /// advice from it: the fee variants carry the numbers involved, and
+    /// only the caller knows what to name (`set_balance` on MCP,
+    /// `forkyard_setBalance` over JSON-RPC). Boxed to keep `SessionError`
+    /// small, since every fallible session call returns one.
+    InvalidTransaction(Box<InvalidTransaction>),
     /// The worker thread this session was assigned to is gone — a bug
     /// (a worker's own job loop panicked past `catch_unwind`, or the
     /// manager was dropped), not a normal runtime condition.
@@ -134,6 +143,9 @@ impl fmt::Display for SessionError {
         match self {
             Self::Unknown(id) => write!(f, "unknown or expired session {id}"),
             Self::Execution(msg) => write!(f, "execution error: {msg}"),
+            // revm's own wording, which reads far better than the `{:?}`
+            // form this used to be stringified into.
+            Self::InvalidTransaction(reason) => write!(f, "invalid transaction: {reason}"),
             Self::WorkerGone => write!(f, "worker thread is gone"),
             Self::BlockUnavailable(number, reason) => {
                 write!(f, "cannot open a session at block {number}: {reason}")
@@ -804,11 +816,20 @@ where
     };
     let mut evm = ctx.build_mainnet();
     if commit {
-        evm.transact_commit(tx).map_err(|e| SessionError::Execution(format!("{e:?}")))
+        evm.transact_commit(tx).map_err(execution_error)
     } else {
-        evm.transact(tx)
-            .map(|result_and_state| result_and_state.result)
-            .map_err(|e| SessionError::Execution(format!("{e:?}")))
+        evm.transact(tx).map(|result_and_state| result_and_state.result).map_err(execution_error)
+    }
+}
+
+/// Keeps a validation rejection typed and stringifies everything else.
+/// Database and header failures have no caller-actionable shape, so their
+/// text is all there is to report; `EVMError::Transaction` is the one that
+/// does, and it is exactly what the fee messages are built from.
+fn execution_error<DB: fmt::Debug>(error: EVMError<DB>) -> SessionError {
+    match error {
+        EVMError::Transaction(reason) => SessionError::InvalidTransaction(Box::new(reason)),
+        other => SessionError::Execution(format!("{other:?}")),
     }
 }
 
@@ -1529,5 +1550,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// revm rejects an underpriced transaction before executing it, and
+    /// that rejection has to survive as a *type*: surfaces build their
+    /// own advice from it (naming the basefee, the shortfall), which is
+    /// impossible once it has been flattened into a string.
+    #[tokio::test]
+    async fn an_underpriced_transaction_fails_with_a_typed_rejection() {
+        let mgr = SessionManager::new(
+            FundedFallback,
+            BlockEnv { basefee: 1_000_000_000, ..Default::default() },
+            2,
+            Duration::from_secs(60),
+        );
+        let id = mgr.fork().await.unwrap();
+
+        let tx = TxEnv::builder()
+            .caller(FUNDED)
+            .kind(TxKind::Call(Address::ZERO))
+            .gas_price(0)
+            .build_fill();
+        let error = mgr.simulate(id, tx).await.expect_err("underpriced must be rejected");
+
+        assert!(
+            matches!(
+                &error,
+                SessionError::InvalidTransaction(reason)
+                    if matches!(**reason, InvalidTransaction::GasPriceLessThanBasefee)
+            ),
+            "should keep revm's typed rejection, got {error:?}"
+        );
+    }
+
+    /// The funds rejection carries the numbers a caller needs, so a
+    /// surface can say what the sender has and what it needed without
+    /// looking anything up again.
+    #[tokio::test]
+    async fn an_unaffordable_fee_fails_with_the_balance_and_fee_attached() {
+        let mgr = SessionManager::new(
+            FundedFallback, // FUNDED holds 100 wei
+            BlockEnv { basefee: 1_000_000_000, ..Default::default() },
+            2,
+            Duration::from_secs(60),
+        );
+        let id = mgr.fork().await.unwrap();
+
+        let tx = TxEnv::builder()
+            .caller(FUNDED)
+            .kind(TxKind::Call(Address::ZERO))
+            .gas_limit(21_000)
+            .gas_price(1_000_000_000)
+            .build_fill();
+        let error = mgr.simulate(id, tx).await.expect_err("an unaffordable fee must be rejected");
+
+        match error {
+            SessionError::InvalidTransaction(reason) => match *reason {
+                InvalidTransaction::LackOfFundForMaxFee { fee, balance } => {
+                    assert_eq!(*balance, U256::from(FUNDED_BALANCE));
+                    assert_eq!(*fee, U256::from(21_000u64) * U256::from(1_000_000_000u64));
+                }
+                other => panic!("expected LackOfFundForMaxFee, got {other:?}"),
+            },
+            other => panic!("expected a typed rejection, got {other:?}"),
+        }
     }
 }
