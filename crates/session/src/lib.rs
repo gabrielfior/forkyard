@@ -25,10 +25,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use forkyard_engine::{BaseSnapshot, Session};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{EVMError, ExecutionResult, InvalidTransaction};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
-use revm::primitives::{Address, StorageKey, StorageValue};
+use revm::primitives::{Address, Bytes, StorageKey, StorageValue, KECCAK_EMPTY};
 use revm::state::AccountInfo;
 use revm::{Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::{oneshot, OnceCell};
@@ -119,6 +119,15 @@ where
 pub enum SessionError {
     Unknown(SessionId),
     Execution(String),
+    /// revm rejected the transaction during validation, before any of its
+    /// code ran — an underpriced `gas_price`, a nonce that doesn't line
+    /// up, a sender who can't cover the fee. Kept as revm's own type
+    /// rather than flattened into a string so a surface can build real
+    /// advice from it: the fee variants carry the numbers involved, and
+    /// only the caller knows what to name (`set_balance` on MCP,
+    /// `forkyard_setBalance` over JSON-RPC). Boxed to keep `SessionError`
+    /// small, since every fallible session call returns one.
+    InvalidTransaction(Box<InvalidTransaction>),
     /// The worker thread this session was assigned to is gone — a bug
     /// (a worker's own job loop panicked past `catch_unwind`, or the
     /// manager was dropped), not a normal runtime condition.
@@ -134,6 +143,9 @@ impl fmt::Display for SessionError {
         match self {
             Self::Unknown(id) => write!(f, "unknown or expired session {id}"),
             Self::Execution(msg) => write!(f, "execution error: {msg}"),
+            // revm's own wording, which reads far better than the `{:?}`
+            // form this used to be stringified into.
+            Self::InvalidTransaction(reason) => write!(f, "invalid transaction: {reason}"),
             Self::WorkerGone => write!(f, "worker thread is gone"),
             Self::BlockUnavailable(number, reason) => {
                 write!(f, "cannot open a session at block {number}: {reason}")
@@ -182,6 +194,21 @@ enum Job<F: DatabaseRef> {
     Discard {
         id: SessionId,
         reply: oneshot::Sender<()>,
+    },
+    /// Read one storage slot. The read-only counterpart to `SetStorage`,
+    /// resolving overlay, then base, then fallback exactly the way
+    /// execution does.
+    Storage {
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+        reply: oneshot::Sender<Result<StorageValue, SessionError>>,
+    },
+    /// Read an account's deployed bytecode.
+    Code {
+        id: SessionId,
+        address: Address,
+        reply: oneshot::Sender<Result<Bytes, SessionError>>,
     },
     Basic {
         id: SessionId,
@@ -491,6 +518,35 @@ where
         rx.await.map_err(|_| SessionError::WorkerGone)?
     }
 
+    /// Read one storage slot out of `id`'s view of the chain — overlay,
+    /// then base, then the fetch fallback, the same resolution order
+    /// `basic` follows. The read-only counterpart to `set_storage`, and
+    /// what lets a caller inspect contract state (an ERC-20 `balanceOf`
+    /// entry, say) without executing a transaction.
+    pub async fn storage(
+        &self,
+        id: SessionId,
+        address: Address,
+        key: StorageKey,
+    ) -> Result<StorageValue, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Storage { id, address, key, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
+    /// Read an account's deployed bytecode in `id`'s view — empty for an
+    /// EOA. Resolved by code hash through the same overlay/base/fallback
+    /// chain execution uses, so it never reaches past the session.
+    pub async fn code(&self, id: SessionId, address: Address) -> Result<Bytes, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.worker_for(id)
+            .send(Job::Code { id, address, reply })
+            .map_err(|_| SessionError::WorkerGone)?;
+        rx.await.map_err(|_| SessionError::WorkerGone)?
+    }
+
     /// Run `tx` read-only against `id`'s session — no commit, nothing
     /// persists — with balance and base-fee checks enforced, same as
     /// `advance`. Answers "would this really work right now." See
@@ -503,6 +559,16 @@ where
     /// session's private overlay only.
     pub async fn advance(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
         self.dispatch(id, tx, true, false).await
+    }
+
+    /// Run `tx` read-only for its *return data* — `eth_call` semantics.
+    /// Like `simulate` in that nothing is committed, but balance and
+    /// base-fee checks are disabled: reading a contract shouldn't require
+    /// the caller to hold gas money, and a client asking `balanceOf` has
+    /// no signer at all. Use `simulate` instead to ask "would this
+    /// transaction really work right now."
+    pub async fn call(&self, id: SessionId, tx: TxEnv) -> Result<ExecutionResult, SessionError> {
+        self.dispatch(id, tx, false, true).await
     }
 
     /// Dry-run `tx` for a gas estimate, the same way real Ethereum nodes'
@@ -597,6 +663,26 @@ where
     }
 }
 
+/// Resolve an account's bytecode the way the EVM does: the account's own
+/// inlined code if the fallback supplied it, otherwise a lookup by code
+/// hash. `KECCAK_EMPTY` short-circuits, because asking the fallback for
+/// the empty-code hash is how an EOA read turns into a spurious
+/// `CodeMiss` error.
+fn code_of<F: Fallback>(session: &mut Session<F>, address: Address) -> Result<Bytes, SessionError> {
+    let info = Database::basic(session, address)
+        .map_err(|e| SessionError::Execution(format!("{e}")))?
+        .unwrap_or_default();
+    if let Some(code) = info.code {
+        return Ok(code.original_bytes());
+    }
+    if info.code_hash == KECCAK_EMPTY {
+        return Ok(Bytes::new());
+    }
+    Database::code_by_hash(session, info.code_hash)
+        .map(|code| code.original_bytes())
+        .map_err(|e| SessionError::Execution(format!("{e}")))
+}
+
 fn handle_job<F: Fallback>(sessions: &mut HashMap<SessionId, (Session<F>, Instant)>, job: Job<F>)
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -633,6 +719,27 @@ where
         Job::Discard { id, reply } => {
             sessions.remove(&id);
             let _ = reply.send(());
+        }
+        Job::Storage { id, address, key, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    Database::storage(session, address, key)
+                        .map_err(|e| SessionError::Execution(format!("{e}")))
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
+        }
+        Job::Code { id, address, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    *touched = Instant::now();
+                    code_of(session, address)
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
         }
         Job::Basic { id, address, reply } => {
             let result = match sessions.get_mut(&id) {
@@ -709,11 +816,20 @@ where
     };
     let mut evm = ctx.build_mainnet();
     if commit {
-        evm.transact_commit(tx).map_err(|e| SessionError::Execution(format!("{e:?}")))
+        evm.transact_commit(tx).map_err(execution_error)
     } else {
-        evm.transact(tx)
-            .map(|result_and_state| result_and_state.result)
-            .map_err(|e| SessionError::Execution(format!("{e:?}")))
+        evm.transact(tx).map(|result_and_state| result_and_state.result).map_err(execution_error)
+    }
+}
+
+/// Keeps a validation rejection typed and stringifies everything else.
+/// Database and header failures have no caller-actionable shape, so their
+/// text is all there is to report; `EVMError::Transaction` is the one that
+/// does, and it is exactly what the fee messages are built from.
+fn execution_error<DB: fmt::Debug>(error: EVMError<DB>) -> SessionError {
+    match error {
+        EVMError::Transaction(reason) => SessionError::InvalidTransaction(Box::new(reason)),
+        other => SessionError::Execution(format!("{other:?}")),
     }
 }
 
@@ -1216,12 +1332,48 @@ mod tests {
 
         mgr.set_storage(id, address, key, value).await.unwrap();
 
-        // No direct storage-read accessor exists on SessionManager today,
-        // so this only proves set_storage doesn't error and reaches the
-        // right session (the wrong-id case would surface as
-        // SessionError::Unknown from the .unwrap() above). A full
-        // write-then-read-back is covered at the forkyard-engine level
-        // (Task 3's test).
+        assert_eq!(mgr.storage(id, address, key).await.unwrap(), value);
+    }
+
+    /// A slot nobody wrote resolves through to the fallback rather than
+    /// erroring — the same overlay-then-base-then-fallback order `basic`
+    /// already follows.
+    #[tokio::test]
+    async fn storage_falls_through_to_the_fallback_for_an_untouched_slot() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+
+        let value = mgr.storage(id, Address::from([0x33; 20]), U256::from(1u64)).await.unwrap();
+
+        assert_eq!(value, U256::ZERO);
+    }
+
+    /// Reads are per-session: writing a slot in one session must not be
+    /// visible from another, the same isolation `set_balance` has.
+    #[tokio::test]
+    async fn storage_is_isolated_between_sessions() {
+        let mgr = manager();
+        let (a, b) = (mgr.fork().await.unwrap(), mgr.fork().await.unwrap());
+        let address = Address::from([0x44; 20]);
+        let key = U256::from(7u64);
+
+        mgr.set_storage(a, address, key, U256::from(42u64)).await.unwrap();
+
+        assert_eq!(mgr.storage(a, address, key).await.unwrap(), U256::from(42u64));
+        assert_eq!(mgr.storage(b, address, key).await.unwrap(), U256::ZERO);
+    }
+
+    /// `code` answers with the account's deployed bytecode, resolved the
+    /// same way execution resolves it (overlay, base, then fallback by
+    /// code hash) — what an agent needs to tell a contract from an EOA.
+    #[tokio::test]
+    async fn code_returns_empty_bytes_for_an_account_with_no_code() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+
+        let code = mgr.code(id, FUNDED).await.unwrap();
+
+        assert!(code.is_empty(), "an EOA has no code, got {} bytes", code.len());
     }
 
     #[tokio::test]
@@ -1398,5 +1550,69 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// revm rejects an underpriced transaction before executing it, and
+    /// that rejection has to survive as a *type*: surfaces build their
+    /// own advice from it (naming the basefee, the shortfall), which is
+    /// impossible once it has been flattened into a string.
+    #[tokio::test]
+    async fn an_underpriced_transaction_fails_with_a_typed_rejection() {
+        let mgr = SessionManager::new(
+            FundedFallback,
+            BlockEnv { basefee: 1_000_000_000, ..Default::default() },
+            2,
+            Duration::from_secs(60),
+        );
+        let id = mgr.fork().await.unwrap();
+
+        let tx = TxEnv::builder()
+            .caller(FUNDED)
+            .kind(TxKind::Call(Address::ZERO))
+            .gas_price(0)
+            .build_fill();
+        let error = mgr.simulate(id, tx).await.expect_err("underpriced must be rejected");
+
+        assert!(
+            matches!(
+                &error,
+                SessionError::InvalidTransaction(reason)
+                    if matches!(**reason, InvalidTransaction::GasPriceLessThanBasefee)
+            ),
+            "should keep revm's typed rejection, got {error:?}"
+        );
+    }
+
+    /// The funds rejection carries the numbers a caller needs, so a
+    /// surface can say what the sender has and what it needed without
+    /// looking anything up again.
+    #[tokio::test]
+    async fn an_unaffordable_fee_fails_with_the_balance_and_fee_attached() {
+        let mgr = SessionManager::new(
+            FundedFallback, // FUNDED holds 100 wei
+            BlockEnv { basefee: 1_000_000_000, ..Default::default() },
+            2,
+            Duration::from_secs(60),
+        );
+        let id = mgr.fork().await.unwrap();
+
+        let tx = TxEnv::builder()
+            .caller(FUNDED)
+            .kind(TxKind::Call(Address::ZERO))
+            .gas_limit(21_000)
+            .gas_price(1_000_000_000)
+            .build_fill();
+        let error = mgr.simulate(id, tx).await.expect_err("an unaffordable fee must be rejected");
+
+        match error {
+            SessionError::InvalidTransaction(reason) => match *reason {
+                InvalidTransaction::LackOfFundForMaxFee { fee, balance } => {
+                    assert_eq!(*balance, U256::from(FUNDED_BALANCE));
+                    assert_eq!(*fee, U256::from(21_000u64) * U256::from(1_000_000_000u64));
+                }
+                other => panic!("expected LackOfFundForMaxFee, got {other:?}"),
+            },
+            other => panic!("expected a typed rejection, got {other:?}"),
+        }
     }
 }

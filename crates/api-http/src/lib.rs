@@ -47,7 +47,7 @@ use axum::extract::{Path, State};
 use axum::routing::post;
 use axum::{Json, Router};
 use forkyard_session::{Fallback, SessionError, SessionId, SessionManager};
-use revm::context::result::ExecutionResult;
+use revm::context::result::{ExecutionResult, InvalidTransaction};
 use revm::context::TxEnv;
 use revm::primitives::{TxKind, U256};
 use serde::{Deserialize, Serialize};
@@ -121,6 +121,27 @@ impl From<SessionError> for RpcErrorObj {
     fn from(e: SessionError) -> Self {
         match e {
             SessionError::Unknown(id) => Self { code: -32001, message: format!("unknown or expired session {id}") },
+            // The two fee rejections are the ones a caller can actually
+            // fix, so they say how — in this surface's own terms, since a
+            // JSON-RPC client reaches for `eth_gasPrice`, not for an MCP
+            // argument. Everything else keeps revm's wording.
+            SessionError::InvalidTransaction(ref reason) => match &**reason {
+                InvalidTransaction::GasPriceLessThanBasefee => RpcErrorObj::execution(format!(
+                    "{e} - read eth_gasPrice for a valid price on this fork (it includes a \
+                     priority-fee margin over the basefee) and re-sign at that price"
+                )),
+                // revm's `fee` here is its `max_balance_spending`: the
+                // value sent *plus* gas_limit * gas_price, not the gas
+                // alone, so it is reported as the total it is.
+                InvalidTransaction::LackOfFundForMaxFee { fee, balance } => {
+                    RpcErrorObj::execution(format!(
+                        "sender holds {balance} wei but this transaction needs {fee} wei in \
+                         total - the value sent plus gas_limit * gas_price; fund it with \
+                         forkyard_setBalance, or lower the gas limit or price"
+                    ))
+                }
+                _ => RpcErrorObj::execution(e),
+            },
             other => RpcErrorObj::execution(other),
         }
     }
@@ -229,6 +250,55 @@ fn build_receipt(
     })
 }
 
+/// Every JSON-RPC method this surface implements.
+///
+/// Dispatch matches on this rather than on string literals so the
+/// compiler checks the surface is covered: a new variant that nobody
+/// handles is a build error, where a mistyped `"eth_getcode"` arm would
+/// just fall through to `method_not_found` and look like an unimplemented
+/// method. The wire names live here and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RpcMethod {
+    EthChainId,
+    EthBlockNumber,
+    EthGasPrice,
+    EthGetBalance,
+    EthGetTransactionCount,
+    EthCall,
+    EthGetStorageAt,
+    EthGetCode,
+    EthSendRawTransaction,
+    EthGetTransactionReceipt,
+    EthEstimateGas,
+    ForkyardSetBalance,
+    ForkyardSetStorageAt,
+    ForkyardForkFrom,
+    ForkyardDiscard,
+}
+
+impl RpcMethod {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "eth_chainId" => Some(Self::EthChainId),
+            "eth_blockNumber" => Some(Self::EthBlockNumber),
+            "eth_gasPrice" => Some(Self::EthGasPrice),
+            "eth_getBalance" => Some(Self::EthGetBalance),
+            "eth_getTransactionCount" => Some(Self::EthGetTransactionCount),
+            "eth_call" => Some(Self::EthCall),
+            "eth_getStorageAt" => Some(Self::EthGetStorageAt),
+            "eth_getCode" => Some(Self::EthGetCode),
+            "eth_sendRawTransaction" => Some(Self::EthSendRawTransaction),
+            "eth_getTransactionReceipt" => Some(Self::EthGetTransactionReceipt),
+            "eth_estimateGas" => Some(Self::EthEstimateGas),
+            "forkyard_setBalance" => Some(Self::ForkyardSetBalance),
+            "forkyard_setStorageAt" => Some(Self::ForkyardSetStorageAt),
+            "forkyard_forkFrom" => Some(Self::ForkyardForkFrom),
+            "forkyard_discard" => Some(Self::ForkyardDiscard),
+            _ => None,
+        }
+    }
+}
+
 /// Handles one JSON-RPC call against `session_id`'s session on the shared
 /// manager. Every real read/write goes through `SessionManager`, which
 /// routes it to whichever worker thread owns that session — nothing here
@@ -242,21 +312,25 @@ async fn dispatch<F: Fallback>(
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
+    let Some(method) = RpcMethod::parse(method) else {
+        return Err(RpcErrorObj::method_not_found(method));
+    };
+
     match method {
-        "eth_chainId" => Ok(json!(format!("0x{:x}", state.chain_id))),
+        RpcMethod::EthChainId => Ok(json!(format!("0x{:x}", state.chain_id))),
 
         // The fork's real starting block number plus this session's own
         // send-count — see module doc.
-        "eth_blockNumber" => Ok(json!(format!("0x{:x}", real_block_number(state, session_id).await))),
+        RpcMethod::EthBlockNumber => Ok(json!(format!("0x{:x}", real_block_number(state, session_id).await))),
 
         // Real base fee (from the fork's actual block) plus a fixed
         // priority-fee margin — see module doc.
-        "eth_gasPrice" => {
+        RpcMethod::EthGasPrice => {
             let gas_price = session_block_env(state, session_id).await.basefee as u64 + PRIORITY_FEE_WEI;
             Ok(json!(format!("0x{gas_price:x}")))
         }
 
-        "eth_getBalance" => {
+        RpcMethod::EthGetBalance => {
             let address = parse_address(params, 0)?;
             let balance = state
                 .manager
@@ -267,7 +341,7 @@ where
             Ok(json!(format!("0x{balance:x}")))
         }
 
-        "eth_getTransactionCount" => {
+        RpcMethod::EthGetTransactionCount => {
             let address = parse_address(params, 0)?;
             let nonce = state
                 .manager
@@ -283,7 +357,7 @@ where
         // usage doesn't get this; it exists so an RPC client can set up a
         // scenario (e.g. a freshly generated signer) without needing a
         // whale's private key.
-        "forkyard_setBalance" => {
+        RpcMethod::ForkyardSetBalance => {
             let address = parse_address(params, 0)?;
             let balance = parse_u256_hex_str(param_str(params, 1)?)?;
 
@@ -298,7 +372,7 @@ where
         // overlay only. Exists so an RPC client can fund an ERC-20
         // balance (or set up any other storage-dependent scenario)
         // without needing impersonation, which forkyard doesn't support.
-        "forkyard_setStorageAt" => {
+        RpcMethod::ForkyardSetStorageAt => {
             let address = parse_address(params, 0)?;
             let key = parse_u256_hex_str(param_str(params, 1)?)?;
             let value = parse_u256_hex_str(param_str(params, 2)?)?;
@@ -310,7 +384,7 @@ where
         // base. A method, not a `/session/{id}/fork` route: the id is already
         // this endpoint's routing key, and the result is the same
         // `{"session_id": ...}` shape `POST /session` returns.
-        "forkyard_forkFrom" => {
+        RpcMethod::ForkyardForkFrom => {
             let child = state.manager.fork_from(session_id).await?;
             // The block counter and receipts live in our side table, not the
             // session, so a branch would otherwise report a lower block than
@@ -325,7 +399,7 @@ where
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
         // surface — the HTTP-side counterpart to the `discard` MCP tool
         // (`crates/api-mcp`), which has no equivalent route here today.
-        "forkyard_discard" => {
+        RpcMethod::ForkyardDiscard => {
             state.manager.discard(session_id).await?;
             // Drop this session's block counter and receipts too. The
             // manager forgets the session, but `rpc_state` is our own
@@ -335,7 +409,7 @@ where
             Ok(json!(true))
         }
 
-        "eth_sendRawTransaction" => {
+        RpcMethod::EthSendRawTransaction => {
             let raw = parse_raw_tx(params, 0)?;
             let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
             let TxEnvelope::Legacy(signed) = &envelope else {
@@ -373,7 +447,7 @@ where
             Ok(json!(format!("{tx_hash:#x}")))
         }
 
-        "eth_getTransactionReceipt" => {
+        RpcMethod::EthGetTransactionReceipt => {
             let hash = param_str(params, 0)?.to_lowercase();
             let receipt = state
                 .rpc_state
@@ -386,10 +460,83 @@ where
             Ok(receipt)
         }
 
+        // The read path every client uses for contract state. Runs through
+        // `SessionManager::call` — no commit, and balance/basefee checks
+        // disabled, since a read shouldn't require the caller to hold gas
+        // money. A revert comes back as an RPC error carrying the revert
+        // data, which is how a client tells "returned nothing" from
+        // "failed".
+        RpcMethod::EthCall => {
+            let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
+            let from = field_str(call, "from")
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?
+                .unwrap_or_default();
+            let to = field_str(call, "to")
+                .map(|s| s.parse())
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?;
+            let value = field_str(call, "value").map(parse_u256_hex_str).transpose()?.unwrap_or_default();
+            let data = field_str(call, "data")
+                .or_else(|| field_str(call, "input"))
+                .map(|s| alloy_primitives::hex::decode(s.trim_start_matches("0x")))
+                .transpose()
+                .map_err(RpcErrorObj::invalid_params)?
+                .unwrap_or_default();
+            let gas_limit = field_str(call, "gas")
+                .map(parse_u256_hex_str)
+                .transpose()?
+                .map(|g| g.saturating_to::<u64>())
+                // Same EIP-7825 per-transaction cap `eth_estimateGas`'s
+                // dry run uses; a higher value fails validation outright.
+                .unwrap_or(ESTIMATE_GAS_LIMIT);
+
+            let tx_env = TxEnv::builder()
+                .caller(from)
+                .kind(match to {
+                    Some(addr) => TxKind::Call(addr),
+                    None => TxKind::Create,
+                })
+                .value(value)
+                .data(Bytes::from(data))
+                .gas_limit(gas_limit)
+                .gas_price(0)
+                .chain_id(Some(state.chain_id))
+                .build_fill();
+
+            let result = state.manager.call(session_id, tx_env).await?;
+            match &result {
+                ExecutionResult::Success { output, .. } => {
+                    Ok(json!(format!("0x{}", alloy_primitives::hex::encode(output.data()))))
+                }
+                ExecutionResult::Revert { output, .. } => Err(RpcErrorObj::execution(format!(
+                    "execution reverted: 0x{}",
+                    alloy_primitives::hex::encode(output)
+                ))),
+                ExecutionResult::Halt { reason, .. } => {
+                    Err(RpcErrorObj::execution(format!("execution halted: {reason:?}")))
+                }
+            }
+        }
+
+        RpcMethod::EthGetStorageAt => {
+            let address = parse_address(params, 0)?;
+            let slot = parse_u256_hex_str(param_str(params, 1)?)?;
+            let value = state.manager.storage(session_id, address, slot).await?;
+            Ok(json!(format!("0x{value:064x}")))
+        }
+
+        RpcMethod::EthGetCode => {
+            let address = parse_address(params, 0)?;
+            let code = state.manager.code(session_id, address).await?;
+            Ok(json!(format!("0x{}", alloy_primitives::hex::encode(code))))
+        }
+
         // Dry-runs the call via `simulate` (no commit) with a generous gas
         // cap and reports the actual gas used — real estimation, not a
         // fixed constant, since we already have the machinery for it.
-        "eth_estimateGas" => {
+        RpcMethod::EthEstimateGas => {
             let call = params.first().ok_or_else(|| RpcErrorObj::invalid_params("missing call object"))?;
             let from = field_str(call, "from").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?.unwrap_or_default();
             let to = field_str(call, "to").map(|s| s.parse()).transpose().map_err(RpcErrorObj::invalid_params)?;
@@ -424,8 +571,6 @@ where
             }
             Ok(json!(format!("0x{:x}", result.tx_gas_used())))
         }
-
-        other => Err(RpcErrorObj::method_not_found(other)),
     }
 }
 
@@ -1048,6 +1193,210 @@ mod tests {
         assert!(
             !state.rpc_state.lock().unwrap().contains_key(&id),
             "discarding a session must not leave its receipts/block counter behind"
+        );
+    }
+
+    /// The counter contract the MCP surface's tests use: reverts with the
+    /// word `0xbb` on empty calldata, otherwise stores the first calldata
+    /// word in slot 0 and returns it.
+    const COUNTER_RUNTIME: &str =
+        "36600e5760bb60005260206000fd5b6000358060005560005260206000f3";
+
+    fn counter_state(addr: Address) -> AppState<TestFallback> {
+        let code = alloy_primitives::hex::decode(COUNTER_RUNTIME).unwrap();
+        test_state_with_contract(addr, Bytecode::new_raw(Bytes::from(code)))
+    }
+
+    fn word_hex(n: u64) -> String {
+        format!("0x{n:064x}")
+    }
+
+    /// `eth_call` is what every client (cast, web3.py, alloy) uses to read
+    /// contract state, and README advertised it while `dispatch` answered
+    /// `method_not_found`.
+    #[tokio::test]
+    async fn eth_call_returns_the_contracts_return_data() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        let result = dispatch(
+            &state,
+            id,
+            "eth_call",
+            &[json!({ "to": contract.to_string(), "data": word_hex(42) })],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result, json!(word_hex(42)));
+    }
+
+    /// A read must not persist: `eth_call` runs through `simulate`, so the
+    /// slot the contract writes is gone the moment the call returns.
+    #[tokio::test]
+    async fn eth_call_does_not_commit_the_calls_writes() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        dispatch(&state, id, "eth_call", &[json!({ "to": contract.to_string(), "data": word_hex(42) })])
+            .await
+            .unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(contract.to_string()), json!("0x0")])
+            .await
+            .unwrap();
+        assert_eq!(slot, json!(word_hex(0)), "eth_call must not have committed");
+    }
+
+    /// A reverting call is an error, not a success with empty data — the
+    /// distinction a client needs to tell "returned nothing" from "failed".
+    #[tokio::test]
+    async fn eth_call_reports_a_revert_as_an_error() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        // Empty calldata makes the counter contract revert.
+        let result = dispatch(&state, id, "eth_call", &[json!({ "to": contract.to_string() })]).await;
+
+        let err = result.expect_err("a revert should surface as an error");
+        // Guard against passing for the wrong reason: before eth_call
+        // existed this assertion was satisfied by `method_not_found`.
+        assert_ne!(err.code, -32601, "should be a revert, not an unimplemented method: {err:?}");
+        assert!(
+            err.message.contains("revert") || err.message.contains("Revert"),
+            "error should name the revert, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eth_get_storage_at_reads_a_slot_written_by_a_transaction() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw = signed_tx_hex(
+            &sender,
+            TxKind::Call(contract),
+            0,
+            200_000,
+            alloy_primitives::hex::decode(word_hex(42).trim_start_matches("0x")).unwrap(),
+        );
+        dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)]).await.unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(contract.to_string()), json!("0x0")])
+            .await
+            .unwrap();
+
+        assert_eq!(slot, json!(word_hex(42)));
+    }
+
+    /// Reads the slot `forkyard_setStorageAt` wrote — the cheatcode had no
+    /// read-back counterpart on this surface at all.
+    #[tokio::test]
+    async fn eth_get_storage_at_reads_back_the_set_storage_cheatcode() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let address = Address::from([0x77; 20]);
+
+        dispatch(
+            &state,
+            id,
+            "forkyard_setStorageAt",
+            &[json!(address.to_string()), json!("0x5"), json!(word_hex(9))],
+        )
+        .await
+        .unwrap();
+
+        let slot = dispatch(&state, id, "eth_getStorageAt", &[json!(address.to_string()), json!("0x5")])
+            .await
+            .unwrap();
+
+        assert_eq!(slot, json!(word_hex(9)));
+    }
+
+    #[tokio::test]
+    async fn eth_get_code_returns_the_deployed_bytecode() {
+        let contract = Address::from([0xAB; 20]);
+        let state = counter_state(contract);
+        let id = state.manager.fork().await.unwrap();
+
+        let code = dispatch(&state, id, "eth_getCode", &[json!(contract.to_string())]).await.unwrap();
+
+        assert_eq!(code, json!(format!("0x{COUNTER_RUNTIME}")));
+    }
+
+    #[tokio::test]
+    async fn eth_get_code_returns_empty_for_an_account_with_no_code() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        let code = dispatch(&state, id, "eth_getCode", &[json!(Address::ZERO.to_string())]).await.unwrap();
+
+        assert_eq!(code, json!("0x"));
+    }
+
+    /// Pins the fallthrough the enum dispatch has to preserve: anything
+    /// outside the implemented surface is `method_not_found` (-32601), not
+    /// a panic and not a silent success.
+    #[tokio::test]
+    async fn an_unimplemented_method_is_method_not_found() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+
+        for method in ["eth_getLogs", "evm_snapshot", "eth_getcode", ""] {
+            let err = dispatch(&state, id, method, &[]).await.expect_err("should be rejected");
+            assert_eq!(err.code, -32601, "{method:?} should be method_not_found, got {err:?}");
+        }
+    }
+
+    /// Same typed rejection the MCP surface explains, reported in this
+    /// surface's own terms: a client here reaches for `eth_gasPrice`, not
+    /// for an MCP argument.
+    #[tokio::test]
+    async fn an_underpriced_transaction_is_rejected_with_advice() {
+        // Above the 20 gwei `signed_tx_hex` signs at.
+        let block_env = revm::context::BlockEnv { basefee: 100_000_000_000, ..Default::default() };
+        let state = test_state_with_block_env(block_env);
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw = signed_tx_hex(&sender, TxKind::Call(Address::ZERO), 0, 21_000, vec![]);
+        let err = dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)])
+            .await
+            .expect_err("an underpriced transaction must be rejected");
+
+        assert!(err.message.contains("basefee"), "should name the problem, got {err:?}");
+        assert!(
+            err.message.contains("eth_gasPrice"),
+            "should point at the method that answers it, got {err:?}"
+        );
+    }
+
+    /// The funds rejection names this surface's cheatcode, and states the
+    /// total and the gas cost as separate numbers — revm's `fee` is the
+    /// value sent plus the gas, not the gas alone.
+    #[tokio::test]
+    async fn an_unaffordable_transaction_names_the_cheatcode_that_fixes_it() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        set_balance(&state, id, sender.address(), "0x3e8").await; // 1000 wei
+
+        let raw = signed_tx_hex(&sender, TxKind::Call(Address::ZERO), 0, 21_000, vec![]);
+        let err = dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw)])
+            .await
+            .expect_err("an unaffordable transaction must be rejected");
+
+        assert!(err.message.contains("1000"), "should state what the sender holds, got {err:?}");
+        assert!(
+            err.message.contains("forkyard_setBalance"),
+            "should name the cheatcode, got {err:?}"
         );
     }
 }

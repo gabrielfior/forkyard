@@ -29,7 +29,7 @@ That starts all three surfaces on one shared cache:
   ```json
   { "mcpServers": { "forkyard": { "command": "forkyard", "env": { "RPC_URL": "https://your-mainnet-rpc" } } } }
   ```
-  Tools: `fork`, `simulate`, `advance`, `get_balance`, `set_balance`, `set_storage`, `discard`.
+  Tools: `fork`, `simulate`, `advance`, `get_balance`, `get_storage`, `get_code`, `set_balance`, `set_storage`, `discard`.
 - **MCP over HTTP** (Streamable HTTP transport), default `http://127.0.0.1:8556/mcp` (`FORKYARD_MCP_HTTP_PORT` to change the port) — for any client that isn't launching forkyard as a subprocess: a browser-based agent, a teammate's [mcp-cli](https://github.com/philschmid/mcp-cli), a client on another machine. Same tools as above. mcp-cli config:
   ```json
   { "mcpServers": { "forkyard": { "url": "http://127.0.0.1:8556/mcp" } } }
@@ -38,6 +38,8 @@ That starts all three surfaces on one shared cache:
 - **HTTP JSON-RPC**, default `http://127.0.0.1:8555` (`FORKYARD_PORT` to change it) — `POST /session` opens a session (optional body `{"block_number": N}` pins it to block N; no body means the block the process is currently on), then `POST /session/{id}` speaks normal Ethereum JSON-RPC (`eth_call`, `eth_sendRawTransaction`, etc.) against it (the `{id}` path segment selects the session). Works with `cast`, `alloy`, `web3.py`, or any wallet/client — see `python/examples` for a working `web3.py` demo.
 
 The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, but only into that session's own private overlay) → `discard()` or let the session's idle TTL expire (default 1 hour, `FORKYARD_SESSION_TTL_SECS` to change it). The real chain and the shared cache are never written to: `get_balance` after `simulate(tx)` is unchanged, after `advance(tx)` it reflects the transfer.
+
+Contract calls, not just ETH transfers: `simulate`/`advance` take `data` (`0x`-prefixed calldata) and report the call's return data in `output` — which is also where a revert's data lands, so a failed call tells you *why*. Omit `to` and the transaction becomes a deploy: `data` is the init code and the new address comes back in `contract_address`. To read contract state without executing anything, `get_storage(address, slot)` reads one raw slot and `get_code(address)` distinguishes a contract from an EOA. A misspelled or unknown argument is rejected outright rather than dropped, so a typo can't quietly turn a contract call back into a bare transfer.
 
 ## Configuration
 
@@ -56,7 +58,7 @@ The model: `fork()` → `simulate(tx)` (read-only) or `advance(tx)` (commits, bu
 
 ## Gotchas
 
-- **`gas_price` vs the fork's real basefee** — `advance`/`simulate` reject a `gas_price` below the forked block's basefee (the schema defaults it to `0`, which will fail on almost any live chain). There's no MCP tool for reading basefee — use `eth_gasPrice` on the JSON-RPC surface, running alongside MCP on the same process, which already includes a usable priority-fee margin.
+- **`gas_price` defaults to the fork's basefee** — omit it and `advance`/`simulate` price the transaction at the basefee of the block that session is pinned to, which is what makes it valid on a live chain. Pass a value explicitly to ask whether a transaction at *that* price would work, and it's still rejected below the basefee — but the error now names the basefee and the fix rather than just `GasPriceLessThanBasefee`. An explicit `0` still means literally zero, so zero-basefee forks keep costing nothing. Two consequences of pricing working: the sender needs `gas_limit * gas_price` in balance on top of the value sent (`set_balance` it), and that gas is really debited. For a priority-fee margin over the basefee, read `eth_gasPrice` off the JSON-RPC surface running alongside MCP in the same process.
 - **Nonces aren't tracked for you** — `advance`'s `nonce` defaults to `0` and isn't auto-incremented; each successful call bumps the sender's nonce by 1. A reused nonce fails with `NonceTooLow`, a skipped-ahead one with `NonceTooHigh` — neither corrupts state. Check the current value via `get_balance`, which returns `nonce` alongside `balance`.
 - **Balances aren't zeroed by default, and `set_balance` overwrites rather than credits** — an address you haven't called `set_balance` on keeps its real forked-chain balance; explicitly set every address you use (sender and receiver) for deterministic tests, and remember calling `set_balance` twice with the same value doesn't double it.
 - **Addresses aren't checksum-validated** — mixed-case (EIP-55) and lowercase hex are both accepted as the same address.
@@ -81,7 +83,7 @@ isolation changes the numbers.
 | **forkyard** | Agents need different fork blocks | one process, cost scaling with blocks not agents; Anvil needs a process per block |
 | **Anvil** | More than ~25 concurrent long-lived agents | 50 agents: **2.7 s** vs 6.3 s — forkyard's 4-thread default becomes the ceiling |
 | **Anvil** | Rewinding a single timeline | `evm_snapshot` ~**1 ms** flat at any dirty-state size; forkyard has no equivalent |
-| **Anvil** | You need the full RPC surface or cheatcodes | forkyard has no `eth_call`, `eth_getCode` or `eth_getStorageAt` |
+| **Anvil** | You need the full RPC surface or cheatcodes | forkyard covers `eth_call`, `eth_getCode` and `eth_getStorageAt`, but not tracing, logs/filters, or `evm_*` time travel |
 | **Anvil** | One agent | every forkyard advantage here begins at "more than one" |
 
 Medians of five warm runs on an Apple M3 Pro against a mainnet archive endpoint.
