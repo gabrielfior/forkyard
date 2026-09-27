@@ -39,6 +39,7 @@ repetition), which is part of why the spread column is here.
   - [Restart cost](#restart-cost)
   - [Whole-workload wall clock](#whole-workload-wall-clock)
 - [Latency pass (2026-09-26)](#latency-pass-2026-09-26)
+- [Fifty agents under a second (2026-09-27)](#fifty-agents-under-a-second-2026-09-27)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
 - [Measurement variance](#measurement-variance)
 
@@ -112,6 +113,7 @@ takes the median and spread over repeated runs and skips the warm-up for you.
 | Quota | `uv run python bench.py quota --quotas 10,50 --agents 5,25 --rpc-url $RPC_URL --out quota.csv` (add `--limit-mode reject --burst 200`) |
 | Restart | `uv run python bench.py warmstart --agents 5 --contracts 8 --rpc-url $RPC_URL --out warmstart.csv` |
 | Startup | `uv run python bench.py startup --runs 7 --rpc-url $RPC_URL --out startup.csv`; add `--binary <path> --label <name>` to compare two builds |
+| Standard workload, Rust client | `cargo run --release -p forkyard-loadgen -- --agents 1,10,50 --block-heights 25795072 --rpc-url $RPC_URL --out rs_rep1.csv` (from the repo root; `--backends forkyard` or `anvil` for one side, `--forkyard-bin` for a specific build), then `uv run python aggregate_runs.py <dir> --name rs` |
 | Resume | `uv run python bench.py resume --prefix-actions 5,20,50 --repeats 5 --rpc-url $RPC_URL --out resume.csv` |
 | Many blocks | `uv run python bench.py blocks --agents 24 --blocks 1,2,4,8 --base-block 25795072 --block-stride 1000 --rounds 2 --rpc-url $RPC_URL --out blocks.csv` |
 
@@ -399,16 +401,115 @@ first upstream fetch of each agent's fresh random addresses, which this change
 doesn't touch. The best reading is round-trip noise to the endpoint, not a
 regression, but it has not been ruled out.
 
+## Fifty agents under a second (2026-09-27)
+
+The pass above left 50 agents at 3.7 s. Breaking that run down showed three
+things in the way, and each got its own fix. Same host and endpoint as above,
+block 25795072, load average 2.8–4.8.
+
+**What was in the way.** The workload's upstream traffic is almost all fresh
+state. Every agent's signer and every transfer recipient is a brand-new random
+address, and every `approve` writes a fresh allowance slot, so about three reads
+per agent miss whatever the cache holds and take a ~160 ms Tenderly round trip.
+That part is unavoidable, for Anvil too. What wasn't unavoidable:
+
+1. **A worker waited on each of those reads, and so did every session behind
+   it.** Giving the pool 64 threads, a crude test, took 50 agents from 3.1 s to
+   1.8 s.
+2. **Each miss was found, and paid for, one at a time.** revm stops at the first
+   read it can't answer.
+3. **The Python client was the ceiling.** It was busy 1.6 s of a 1.8 s run: one
+   process, 50 threads, one core, and five HTTP calls per transaction.
+
+**What changed.**
+
+- **A worker never waits on the network.** A job runs *speculatively*: a read
+  the shared cache can't answer is recorded, answered with a placeholder (no
+  account, a zero word), and execution carries on. If anything was missing, the
+  pass is thrown away, including anything it cached, and nothing is committed.
+  The job is then parked and its keys fetched on another thread while the worker
+  serves other sessions. When the keys arrive the job runs again. Jobs for one
+  session keep their order. An upstream error, or 16 passes without converging,
+  falls back to running the job blocking, so errors still surface as errors.
+- **One round trip per pass, not per read.**
+  - Because a pass carries on past a miss, it finds most of what it needs at
+    once.
+  - A transaction's sender and recipient are read before it runs, so they are
+    found together even when validation would have stopped at the sender.
+  - Everything a pass missed goes upstream as one JSON-RPC batch (balance,
+    nonce and code per account, plus any storage slots), written into the fetch
+    backend's own cache so it is persisted like any other read.
+  - Debug logs of a 50-agent run: every resolve was **one key in one round**,
+    median 168 ms. No pass was ever wasted on a key a previous pass could have
+    found.
+- **A client that doesn't measure itself.**
+  - The HTTP surface now implements `eth_sendRawTransactionSync` (EIP-7966),
+    which puts the receipt in the reply. Anvil implements it too, so the
+    harness uses it on both backends.
+  - Chain id and gas price are fetched once per client.
+  - A transaction is now one round trip, where it was five.
+  - `run_benchmark.py --client-processes N` spreads agents over N processes.
+  - `forkyard-loadgen` is the same workload in async Rust, action for action.
+    Its RNG is a bit-exact port of CPython's, so agent *i* makes the same
+    choices in both harnesses. Same timed regions, same CSV. The one difference:
+    it polls Anvil's readiness every 10 ms instead of every 200 ms, which only
+    ever flatters Anvil.
+
+**Step by step, 50 agents** (median of five unless noted):
+
+| Build | Client | Wall clock | Client CPU |
+| --- | --- | --- | --- |
+| previous pass | Python, 1 process, old send path | 3.10 s (2.91–3.39) | 1.5 s |
+| this change | Python, 1 process, old send path | **1.66 s** (1.58–1.72) | 1.4 s |
+| this change | Python, 1 process, sync send | 1.48 s (median of 3) | 1.2 s |
+| this change | Python, 12 processes, sync send | 1.13 s (0.98–1.27) | — |
+| this change | **Rust** | **0.93 s** (0.92–1.00) | — |
+
+The second row is the forkyard change on its own, measured with the client held
+fixed: 1.9× faster. The rest is the client getting out of the way.
+
+**The standard workload through the Rust client**, both backends in the same
+pass, median of five after a discarded warm-up, 0 failed actions in any run:
+
+| Agents | forkyard | spread | anvil | spread |
+| --- | --- | --- | --- | --- |
+| 1 | **0.54 s** | 1.09× | 1.37 s | 1.13× |
+| 10 | **0.86 s** | 1.03× | 1.40 s | 1.01× |
+| 50 | **0.93 s** | 1.09× | 1.72 s | 1.12× |
+
+Four of the five 50-agent runs finished under a second; the fifth took 1.002 s.
+Anvil is faster through this client too (it was 3.9 s through the Python one).
+The client was holding both back.
+
+**The floor.** What's left is about three sequential upstream round trips per
+agent at ~160 ms each — fresh addresses and slots that no cache can have seen —
+plus the agent's own work. A slower-than-median agent sets the wall clock. Below
+this takes either fewer sequential cold reads per agent or a nearer upstream
+(Tenderly's round trip is mostly its own processing: ~20–50 ms to connect,
+~155 ms per request). Answering a fresh read *before* upstream confirms it would
+be faster and is ruled out here, since a simulator that is usually right isn't
+one.
+
+**Tried and dropped**, each A/B'd twice at 50 agents:
+- Coalescing misses from all sessions into one batch within a 2 ms window:
+  1.12–1.15 s against 1.11–1.17 s. Tenderly serves 50 concurrent small batches
+  over HTTP/2 as fast as one large one (~240 ms either way, measured with curl).
+- Pre-warming the upstream connection at startup: 1.06–1.11 s against
+  1.13–1.18 s. Within noise, and it would have put an upstream call back into the
+  zero-call warm start.
+
 ## Where Anvil is the better tool
 
-**Concurrency past a few tens of agents.** This was the clearest one, and is
-now narrower. forkyard shards sessions over `FORKYARD_NUM_WORKERS` threads, and
+**Concurrency past a few tens of agents.** This was the clearest one; since
+[the non-blocking workers](#fifty-agents-under-a-second-2026-09-27) the
+standard workload no longer shows it (50 agents: 0.93 s against 1.72 s), but
+the history is worth keeping. forkyard shards sessions over `FORKYARD_NUM_WORKERS` threads, and
 with the old default of 4 that queue was the ceiling: at 50 concurrent agents
 the standard workload took 6.34 s against Anvil's 2.72 s, and at 20
 arrivals/second forkyard's p50 was 6,233 ms against 1,181 ms. Since the
 [latency pass](#latency-pass-2026-09-26) workers default to one per core, and 50
-agents are level (3.72 s against 3.92 s). The arrivals sweep has not been re-run,
-and a fixed pool is still a ceiling Anvil's flat per-process cost doesn't have.
+agents were level (3.72 s against 3.92 s). The arrivals sweep has not been re-run
+since either change.
 
 **Rewinding one timeline.** `evm_snapshot`/`evm_revert` cost about a millisecond
 flat no matter how much state is dirty. forkyard's equivalent, snapshot then
