@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 alloy-network = "=2.3.0"
 alloy-provider = { version = "=2.3.0", features = ["reqwest"] }
+alloy-rpc-client = "2.4.1"
 alloy-rpc-types = "=2.3.0"
 dashmap = "6.2.1"
 eyre = "0.6.14"

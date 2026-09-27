@@ -3,6 +3,7 @@
 //! hand-rolling the sync-revm/async-fetch bridge. See `docs/RESEARCH.md`
 //! ("System design", layer 4, "Lazy remote fetch — not reinvented").
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
 use alloy_network::Ethereum;
@@ -14,7 +15,8 @@ use foundry_fork_db::cache::BlockchainDbMeta;
 use foundry_fork_db::{BlockchainDb, SharedBackend};
 use revm::context::BlockEnv;
 use revm::database_interface::{DatabaseRef, WrapDatabaseRef};
-use revm::primitives::{Address, B256, U256};
+use alloy_rpc_client::RpcClient;
+use revm::primitives::{keccak256, Address, Bytes, B256, KECCAK_EMPTY, U256};
 use revm::state::{AccountInfo, Bytecode};
 
 /// `foundry-fork-db`'s backend as a revm database — what `Fork` wraps.
@@ -24,6 +26,49 @@ pub type Backend = WrapDatabaseRef<SharedBackend<Ethereum, BlockEnv>>;
 /// is internally reference-counted, so cloning a `Fork` is cheap and every
 /// clone shares the same background fetch thread and cache.
 pub type Fork = ReadThrough<Backend>;
+
+/// One piece of upstream state a read needed and didn't have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum StateKey {
+    Account(Address),
+    Storage(Address, U256),
+    BlockHash(u64),
+}
+
+thread_local! {
+    /// `Some` while `speculate` runs on this thread: the misses so far.
+    static MISSES: RefCell<Option<Vec<StateKey>>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with every `ReadThrough` miss on this thread *recorded instead of
+/// fetched*: the read answers a default (no account, a zero word) at once
+/// and execution carries on, so one pass finds as many of the reads it
+/// needs as it can instead of stopping at the first. Returns what `f`
+/// returned and every key it missed. If that list isn't empty, `f`'s result
+/// was computed from made-up values and must be thrown away — along with
+/// anything the caller cached from it — then retried once the keys are
+/// resolved (`ReadThrough::resolve`). A worker thread never waits on the
+/// network this way; it moves on to another session instead.
+pub fn speculate<R>(f: impl FnOnce() -> R) -> (R, Vec<StateKey>) {
+    let outer = MISSES.with(|m| m.borrow_mut().replace(Vec::new()));
+    let result = f();
+    let mut misses = MISSES.with(|m| std::mem::replace(&mut *m.borrow_mut(), outer)).unwrap_or_default();
+    misses.sort();
+    misses.dedup();
+    (result, misses)
+}
+
+/// `true`, with `key` recorded, when this thread is speculating: the
+/// caller answers a default rather than blocking.
+fn record_miss(key: StateKey) -> bool {
+    MISSES.with(|m| match m.borrow_mut().as_mut() {
+        Some(misses) => {
+            misses.push(key);
+            true
+        }
+        None => false,
+    })
+}
 
 /// A concurrent read cache in front of a fallback, shared by every clone.
 ///
@@ -39,6 +84,21 @@ pub type Fork = ReadThrough<Backend>;
 pub struct ReadThrough<D> {
     inner: D,
     cache: Arc<ReadCache>,
+    /// Resolves many keys in one JSON-RPC batch; `None` resolves them one
+    /// inner read each (in parallel), which is what the tests' in-memory
+    /// fallbacks get.
+    batch: Option<Arc<Batcher>>,
+}
+
+/// Straight to upstream, bypassing the backend thread, for `resolve`.
+struct Batcher {
+    client: RpcClient,
+    block: BlockId,
+    /// Where the backend keeps what it fetched — written to as well, so
+    /// what a batch resolved is persisted like anything else (`cache_snapshot`).
+    db: BlockchainDb<BlockEnv>,
+    /// A batch is async; `resolve` is called from plain threads.
+    runtime: tokio::runtime::Handle,
 }
 
 #[derive(Default)]
@@ -50,7 +110,7 @@ struct ReadCache {
 
 impl<D> ReadThrough<D> {
     pub fn new(inner: D) -> Self {
-        Self { inner, cache: Arc::default() }
+        Self { inner, cache: Arc::default(), batch: None }
     }
 
     /// The wrapped fallback — for `cache_snapshot`, which reads the
@@ -60,12 +120,106 @@ impl<D> ReadThrough<D> {
     }
 }
 
+impl<D: DatabaseRef + Sync> ReadThrough<D>
+where
+    D::Error: std::fmt::Display,
+{
+    /// Fetch every key into the shared cache, blocking the calling thread
+    /// — one JSON-RPC batch for all of them when this fork has an upstream,
+    /// so a speculative pass that missed k keys costs one round trip, not k.
+    pub fn resolve(&self, keys: &[StateKey]) -> Result<(), String> {
+        let keys: Vec<StateKey> = keys.iter().copied().filter(|k| !self.is_cached(k)).collect();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        match &self.batch {
+            Some(batch) => self.resolve_batched(batch, &keys),
+            None => std::thread::scope(|scope| {
+                let reads: Vec<_> = keys.iter().map(|key| scope.spawn(move || self.read_blocking(key))).collect();
+                reads.into_iter().try_for_each(|r| r.join().map_err(|_| "resolver panicked".to_string())?)
+            }),
+        }
+    }
+
+    fn is_cached(&self, key: &StateKey) -> bool {
+        match key {
+            StateKey::Account(a) => self.cache.accounts.contains_key(a),
+            StateKey::Storage(a, i) => self.cache.storage.contains_key(&(*a, *i)),
+            StateKey::BlockHash(n) => self.cache.block_hashes.contains_key(n),
+        }
+    }
+
+    fn read_blocking(&self, key: &StateKey) -> Result<(), String> {
+        let result = match key {
+            StateKey::Account(a) => self.basic_ref(*a).map(drop),
+            StateKey::Storage(a, i) => self.storage_ref(*a, *i).map(drop),
+            StateKey::BlockHash(n) => self.block_hash_ref(*n).map(drop),
+        };
+        result.map_err(|e| e.to_string())
+    }
+
+    fn resolve_batched(&self, batch: &Batcher, keys: &[StateKey]) -> Result<(), String> {
+        let block = batch.block;
+        let mut request = batch.client.new_batch();
+        let mut accounts = Vec::new();
+        let mut slots = Vec::new();
+        let mut hashes = Vec::new();
+        fn err(e: impl std::fmt::Display) -> String {
+            e.to_string()
+        }
+        for key in keys {
+            match *key {
+                StateKey::Account(address) => accounts.push((
+                    address,
+                    request.add_call::<_, U256>("eth_getBalance", &(address, block)).map_err(err)?,
+                    request.add_call::<_, U256>("eth_getTransactionCount", &(address, block)).map_err(err)?,
+                    request.add_call::<_, Bytes>("eth_getCode", &(address, block)).map_err(err)?,
+                )),
+                StateKey::Storage(address, index) => slots.push((
+                    address,
+                    index,
+                    request.add_call::<_, U256>("eth_getStorageAt", &(address, index, block)).map_err(err)?,
+                )),
+                // No lighter call for a block hash than the whole header;
+                // rare enough to leave to the backend.
+                StateKey::BlockHash(number) => hashes.push(number),
+            }
+        }
+        batch.runtime.block_on(async {
+            request.send().await.map_err(err)?;
+            for (address, balance, nonce, code) in accounts {
+                let (balance, nonce, code) = (balance.await.map_err(err)?, nonce.await.map_err(err)?, code.await.map_err(err)?);
+                // The shape `SharedBackend` itself stores: code inline,
+                // hashed, `KECCAK_EMPTY` for none.
+                let (code_hash, code) = if code.is_empty() {
+                    (KECCAK_EMPTY, None)
+                } else {
+                    (keccak256(&code), Some(Bytecode::new_raw(code)))
+                };
+                let info = AccountInfo { balance, nonce: nonce.to::<u64>(), code_hash, code, ..Default::default() };
+                batch.db.accounts().write().insert(address, info.clone());
+                self.cache.accounts.insert(address, Some(info));
+            }
+            for (address, index, value) in slots {
+                let value = value.await.map_err(err)?;
+                batch.db.storage().write().entry(address).or_default().insert(index, value);
+                self.cache.storage.insert((address, index), value);
+            }
+            Ok::<_, String>(())
+        })?;
+        hashes.into_iter().try_for_each(|n| self.read_blocking(&StateKey::BlockHash(n)))
+    }
+}
+
 impl<D: DatabaseRef> DatabaseRef for ReadThrough<D> {
     type Error = D::Error;
 
     fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         if let Some(hit) = self.cache.accounts.get(&address) {
             return Ok(hit.clone());
+        }
+        if record_miss(StateKey::Account(address)) {
+            return Ok(None);
         }
         let info = self.inner.basic_ref(address)?;
         self.cache.accounts.insert(address, info.clone());
@@ -82,6 +236,9 @@ impl<D: DatabaseRef> DatabaseRef for ReadThrough<D> {
         if let Some(hit) = self.cache.storage.get(&(address, index)) {
             return Ok(*hit);
         }
+        if record_miss(StateKey::Storage(address, index)) {
+            return Ok(U256::ZERO);
+        }
         let value = self.inner.storage_ref(address, index)?;
         self.cache.storage.insert((address, index), value);
         Ok(value)
@@ -90,6 +247,9 @@ impl<D: DatabaseRef> DatabaseRef for ReadThrough<D> {
     fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
         if let Some(hit) = self.cache.block_hashes.get(&number) {
             return Ok(*hit);
+        }
+        if record_miss(StateKey::BlockHash(number)) {
+            return Ok(B256::ZERO);
         }
         let hash = self.inner.block_hash_ref(number)?;
         self.cache.block_hashes.insert(number, hash);
@@ -130,19 +290,32 @@ pub async fn latest_block_env(rpc_url: &str) -> eyre::Result<BlockEnv> {
 async fn fork_impl(rpc_url: &str, block: BlockId) -> eyre::Result<(Fork, BlockEnv)> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
     let block_env = block_env_from_provider_at(&provider, block).await?;
-    let fork = fork_from_provider(provider, rpc_url, block_env.clone());
+    let fork = fork_from_provider(provider, rpc_url, block_env.clone())?;
     Ok((fork, block_env))
 }
 
-fn fork_from_provider<P: Provider<Ethereum> + 'static>(provider: P, rpc_url: &str, block_env: BlockEnv) -> Fork {
+/// Must be called from inside a tokio runtime: the batcher keeps its handle.
+fn fork_from_provider<P: Provider<Ethereum> + 'static>(
+    provider: P,
+    rpc_url: &str,
+    block_env: BlockEnv,
+) -> eyre::Result<Fork> {
     let pin = BlockId::number(block_env.number.to::<u64>());
     let meta = BlockchainDbMeta::new(block_env, rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);
+    let batch = Batcher {
+        client: RpcClient::new_http(rpc_url.parse()?),
+        block: pin,
+        db: db.clone(),
+        runtime: tokio::runtime::Handle::try_current()?,
+    };
     // `pin_block: None` sends every account/storage/code read to `latest`
     // whatever block was forked, so `fork_at(url, N)` was a label on live
     // state. Two sessions at different blocks read identical state.
     let backend = SharedBackend::spawn_backend_thread(provider, db, Some(pin));
-    ReadThrough::new(WrapDatabaseRef(backend))
+    let mut fork = ReadThrough::new(WrapDatabaseRef(backend));
+    fork.batch = Some(Arc::new(batch));
+    Ok(fork)
 }
 
 /// A fork at `block_env`'s block without asking upstream for its header —
@@ -152,7 +325,7 @@ fn fork_from_provider<P: Provider<Ethereum> + 'static>(provider: P, rpc_url: &st
 /// takes a pinned warm restart from one header round trip to zero.
 pub async fn fork_with_block_env(rpc_url: &str, block_env: BlockEnv) -> eyre::Result<Fork> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    Ok(fork_from_provider(provider, rpc_url, block_env))
+    fork_from_provider(provider, rpc_url, block_env)
 }
 
 /// Fork `rpc_url` at its current head, returning both the fork itself and
@@ -297,5 +470,58 @@ mod tests {
         assert!(fork.basic_ref(address).is_err());
         assert!(fork.basic_ref(address).is_ok(), "one upstream hiccup must not poison the address for good");
         assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_speculative_miss_is_recorded_and_answered_without_the_backend() {
+        let (fork, hits) = counting(0);
+        let address = Address::with_last_byte(3);
+
+        let ((info, slot), misses) =
+            speculate(|| (fork.basic_ref(address).unwrap(), fork.storage_ref(address, U256::from(1u64)).unwrap()));
+
+        assert_eq!((info, slot), (None, U256::ZERO), "a miss answers a default at once");
+        assert_eq!(misses, vec![StateKey::Account(address), StateKey::Storage(address, U256::from(1u64))]);
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "speculating must never reach the backend");
+
+        // Nothing made up was cached: a normal read still goes upstream.
+        assert_eq!(fork.basic_ref(address).unwrap().unwrap().balance, U256::from(7u64));
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn resolving_the_misses_makes_the_next_speculative_pass_clean() {
+        let (fork, hits) = counting(0);
+        let address = Address::with_last_byte(4);
+        let (_, misses) = speculate(|| fork.basic_ref(address).unwrap());
+
+        fork.resolve(&misses).unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+
+        let (info, misses) = speculate(|| fork.basic_ref(address).unwrap());
+        assert!(misses.is_empty());
+        assert_eq!(info.unwrap().balance, U256::from(7u64));
+
+        // Already cached: resolving again costs nothing.
+        fork.resolve(&[StateKey::Account(address)]).unwrap();
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_resolve_says_so() {
+        let (fork, _) = counting(usize::MAX);
+        assert!(fork.resolve(&[StateKey::Account(Address::with_last_byte(5))]).is_err());
+    }
+
+    #[test]
+    fn speculation_is_per_thread() {
+        let (fork, hits) = counting(0);
+        let address = Address::with_last_byte(6);
+        let (_, misses) = speculate(|| {
+            // Another thread isn't speculating, so its read really happens.
+            std::thread::scope(|s| s.spawn(|| fork.basic_ref(address).unwrap()).join().unwrap())
+        });
+        assert!(misses.is_empty());
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
     }
 }

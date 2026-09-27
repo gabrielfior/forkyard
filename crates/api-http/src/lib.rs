@@ -271,6 +271,7 @@ enum RpcMethod {
     EthGetStorageAt,
     EthGetCode,
     EthSendRawTransaction,
+    EthSendRawTransactionSync,
     EthGetTransactionReceipt,
     EthEstimateGas,
     ForkyardSetBalance,
@@ -292,6 +293,7 @@ impl RpcMethod {
             "eth_getStorageAt" => Some(Self::EthGetStorageAt),
             "eth_getCode" => Some(Self::EthGetCode),
             "eth_sendRawTransaction" => Some(Self::EthSendRawTransaction),
+            "eth_sendRawTransactionSync" => Some(Self::EthSendRawTransactionSync),
             "eth_getTransactionReceipt" => Some(Self::EthGetTransactionReceipt),
             "eth_estimateGas" => Some(Self::EthEstimateGas),
             "forkyard_setBalance" => Some(Self::ForkyardSetBalance),
@@ -429,7 +431,12 @@ where
             Ok(json!(true))
         }
 
-        RpcMethod::EthSendRawTransaction => {
+        // `…Sync` is EIP-7966: the receipt in the reply, instead of a hash
+        // to poll `eth_getTransactionReceipt` with. A session executes the
+        // transaction before answering either way, so the poll was always
+        // a wasted round trip. The optional timeout parameter is ignored:
+        // nothing here is ever pending.
+        RpcMethod::EthSendRawTransaction | RpcMethod::EthSendRawTransactionSync => {
             let raw = parse_raw_tx(params, 0)?;
             let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
             let TxEnvelope::Legacy(signed) = &envelope else {
@@ -462,8 +469,11 @@ where
             let entry = guard.entry(session_id).or_default();
             entry.block_number += 1;
             let receipt = build_receipt(tx_hash, sender, tx.to, &result, real_start + entry.block_number);
-            entry.receipts.insert(format!("{tx_hash:#x}"), receipt);
+            entry.receipts.insert(format!("{tx_hash:#x}"), receipt.clone());
 
+            if method == RpcMethod::EthSendRawTransactionSync {
+                return Ok(receipt);
+            }
             Ok(json!(format!("{tx_hash:#x}")))
         }
 
@@ -909,6 +919,27 @@ mod tests {
         assert_eq!(receipt["status"], json!("0x1"));
         assert_eq!(receipt["gasUsed"], json!("0x5208"));
         assert_eq!(receipt["blockNumber"], json!("0x1"));
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_sync_answers_with_the_receipt_itself() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        let recipient = PrivateKeySigner::random().address();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw_hex = signed_transfer_hex(&sender, recipient, 100, 20_000_000_000);
+        // EIP-7966's optional second parameter, a timeout, is accepted.
+        let receipt = dispatch(&state, id, "eth_sendRawTransactionSync", &[json!(raw_hex), json!(1000)]).await.unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+        assert_eq!(receipt["gasUsed"], json!("0x5208"));
+
+        // The same receipt an ordinary send would have left to poll for.
+        let polled =
+            dispatch(&state, id, "eth_getTransactionReceipt", &[receipt["transactionHash"].clone()]).await.unwrap();
+        assert_eq!(polled, receipt);
+        assert_eq!(balance_of(&state, id, recipient).await, json!("0x64"));
     }
 
     /// Regression test for a real bug caught live via the Python

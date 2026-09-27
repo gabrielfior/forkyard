@@ -177,6 +177,17 @@ pub struct Session<F: DatabaseRef = NoFallback> {
     /// needs exactly that. Structurally shared, so a branch pays for its
     /// parent's overlay once here, as it already does in `base`.
     inherited: Inherited,
+    /// `Some` during a speculative pass (`begin_speculation`): every key
+    /// this session cached from its fallback since, so the pass can be
+    /// undone exactly — its reads may have been made-up defaults.
+    read_log: Option<Vec<ReadKey>>,
+}
+
+/// A key the overlay gained from a fallback read, not a write.
+enum ReadKey {
+    Account(Address),
+    Code(B256),
+    Storage(Address, StorageKey),
 }
 
 #[derive(Clone, Default)]
@@ -221,6 +232,50 @@ impl<F: DatabaseRef> Session<F> {
             overlay_code: HashMap::new(),
             overlay_storage: HashMap::new(),
             inherited: Inherited::default(),
+            read_log: None,
+        }
+    }
+
+    /// The fallback this session reads through — so a caller can resolve,
+    /// off this thread, what a speculative pass found missing.
+    pub fn fallback(&self) -> &F {
+        &self.fallback
+    }
+
+    /// Start logging what this session caches from its fallback. Pair
+    /// with `end_speculation`.
+    pub fn begin_speculation(&mut self) {
+        self.read_log = Some(Vec::new());
+    }
+
+    /// Stop logging; with `keep` false, forget every fallback read cached
+    /// since `begin_speculation`. Exact, because a fallback read is only
+    /// ever cached for a key the overlay didn't already hold. Writes made
+    /// in between are the caller's to not have made — commit only after a
+    /// clean pass.
+    pub fn end_speculation(&mut self, keep: bool) {
+        let Some(log) = self.read_log.take() else { return };
+        if keep {
+            return;
+        }
+        for key in log {
+            match key {
+                ReadKey::Account(address) => {
+                    self.overlay_accounts.remove(&address);
+                }
+                ReadKey::Code(hash) => {
+                    self.overlay_code.remove(&hash);
+                }
+                ReadKey::Storage(address, index) => {
+                    self.overlay_storage.remove(&(address, index));
+                }
+            }
+        }
+    }
+
+    fn log_read(&mut self, key: ReadKey) {
+        if let Some(log) = self.read_log.as_mut() {
+            log.push(key);
         }
     }
 
@@ -344,6 +399,7 @@ impl<F: DatabaseRef> Session<F> {
             overlay_code: HashMap::new(),
             overlay_storage: HashMap::new(),
             inherited,
+            read_log: None,
         }
     }
 }
@@ -387,6 +443,7 @@ where
             .map_err(SessionDbError::Fallback)?;
         if let Some(info) = &info {
             self.overlay_accounts.insert(address, info.clone());
+            self.log_read(ReadKey::Account(address));
         }
         Ok(info)
     }
@@ -401,6 +458,7 @@ where
         match self.fallback.code_by_hash_ref(code_hash) {
             Ok(code) => {
                 self.overlay_code.insert(code_hash, code.clone());
+                self.log_read(ReadKey::Code(code_hash));
                 Ok(code)
             }
             // A missing fallback (NoFallback) is the common "no code, this
@@ -424,6 +482,7 @@ where
         match self.fallback.storage_ref(address, index) {
             Ok(value) => {
                 self.overlay_storage.insert((address, index), value);
+                self.log_read(ReadKey::Storage(address, index));
                 Ok(value)
             }
             // No fallback configured / slot genuinely empty both read as
@@ -679,5 +738,26 @@ mod tests {
             b.set_account(*address, funded(1));
         }
         assert_eq!(a.state(), b.state());
+    }
+
+    #[test]
+    fn an_abandoned_speculation_forgets_its_fallback_reads_but_not_earlier_state() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let code = Bytecode::new_raw(revm::primitives::Bytes::from(vec![0x60, 0x00]));
+        let fallback = CountingCodeFallback { code: code.clone(), hits };
+        let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fallback, revm::context::BlockEnv::default());
+        let written = Address::from([0x91; 20]);
+        session.set_account(written, funded(3));
+
+        session.begin_speculation();
+        session.code_by_hash(code.hash_slow()).unwrap();
+        session.end_speculation(false);
+        assert!(session.state().code.is_empty(), "a read from an abandoned pass must not stay cached");
+        assert_eq!(session.basic(written).unwrap().unwrap().balance, revm::primitives::U256::from(3u64));
+
+        session.begin_speculation();
+        session.code_by_hash(code.hash_slow()).unwrap();
+        session.end_speculation(true);
+        assert_eq!(session.state().code.len(), 1, "a clean pass keeps what it read");
     }
 }

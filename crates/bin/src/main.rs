@@ -205,7 +205,10 @@ async fn main() -> eyre::Result<()> {
             },
             max_pinned_blocks,
         )
-        .with_snapshots(snapshots);
+        .with_snapshots(snapshots)
+        // Whatever a speculative pass missed goes upstream as one JSON-RPC
+        // batch rather than a request per key.
+        .with_resolver(|fork: &Fork, keys: &[forkyard_session::StateKey]| fork.resolve(keys));
     if let Some((_, base)) = &seeded {
         manager = manager.with_base(base.clone());
     }
