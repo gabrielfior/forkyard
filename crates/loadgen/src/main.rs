@@ -525,6 +525,8 @@ struct Args {
     backends: Vec<String>,
     out: String,
     forkyard: String,
+    /// Pause between forkyard answering and the agents starting.
+    settle: Duration,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -537,6 +539,7 @@ fn parse_args() -> Result<Args, String> {
         backends: vec!["forkyard".into(), "anvil".into()],
         out: "results.csv".into(),
         forkyard: "forkyard".into(),
+        settle: Duration::ZERO,
     };
     let list = |v: &str| v.split(',').map(|x| x.trim().parse::<u64>().map_err(|e| format!("{v}: {e}"))).collect::<Result<Vec<_>, _>>();
     let mut it = std::env::args().skip(1);
@@ -551,10 +554,11 @@ fn parse_args() -> Result<Args, String> {
             "--backends" => args.backends = value()?.split(',').map(str::to_string).collect(),
             "--out" => args.out = value()?,
             "--forkyard-bin" => args.forkyard = value()?,
+            "--settle-ms" => args.settle = Duration::from_millis(value()?.parse().map_err(|e| format!("{e}"))?),
             "-h" | "--help" => {
                 return Err("usage: forkyard-loadgen --agents 1,10,50 --block-heights 25795072 \
                             [--actions-per-agent 5] [--episodes 1] [--rpc-url URL] \
-                            [--backends forkyard,anvil] [--forkyard-bin forkyard] [--out results.csv]"
+                            [--backends forkyard,anvil] [--forkyard-bin forkyard] [--settle-ms 0] [--out results.csv]"
                     .into())
             }
             other => return Err(format!("unknown flag {other}")),
@@ -638,6 +642,7 @@ async fn main() {
                             eprintln!("{e}");
                             std::process::exit(1)
                         });
+                        tokio::time::sleep(args.settle).await;
                         let base_url = format!("http://127.0.0.1:{FORKYARD_PORT}");
                         ("forkyard", Target::Forkyard { base_url }, Some(child))
                     }

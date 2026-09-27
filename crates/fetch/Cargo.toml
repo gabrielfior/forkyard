@@ -14,6 +14,11 @@ dashmap = "6.2.1"
 eyre = "0.6.14"
 forkyard-engine = { version = "0.1.0", path = "../engine" }
 foundry-fork-db = "0.27.0"
+# Not used directly: turns on HTTP/2 for the reqwest alloy's transport
+# already uses, which alloy builds without it. Over HTTP/1.1 a burst of N
+# concurrent misses dials N TLS connections (measured: 50 agents opening at
+# once dialed 50); over HTTP/2 they share one warm connection.
+reqwest = { version = "0.13.4", default-features = false, features = ["http2"] }
 revm.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 

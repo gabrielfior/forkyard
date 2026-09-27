@@ -152,7 +152,8 @@ async fn main() -> eyre::Result<()> {
 
     // A pinned block is known before anything is fetched, so its cache can
     // be read first — and if it recorded the block env, the header fetch
-    // is skipped too: a warm pinned start makes no upstream call at all.
+    // is skipped too: a warm pinned start serves before making any upstream
+    // call (the only one is the background connection keep-alive).
     // Following the tip, the block (and so the cache file) is only known
     // once the header has been fetched.
     let pinned_cache = fork_block_number

@@ -4,7 +4,9 @@
 //! ("System design", layer 4, "Lazy remote fetch — not reinvented").
 
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use alloy_network::Ethereum;
 use alloy_provider::{Provider, ProviderBuilder};
@@ -88,6 +90,39 @@ pub struct ReadThrough<D> {
     /// inner read each (in parallel), which is what the tests' in-memory
     /// fallbacks get.
     batch: Option<Arc<Batcher>>,
+}
+
+/// How often the shared upstream connection is exercised to keep it open —
+/// well inside typical idle timeouts (reqwest's pool: 90 s). Three cheap
+/// `eth_chainId` calls a minute, process-wide.
+const KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// The one upstream client for `rpc_url` in this process, shared by every
+/// fork — the default block, pinned blocks, each re-fork at a new tip — so
+/// they all resolve over one warm, HTTP/2-multiplexed connection.
+///
+/// It's opened in the background the first time it's asked for and kept
+/// open from then on. Without that, the first burst of misses paid for the
+/// connection: 50 agents opening at once each found no connection yet and
+/// dialed their own, and every agent's first miss took ~100 ms longer
+/// than any later one. Must be called inside a tokio runtime.
+fn shared_client(rpc_url: &str) -> eyre::Result<RpcClient> {
+    static CLIENTS: OnceLock<Mutex<HashMap<String, RpcClient>>> = OnceLock::new();
+    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
+    if let Some(client) = clients.get(rpc_url) {
+        return Ok(client.clone());
+    }
+    let client = RpcClient::new_http(rpc_url.parse()?);
+    let keepalive = client.clone();
+    tokio::spawn(async move {
+        loop {
+            // A failure is harmless: the next real request dials again.
+            let _ = keepalive.request_noparams::<U256>("eth_chainId").await;
+            tokio::time::sleep(KEEPALIVE).await;
+        }
+    });
+    clients.insert(rpc_url.to_string(), client.clone());
+    Ok(client)
 }
 
 /// Straight to upstream, bypassing the backend thread, for `resolve`.
@@ -304,7 +339,7 @@ fn fork_from_provider<P: Provider<Ethereum> + 'static>(
     let meta = BlockchainDbMeta::new(block_env, rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);
     let batch = Batcher {
-        client: RpcClient::new_http(rpc_url.parse()?),
+        client: shared_client(rpc_url)?,
         block: pin,
         db: db.clone(),
         runtime: tokio::runtime::Handle::try_current()?,

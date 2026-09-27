@@ -40,6 +40,7 @@ repetition), which is part of why the spread column is here.
   - [Whole-workload wall clock](#whole-workload-wall-clock)
 - [Latency pass (2026-09-26)](#latency-pass-2026-09-26)
 - [Fifty agents under a second (2026-09-27)](#fifty-agents-under-a-second-2026-09-27)
+- [One warm HTTP/2 connection upstream (2026-09-27)](#one-warm-http2-connection-upstream-2026-09-27)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
 - [Measurement variance](#measurement-variance)
 
@@ -496,7 +497,48 @@ one.
   over HTTP/2 as fast as one large one (~240 ms either way, measured with curl).
 - Pre-warming the upstream connection at startup: 1.06–1.11 s against
   1.13–1.18 s. Within noise, and it would have put an upstream call back into the
-  zero-call warm start.
+  zero-call warm start. (Reinstated in a different form in the next section,
+  once the Rust client showed what it was actually for.)
+
+## One warm HTTP/2 connection upstream (2026-09-27)
+
+In the Rust client's 50-agent runs, every agent's `set_balance` took ~100 ms
+longer than any other miss, including its fastest runs (p10 257 ms against
+153 ms). With hyper's connection logging on, the cause was plain: **51 TLS
+connections to Tenderly in one run**, 50 of them dialed in the same
+millisecond. The shipped binary spoke HTTP/1.1. alloy builds reqwest without
+its `http2` feature, and only builds that also compiled the test and loadgen
+crates turned it on. So each of 50 concurrent requests needed a connection of
+its own.
+
+Two changes:
+- `forkyard-fetch` enables reqwest's `http2` feature.
+- Every fork in the process shares one upstream client per URL, opened in the
+  background at startup and kept open with an `eth_chainId` every 20 s.
+
+After both, the same run dials **one** connection.
+
+Interleaved A/B, 50 agents, Rust client, six pairs, 1.5 s between forkyard
+answering and the agents starting, so the connection exists, as it does in any
+process that has been up for a moment:
+
+| Build | Wall clock (median) | Range | `set_balance` p50 / p90 | `transfer` p50 |
+| --- | --- | --- | --- | --- |
+| before | 0.973 s | 0.913–1.066 s | 274 / 385 ms | 161 ms |
+| after | **0.881 s** | 0.849–1.069 s | **196 / 256 ms** | 166 ms |
+
+The standard benchmark starts agents ~10 ms after forkyard answers. There the
+change does nothing (six pairs: 1.023 s against 1.168 s, overlapping ranges
+and one 2.2 s outlier), because the burst beats the background handshake and
+dials its own connections anyway. Making those requests wait for the
+connection being opened would be slower for that first burst, and holding
+readiness until it is open would give back most of the 10 ms warm start. So the
+fix is for a process that has been running a while, which is how forkyard is
+deployed. The warm start is unchanged: ready in 10.2 ms, first read 14.2 ms.
+Its upstream call count goes from 0 to 1, the background keep-alive, made after
+the server is already serving.
+
+`forkyard-loadgen --settle-ms N` reproduces the steady-state rows.
 
 ## Where Anvil is the better tool
 
