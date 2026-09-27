@@ -24,7 +24,8 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use forkyard_engine::{BaseSnapshot, Session};
+use forkyard_engine::persist::{SnapshotInfo, SnapshotStore};
+use forkyard_engine::{BaseSnapshot, Session, SessionState};
 use revm::context::result::{EVMError, ExecutionResult, InvalidTransaction};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
@@ -136,6 +137,10 @@ pub enum SessionError {
     /// serve it, or no block-fork factory was configured. A caller error to
     /// report, not a panic to take a worker down with.
     BlockUnavailable(u64, String),
+    /// A snapshot couldn't be written or read back — no store configured,
+    /// an unknown or malformed id, a file from another chain. Carries the
+    /// store's own explanation, which already names the file.
+    Snapshot(String),
 }
 
 impl fmt::Display for SessionError {
@@ -150,6 +155,7 @@ impl fmt::Display for SessionError {
             Self::BlockUnavailable(number, reason) => {
                 write!(f, "cannot open a session at block {number}: {reason}")
             }
+            Self::Snapshot(reason) => write!(f, "snapshot: {reason}"),
         }
     }
 }
@@ -164,7 +170,16 @@ enum Job<F: DatabaseRef> {
         base: Arc<BaseSnapshot>,
         fallback: F,
         block_env: BlockEnv,
+        /// A snapshot's state to lay over the base — `resume`. `None` is
+        /// an ordinary fresh fork.
+        seed: Option<Box<SessionState>>,
         reply: oneshot::Sender<()>,
+    },
+    /// Everything `id` holds that its shared base doesn't, and the block
+    /// it holds it at — what `snapshot` writes to disk.
+    State {
+        id: SessionId,
+        reply: oneshot::Sender<Result<(Box<SessionState>, u64), SessionError>>,
     },
     /// Branch `parent` on the worker that owns it, handing the child back
     /// for `fork_from` to register. Two hops, because parent and child are
@@ -258,6 +273,9 @@ where
     /// to fetch a block says so via `BlockUnavailable`.
     block_forks: Option<Arc<dyn BlockForkFactory<F>>>,
     pinned: Mutex<PinnedBlocks<F>>,
+    /// `None` unless `with_snapshots` was called; `snapshot` and `resume`
+    /// then say so rather than guessing a directory.
+    snapshots: Option<SnapshotStore>,
 }
 
 impl<F: Fallback> SessionManager<F>
@@ -293,7 +311,14 @@ where
                 recency: Vec::new(),
                 cap: DEFAULT_MAX_PINNED_BLOCKS,
             }),
+            snapshots: None,
         }
+    }
+
+    /// Enable `snapshot` and `resume`, writing to and reading from `store`.
+    pub fn with_snapshots(mut self, store: SnapshotStore) -> Self {
+        self.snapshots = Some(store);
+        self
     }
 
     /// Enable `fork_at_block`: `factory` builds the fallback for one block,
@@ -384,16 +409,27 @@ where
     /// the actual thing this crate exists for. O(1) modulo the channel
     /// hop: no state is copied, only an `Arc` and a cheap `F` clone.
     pub async fn fork(&self) -> Result<SessionId, SessionError> {
+        self.fork_seeded(None).await
+    }
+
+    async fn fork_seeded(&self, seed: Option<Box<SessionState>>) -> Result<SessionId, SessionError> {
+        let base = self.base();
+        let fallback = self.fallback.read().unwrap().clone();
+        let block_env = self.block_env();
+        self.register(base, fallback, block_env, seed).await
+    }
+
+    async fn register(
+        &self,
+        base: Arc<BaseSnapshot>,
+        fallback: F,
+        block_env: BlockEnv,
+        seed: Option<Box<SessionState>>,
+    ) -> Result<SessionId, SessionError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
-            .send(Job::Fork {
-                id,
-                base: self.base(),
-                fallback: self.fallback.read().unwrap().clone(),
-                block_env: self.block_env(),
-                reply,
-            })
+            .send(Job::Fork { id, base, fallback, block_env, seed, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
         Ok(id)
@@ -409,6 +445,14 @@ where
     /// pinned session must survive `refresh_fallback`, which moves the
     /// default base out from under it.
     pub async fn fork_at_block(&self, block_number: u64) -> Result<SessionId, SessionError> {
+        self.fork_at_block_seeded(block_number, None).await
+    }
+
+    async fn fork_at_block_seeded(
+        &self,
+        block_number: u64,
+        seed: Option<Box<SessionState>>,
+    ) -> Result<SessionId, SessionError> {
         let (base, fallback, block_env) = {
             let cell = self.pinned.lock().unwrap().get_or_insert(block_number);
             let factory = Arc::clone(self.block_forks.as_ref().ok_or_else(|| {
@@ -426,14 +470,64 @@ where
                 .map_err(|reason| SessionError::BlockUnavailable(block_number, reason))?;
             (Arc::clone(&pinned.base), pinned.fallback.clone(), pinned.block_env.clone())
         };
+        self.register(base, fallback, block_env, seed).await
+    }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// `id`'s own state — what it wrote and what it read through, branch
+    /// ancestry included — and the block it's at. Laid over any base at
+    /// that block by `restore`, it reproduces the session.
+    pub async fn session_state(&self, id: SessionId) -> Result<(u64, SessionState), SessionError> {
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
-            .send(Job::Fork { id, base, fallback, block_env, reply })
+            .send(Job::State { id, reply })
             .map_err(|_| SessionError::WorkerGone)?;
-        rx.await.map_err(|_| SessionError::WorkerGone)?;
-        Ok(id)
+        let (state, block_number) = rx.await.map_err(|_| SessionError::WorkerGone)??;
+        Ok((block_number, *state))
+    }
+
+    /// A new session at `block_number` holding `state` — the inverse of
+    /// `session_state`. On the default base when that's the block this
+    /// manager is on, otherwise through `fork_at_block`'s pinned blocks
+    /// (so a snapshot outlives the chain tip moving on).
+    pub async fn restore(&self, block_number: u64, state: SessionState) -> Result<SessionId, SessionError> {
+        let seed = Some(Box::new(state));
+        if u64::try_from(self.block_env().number).ok() == Some(block_number) {
+            self.fork_seeded(seed).await
+        } else {
+            self.fork_at_block_seeded(block_number, seed).await
+        }
+    }
+
+    /// Write `id`'s state to the snapshot store and return its id: a few
+    /// KB for a typical session, since the shared base isn't in it. The
+    /// session itself is untouched and stays live.
+    pub async fn snapshot(&self, id: SessionId) -> Result<SnapshotInfo, SessionError> {
+        let store = self.snapshot_store()?;
+        let (block_number, state) = self.session_state(id).await?;
+        tokio::task::spawn_blocking(move || store.store(block_number, &state))
+            .await
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?
+            .map_err(|e| SessionError::Snapshot(e.to_string()))
+    }
+
+    /// Open a new session from a snapshot id `snapshot` handed out — in
+    /// this process or any other sharing the store's directory, before or
+    /// after a restart. Resuming the same id twice gives two independent
+    /// sessions, the way `fork_from` does.
+    pub async fn resume(&self, snapshot_id: &str) -> Result<SessionId, SessionError> {
+        let store = self.snapshot_store()?;
+        let snapshot_id = snapshot_id.to_string();
+        let (block_number, state) = tokio::task::spawn_blocking(move || store.load(&snapshot_id))
+            .await
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?;
+        self.restore(block_number, state).await
+    }
+
+    fn snapshot_store(&self) -> Result<SnapshotStore, SessionError> {
+        self.snapshots
+            .clone()
+            .ok_or_else(|| SessionError::Snapshot("this session manager was built without a snapshot store".to_string()))
     }
 
     /// The block one session is pinned to, not the manager's default. An
@@ -688,9 +782,26 @@ where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     match job {
-        Job::Fork { id, base, fallback, block_env, reply } => {
-            sessions.insert(id, (Session::fork(base, fallback, block_env), Instant::now()));
+        Job::Fork { id, base, fallback, block_env, seed, reply } => {
+            let session = match seed {
+                Some(state) => Session::restore(base, fallback, block_env, *state),
+                None => Session::fork(base, fallback, block_env),
+            };
+            sessions.insert(id, (session, Instant::now()));
             let _ = reply.send(());
+        }
+        Job::State { id, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    // Snapshotting counts as activity, like branching.
+                    *touched = Instant::now();
+                    u64::try_from(session.block_env().number)
+                        .map(|number| (Box::new(session.state()), number))
+                        .map_err(|_| SessionError::Execution("block number does not fit a u64".to_string()))
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
         }
         Job::Branch { parent, reply } => {
             let result = match sessions.get_mut(&parent) {
@@ -1614,5 +1725,116 @@ mod tests {
             },
             other => panic!("expected a typed rejection, got {other:?}"),
         }
+    }
+
+    /// A snapshot directory unique to one test, removed afterwards.
+    struct SnapshotDir(std::path::PathBuf);
+
+    impl SnapshotDir {
+        fn new() -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "forkyard-session-snapshots-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn store(&self) -> SnapshotStore {
+            SnapshotStore::new(&self.0, 1)
+        }
+    }
+
+    impl Drop for SnapshotDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_resumes_into_an_independent_session_with_the_same_state() {
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        let original = mgr.fork().await.unwrap();
+        let touched = Address::from([0x91; 20]);
+        fund(&mgr, original, touched, 321).await;
+        let slot = StorageKey::from(4u64);
+        mgr.set_storage(original, touched, slot, U256::from(88u64)).await.unwrap();
+
+        let info = mgr.snapshot(original).await.unwrap();
+        let resumed = mgr.resume(&info.id).await.unwrap();
+
+        assert_ne!(resumed, original);
+        assert_eq!(balance_of(&mgr, resumed, touched).await, U256::from(321));
+        assert_eq!(mgr.storage(resumed, touched, slot).await.unwrap(), U256::from(88u64));
+
+        // Independent from here on, both ways.
+        fund(&mgr, resumed, touched, 1).await;
+        assert_eq!(balance_of(&mgr, original, touched).await, U256::from(321));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_survives_the_process_that_took_it() {
+        let dir = SnapshotDir::new();
+        let touched = Address::from([0x92; 20]);
+        let id = {
+            let before = manager().with_snapshots(dir.store());
+            let session = before.fork().await.unwrap();
+            fund(&before, session, touched, 654).await;
+            before.snapshot(session).await.unwrap().id
+        };
+
+        // A fresh manager sharing only the directory — a restart.
+        let after = manager().with_snapshots(dir.store());
+        let resumed = after.resume(&id).await.unwrap();
+        assert_eq!(balance_of(&after, resumed, touched).await, U256::from(654));
+    }
+
+    #[tokio::test]
+    async fn a_branch_snapshots_with_everything_it_inherited() {
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        let parent = mgr.fork().await.unwrap();
+        let from_parent = Address::from([0x93; 20]);
+        fund(&mgr, parent, from_parent, 10).await;
+        let child = mgr.fork_from(parent).await.unwrap();
+        mgr.discard(parent).await.unwrap();
+
+        let resumed = mgr.resume(&mgr.snapshot(child).await.unwrap().id).await.unwrap();
+        assert_eq!(balance_of(&mgr, resumed, from_parent).await, U256::from(10));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_at_a_pinned_block_resumes_at_that_block() {
+        let dir = SnapshotDir::new();
+        let (mgr, _calls) = pinning_manager(DEFAULT_MAX_PINNED_BLOCKS);
+        let mgr = mgr.with_snapshots(dir.store());
+        let at_100 = mgr.fork_at_block(100).await.unwrap();
+        let written = Address::from([0x94; 20]);
+        mgr.set_account(at_100, written, AccountInfo { balance: U256::from(5), ..Default::default() })
+            .await
+            .unwrap();
+
+        let resumed = mgr.resume(&mgr.snapshot(at_100).await.unwrap().id).await.unwrap();
+
+        assert_eq!(mgr.session_block_env(resumed).await.unwrap().number, U256::from(100));
+        // Unwritten state comes from block 100's fallback, not the default's.
+        assert_eq!(watched_balance(&mgr, resumed).await, U256::from(100));
+        assert_eq!(mgr.basic(resumed, written).await.unwrap().unwrap().balance, U256::from(5));
+    }
+
+    #[tokio::test]
+    async fn snapshots_without_a_store_or_with_a_bad_id_are_errors() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+        assert!(matches!(mgr.snapshot(id).await, Err(SessionError::Snapshot(_))));
+
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        assert!(matches!(mgr.resume("not-an-id").await, Err(SessionError::Snapshot(_))));
+        assert!(matches!(mgr.resume(&"a".repeat(32)).await, Err(SessionError::Snapshot(_))));
+        assert!(matches!(mgr.snapshot(12345).await, Err(SessionError::Unknown(12345))));
     }
 }

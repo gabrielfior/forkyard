@@ -15,11 +15,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use revm::primitives::{Address, Bytes, StorageKey, StorageValue, B256, U256};
+use revm::context::BlockEnv;
+use revm::primitives::{keccak256, Address, Bytes, StorageKey, StorageValue, B256, U256};
 use revm::state::{AccountInfo, Bytecode};
 use serde::{Deserialize, Serialize};
 
-use crate::BaseSnapshot;
+use crate::{BaseSnapshot, SessionState};
 
 /// Written into every file and checked on load: a file without this tag is
 /// someone else's JSON sitting at our path, and must be refused before any
@@ -66,6 +67,9 @@ pub enum CacheError {
     /// The file describes a different chain or a different block than the
     /// one asked for.
     KeyMismatch { path: PathBuf, expected: CacheKey, found_chain_id: Option<u64>, found_block_number: Option<u64> },
+    /// Not something `SnapshotStore::store` could have handed out. Checked
+    /// before the id goes anywhere near a path: it comes from a client.
+    InvalidSnapshotId(String),
 }
 
 impl CacheError {
@@ -108,6 +112,9 @@ impl fmt::Display for CacheError {
                 describe(found_chain_id),
                 describe(found_block_number)
             ),
+            Self::InvalidSnapshotId(id) => {
+                write!(f, "{id:?} is not a snapshot id (expected {SNAPSHOT_ID_LEN} lowercase hex characters)")
+            }
         }
     }
 }
@@ -134,6 +141,39 @@ struct StoredCode {
     bytes: Bytes,
 }
 
+/// The four fields `forkyard-fetch` reads off a block header, and so the
+/// only four a `BlockEnv` built from one ever has set. Stored so a pinned
+/// restart can skip that header fetch — the one upstream call a warm start
+/// otherwise still makes.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct StoredBlockEnv {
+    number: u64,
+    timestamp: U256,
+    basefee: u64,
+    gas_limit: u64,
+}
+
+impl StoredBlockEnv {
+    fn from_env(env: &BlockEnv) -> Option<Self> {
+        Some(Self {
+            number: u64::try_from(env.number).ok()?,
+            timestamp: env.timestamp,
+            basefee: env.basefee,
+            gas_limit: env.gas_limit,
+        })
+    }
+
+    fn to_env(self) -> BlockEnv {
+        BlockEnv {
+            number: U256::from(self.number),
+            timestamp: self.timestamp,
+            basefee: self.basefee,
+            gas_limit: self.gas_limit,
+            ..Default::default()
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct CacheFile {
     /// The self-describing fields are `Option` so an absent tag gets the
@@ -155,6 +195,82 @@ struct CacheFile {
     storage: Vec<(Address, StorageKey, StorageValue)>,
     #[serde(default)]
     block_hashes: Vec<(u64, B256)>,
+    /// Absent in files written before it existed, which still load — they
+    /// just can't skip the header fetch. Additive, so no version bump.
+    #[serde(default)]
+    block_env: Option<StoredBlockEnv>,
+}
+
+/// Rebuild analyzed bytecode from stored bytes, refusing the whole file on
+/// the first blob that doesn't decode.
+fn decode_code(path: &Path, stored: Vec<StoredCode>) -> Result<Vec<(B256, Bytecode)>, CacheError> {
+    let mut code = Vec::with_capacity(stored.len());
+    for entry in stored {
+        // Undecodable code means the bytes on disk aren't what was
+        // written, so refuse the whole file rather than serve a
+        // snapshot with a hole in it.
+        let bytecode = Bytecode::new_raw_checked(entry.bytes)
+            .map_err(|e| CacheError::Malformed(path.to_path_buf(), format!("code {}: {e}", entry.hash)))?;
+        code.push((entry.hash, bytecode));
+    }
+    Ok(code)
+}
+
+/// Re-attach each account's code inline: revm only calls `code_by_hash`
+/// when `basic` returns `code: None`, so leaving it off costs a round trip
+/// per contract read.
+fn attach_code(accounts: Vec<StoredAccount>, code: &[(B256, Bytecode)]) -> Vec<(Address, AccountInfo)> {
+    let by_hash: std::collections::HashMap<B256, &Bytecode> = code.iter().map(|(h, c)| (*h, c)).collect();
+    accounts
+        .into_iter()
+        .map(|a| {
+            let info = AccountInfo {
+                balance: a.balance,
+                nonce: a.nonce,
+                code_hash: a.code_hash,
+                code: by_hash.get(&a.code_hash).map(|c| (*c).clone()),
+                ..Default::default()
+            };
+            (a.address, info)
+        })
+        .collect()
+}
+
+fn stored_account(address: &Address, info: &AccountInfo) -> StoredAccount {
+    StoredAccount { address: *address, balance: info.balance, nonce: info.nonce, code_hash: info.code_hash }
+}
+
+/// Separates concurrent temp files within a process, as the pid does
+/// between processes: two instances sharing a cache directory must not
+/// write into one temp file and rename the mixture into place.
+static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Temp file in `path`'s directory, fsync, rename over `path`. A reader
+/// sees the whole old file or the whole new one — an in-place write would
+/// leave a crash's truncated prefix as a permanently poisoned entry.
+fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+    let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    fs::create_dir_all(&dir).map_err(|e| CacheError::Io(dir.clone(), e))?;
+
+    let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!("{stem}.{}.{nonce}.tmp", std::process::id()));
+    let write = (|| -> io::Result<()> {
+        let mut handle = fs::File::create(&temp)?;
+        handle.write_all(bytes)?;
+        // Without this the rename can land before the data does: on a
+        // crash the file exists, is named correctly, and is empty.
+        handle.sync_all()
+    })();
+    if let Err(e) = write {
+        let _ = fs::remove_file(&temp);
+        return Err(CacheError::Io(temp, e));
+    }
+    if let Err(e) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(CacheError::Io(path.to_path_buf(), e));
+    }
+    Ok(())
 }
 
 /// `$HOME/.forkyard/cache` when `FORKYARD_CACHE_DIR` isn't set — alongside
@@ -168,16 +284,22 @@ pub fn default_cache_dir() -> PathBuf {
     }
 }
 
+/// `$HOME/.forkyard/snapshots` when `FORKYARD_SNAPSHOT_DIR` isn't set —
+/// beside the fork cache, not in it: clearing a cache must never delete a
+/// snapshot someone meant to come back to.
+pub fn default_snapshot_dir() -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    match home {
+        Some(home) if !home.is_empty() => PathBuf::from(home).join(".forkyard").join("snapshots"),
+        _ => std::env::temp_dir().join("forkyard-snapshots"),
+    }
+}
+
 /// A directory of cache files, one per (chain id, block number).
 #[derive(Debug, Clone)]
 pub struct ForkCache {
     dir: PathBuf,
 }
-
-/// Separates concurrent temp files within a process, as the pid does
-/// between processes: two instances sharing a cache directory must not
-/// write into one temp file and rename the mixture into place.
-static TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 impl ForkCache {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
@@ -197,6 +319,13 @@ impl ForkCache {
     /// Read back the snapshot stored for `key`, or say why it can't be
     /// trusted. Every parse and field check is an `Err`, never a panic.
     pub fn load(&self, key: CacheKey) -> Result<BaseSnapshot, CacheError> {
+        self.load_with_block_env(key).map(|(base, _)| base)
+    }
+
+    /// `load`, plus the block env the file was written with — `None` for a
+    /// file from before that was recorded. What lets a pinned restart
+    /// serve without asking upstream for a header it already had.
+    pub fn load_with_block_env(&self, key: CacheKey) -> Result<(BaseSnapshot, Option<BlockEnv>), CacheError> {
         let path = self.path_for(key);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
@@ -227,91 +356,212 @@ impl ForkCache {
                 found_block_number: file.block_number,
             });
         }
+        // An env for another block than the file's own is a corrupt file,
+        // not a usable hint: drop the hint, keep the (checked) state.
+        let block_env = file.block_env.filter(|env| env.number == key.block_number).map(StoredBlockEnv::to_env);
 
-        let mut code = Vec::with_capacity(file.code.len());
-        for entry in file.code {
-            // Undecodable code means the bytes on disk aren't what was
-            // written, so refuse the whole file rather than serve a
-            // snapshot with a hole in it.
-            let bytecode = Bytecode::new_raw_checked(entry.bytes)
-                .map_err(|e| CacheError::Malformed(path.clone(), format!("code {}: {e}", entry.hash)))?;
-            code.push((entry.hash, bytecode));
-        }
+        let code = decode_code(&path, file.code)?;
+        let accounts = attach_code(file.accounts, &code);
 
-        // Re-attach each account's code inline: revm only calls
-        // `code_by_hash` when `basic` returns `code: None`, so leaving it
-        // off costs a round trip per contract read.
-        let by_hash: std::collections::HashMap<B256, Bytecode> = code.iter().cloned().collect();
-        let accounts = file.accounts.into_iter().map(|a| {
-            let info = AccountInfo {
-                balance: a.balance,
-                nonce: a.nonce,
-                code_hash: a.code_hash,
-                code: by_hash.get(&a.code_hash).cloned(),
-                ..Default::default()
-            };
-            (a.address, info)
-        });
-
-        Ok(BaseSnapshot::from_parts(
+        let base = BaseSnapshot::from_parts(
             accounts,
             code,
             file.storage.into_iter().map(|(address, key, value)| ((address, key), value)),
             file.block_hashes,
-        ))
+        );
+        Ok((base, block_env))
     }
 
-    /// Write `snapshot` as the cache for `key`: temp file in the same
-    /// directory, fsync, rename over the target. A reader sees the whole
-    /// old file or the whole new one — an in-place write would leave a
-    /// crash's truncated prefix as a permanently poisoned entry.
+    /// Write `snapshot` as the cache for `key`, atomically.
     pub fn store(&self, key: CacheKey, snapshot: &BaseSnapshot) -> Result<(), CacheError> {
-        let path = self.path_for(key);
-        let dir = path.parent().unwrap_or(&self.dir).to_path_buf();
-        fs::create_dir_all(&dir).map_err(|e| CacheError::Io(dir.clone(), e))?;
+        self.store_inner(key, snapshot, None)
+    }
 
+    /// `store`, recording `block_env` too, so the next start at this block
+    /// can skip fetching its header (`load_with_block_env`).
+    pub fn store_with_block_env(
+        &self,
+        key: CacheKey,
+        snapshot: &BaseSnapshot,
+        block_env: &BlockEnv,
+    ) -> Result<(), CacheError> {
+        self.store_inner(key, snapshot, StoredBlockEnv::from_env(block_env))
+    }
+
+    fn store_inner(
+        &self,
+        key: CacheKey,
+        snapshot: &BaseSnapshot,
+        block_env: Option<StoredBlockEnv>,
+    ) -> Result<(), CacheError> {
+        let path = self.path_for(key);
         let file = CacheFile {
             format: Some(CACHE_FORMAT.to_string()),
             version: Some(CACHE_FORMAT_VERSION),
             chain_id: Some(key.chain_id),
             block_number: Some(key.block_number),
-            accounts: snapshot
-                .accounts()
-                .map(|(address, info)| StoredAccount {
-                    address: *address,
-                    balance: info.balance,
-                    nonce: info.nonce,
-                    code_hash: info.code_hash,
-                })
-                .collect(),
+            accounts: snapshot.accounts().map(|(address, info)| stored_account(address, info)).collect(),
             code: snapshot
                 .code()
                 .map(|(hash, bytecode)| StoredCode { hash: *hash, bytes: bytecode.original_bytes() })
                 .collect(),
             storage: snapshot.storage().map(|((address, key), value)| (*address, *key, *value)).collect(),
             block_hashes: snapshot.block_hashes().map(|(number, hash)| (*number, *hash)).collect(),
+            block_env: block_env.filter(|env| env.number == key.block_number),
         };
         let bytes = serde_json::to_vec(&file)
             .map_err(|e| CacheError::Malformed(path.clone(), e.to_string()))?;
+        write_atomically(&path, &bytes)
+    }
+}
 
-        let nonce = TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temp = dir.join(format!("{}.{}.{nonce}.tmp", key.block_number, std::process::id()));
-        let write = (|| -> io::Result<()> {
-            let mut handle = fs::File::create(&temp)?;
-            handle.write_all(&bytes)?;
-            // Without this the rename can land before the data does: on a
-            // crash the file exists, is named correctly, and is empty.
-            handle.sync_all()
-        })();
-        if let Err(e) = write {
-            let _ = fs::remove_file(&temp);
-            return Err(CacheError::Io(temp, e));
+/// Written into every session snapshot and checked on load, as
+/// `CACHE_FORMAT` is for fork caches. A different tag: the two files hold
+/// different things and must never be read as each other.
+pub const SNAPSHOT_FORMAT: &str = "forkyard-session-snapshot";
+
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 1;
+
+/// Hex characters in a snapshot id: the first 16 bytes of the file's
+/// keccak — collision-free for any realistic number of snapshots, and
+/// short enough for an agent to carry around in a prompt.
+pub const SNAPSHOT_ID_LEN: usize = 32;
+
+#[derive(Serialize, Deserialize, Default)]
+struct SnapshotFile {
+    #[serde(default)]
+    format: Option<String>,
+    #[serde(default)]
+    version: Option<u32>,
+    #[serde(default)]
+    chain_id: Option<u64>,
+    #[serde(default)]
+    block_number: Option<u64>,
+    #[serde(default)]
+    accounts: Vec<StoredAccount>,
+    #[serde(default)]
+    code: Vec<StoredCode>,
+    #[serde(default)]
+    storage: Vec<(Address, StorageKey, StorageValue)>,
+}
+
+/// What `SnapshotStore::store` wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotInfo {
+    /// Hand this back to `SnapshotStore::load` to get the state again.
+    pub id: String,
+    pub block_number: u64,
+    pub accounts: usize,
+    pub storage_slots: usize,
+    pub contracts: usize,
+    /// Size of the file on disk.
+    pub bytes: usize,
+}
+
+/// Session snapshots on disk, content-addressed: `<dir>/<chain_id>/<id>.json`,
+/// where `id` is derived from the file's own bytes. So a snapshot is
+/// immutable once written, snapshotting the same state twice writes the
+/// same file, and any process sharing `dir` can resume any id another
+/// wrote — the id *is* the handoff, no blob passes through an agent.
+#[derive(Debug, Clone)]
+pub struct SnapshotStore {
+    dir: PathBuf,
+    chain_id: u64,
+}
+
+impl SnapshotStore {
+    pub fn new(dir: impl Into<PathBuf>, chain_id: u64) -> Self {
+        Self { dir: dir.into(), chain_id }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// Where `id` lives, or `InvalidSnapshotId` for anything that isn't an
+    /// id this store could have minted — which keeps a client-supplied
+    /// string from naming any other path.
+    pub fn path_for(&self, id: &str) -> Result<PathBuf, CacheError> {
+        let valid = id.len() == SNAPSHOT_ID_LEN && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+        if !valid {
+            return Err(CacheError::InvalidSnapshotId(id.to_string()));
         }
-        if let Err(e) = fs::rename(&temp, &path) {
-            let _ = fs::remove_file(&temp);
-            return Err(CacheError::Io(path, e));
+        Ok(self.dir.join(self.chain_id.to_string()).join(format!("{id}.json")))
+    }
+
+    /// Write `state`, a session at `block_number`, and return its id.
+    pub fn store(&self, block_number: u64, state: &SessionState) -> Result<SnapshotInfo, CacheError> {
+        let file = SnapshotFile {
+            format: Some(SNAPSHOT_FORMAT.to_string()),
+            version: Some(SNAPSHOT_FORMAT_VERSION),
+            chain_id: Some(self.chain_id),
+            block_number: Some(block_number),
+            accounts: state.accounts.iter().map(|(address, info)| stored_account(address, info)).collect(),
+            code: state
+                .code
+                .iter()
+                .map(|(hash, bytecode)| StoredCode { hash: *hash, bytes: bytecode.original_bytes() })
+                .collect(),
+            storage: state.storage.iter().map(|((address, key), value)| (*address, *key, *value)).collect(),
+        };
+        let bytes = serde_json::to_vec(&file)
+            .map_err(|e| CacheError::Malformed(self.dir.clone(), e.to_string()))?;
+        let id = revm::primitives::hex::encode(&keccak256(&bytes)[..SNAPSHOT_ID_LEN / 2]);
+        let path = self.path_for(&id)?;
+
+        // Content-addressed: an existing file under this id already holds
+        // these exact bytes, so rewriting it is pure cost.
+        if !path.exists() {
+            write_atomically(&path, &bytes)?;
         }
-        Ok(())
+        Ok(SnapshotInfo {
+            id,
+            block_number,
+            accounts: state.accounts.len(),
+            storage_slots: state.storage.len(),
+            contracts: state.code.len(),
+            bytes: bytes.len(),
+        })
+    }
+
+    /// The block and state stored under `id`, checked as strictly as a
+    /// fork cache: format, version and chain must all be this store's.
+    pub fn load(&self, id: &str) -> Result<(u64, SessionState), CacheError> {
+        let path = self.path_for(id)?;
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(CacheError::Missing(path)),
+            Err(e) => return Err(CacheError::Io(path, e)),
+        };
+        let file: SnapshotFile = serde_json::from_slice(&bytes)
+            .map_err(|e| CacheError::Malformed(path.clone(), e.to_string()))?;
+
+        if file.format.as_deref() != Some(SNAPSHOT_FORMAT) {
+            return Err(CacheError::NotAForkyardCache { path, found: file.format });
+        }
+        if file.version != Some(SNAPSHOT_FORMAT_VERSION) {
+            return Err(CacheError::VersionMismatch { path, found: file.version, expected: SNAPSHOT_FORMAT_VERSION });
+        }
+        let (Some(chain_id), Some(block_number)) = (file.chain_id, file.block_number) else {
+            return Err(CacheError::Malformed(path, "snapshot names no chain or block".to_string()));
+        };
+        if chain_id != self.chain_id {
+            return Err(CacheError::KeyMismatch {
+                path,
+                expected: CacheKey::new(self.chain_id, block_number),
+                found_chain_id: Some(chain_id),
+                found_block_number: Some(block_number),
+            });
+        }
+
+        let code = decode_code(&path, file.code)?;
+        let accounts = attach_code(file.accounts, &code);
+        let state = SessionState {
+            accounts,
+            code,
+            storage: file.storage.into_iter().map(|(address, key, value)| ((address, key), value)).collect(),
+        };
+        Ok((block_number, state))
     }
 }
 
@@ -602,5 +852,132 @@ mod tests {
 
         assert!(matches!(cache.store(KEY, &snapshot), Err(CacheError::Io(..))));
         assert!(cache.load(KEY).is_err());
+    }
+
+    fn block_env() -> BlockEnv {
+        BlockEnv {
+            number: U256::from(KEY.block_number),
+            timestamp: U256::from(1_750_000_000u64),
+            basefee: 3_000_000_000,
+            gas_limit: 36_000_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_block_env_round_trips_with_the_cache() {
+        let scratch = Scratch::new();
+        let cache = scratch.cache();
+        let (snapshot, ..) = populated();
+
+        cache.store_with_block_env(KEY, &snapshot, &block_env()).unwrap();
+        let (loaded, env) = cache.load_with_block_env(KEY).unwrap();
+
+        assert_eq!(loaded.account_count(), 2);
+        assert_eq!(env, Some(block_env()), "a pinned restart needs every field the header fetch would have set");
+    }
+
+    #[test]
+    fn a_file_from_before_block_envs_were_recorded_still_loads() {
+        let scratch = Scratch::new();
+        let cache = scratch.cache();
+        let (snapshot, ..) = populated();
+        cache.store(KEY, &snapshot).unwrap();
+
+        let (loaded, env) = cache.load_with_block_env(KEY).unwrap();
+        assert_eq!(loaded.account_count(), 2);
+        assert_eq!(env, None, "no env means fetch the header, not refuse the file");
+    }
+
+    #[test]
+    fn a_block_env_for_another_block_is_never_served() {
+        let scratch = Scratch::new();
+        let cache = scratch.cache();
+        let (snapshot, ..) = populated();
+        let mut wrong = block_env();
+        wrong.number = U256::from(KEY.block_number + 1);
+
+        cache.store_with_block_env(KEY, &snapshot, &wrong).unwrap();
+        assert_eq!(cache.load_with_block_env(KEY).unwrap().1, None);
+    }
+
+    fn session_state() -> SessionState {
+        let (_, eoa, contract, code) = populated();
+        SessionState {
+            accounts: vec![
+                (eoa, AccountInfo { balance: U256::from(9u64), nonce: 3, ..Default::default() }),
+                (contract, AccountInfo { code_hash: code.hash_slow(), code: None, ..Default::default() }),
+            ],
+            code: vec![(code.hash_slow(), code)],
+            storage: vec![((contract, StorageKey::from(5u64)), StorageValue::from(6u64))],
+        }
+    }
+
+    #[test]
+    fn a_session_snapshot_round_trips_with_code_reattached() {
+        let scratch = Scratch::new();
+        let store = SnapshotStore::new(&scratch.0, 1);
+        let state = session_state();
+
+        let info = store.store(KEY.block_number, &state).unwrap();
+        assert_eq!(info.id.len(), SNAPSHOT_ID_LEN);
+        assert_eq!((info.accounts, info.storage_slots, info.contracts), (2, 1, 1));
+
+        let (block_number, loaded) = store.load(&info.id).unwrap();
+        assert_eq!(block_number, KEY.block_number);
+        assert_eq!(loaded.accounts[0].1.balance, U256::from(9u64));
+        assert_eq!(loaded.storage, state.storage);
+        assert!(loaded.accounts[1].1.code.is_some(), "a restored contract must carry its code inline");
+    }
+
+    #[test]
+    fn the_same_state_gets_the_same_id_and_other_blocks_do_not() {
+        let scratch = Scratch::new();
+        let store = SnapshotStore::new(&scratch.0, 1);
+        let a = store.store(KEY.block_number, &session_state()).unwrap();
+        let b = store.store(KEY.block_number, &session_state()).unwrap();
+        let other_block = store.store(KEY.block_number + 1, &session_state()).unwrap();
+        assert_eq!(a.id, b.id);
+        assert_ne!(a.id, other_block.id);
+    }
+
+    #[test]
+    fn a_snapshot_id_cannot_name_a_path() {
+        let scratch = Scratch::new();
+        let store = SnapshotStore::new(&scratch.0, 1);
+        for id in ["../../etc/passwd", "", "ABCDEF00ABCDEF00ABCDEF00ABCDEF00", &"a".repeat(33)] {
+            assert!(
+                matches!(store.load(id), Err(CacheError::InvalidSnapshotId(_))),
+                "{id:?} must be refused before it reaches the filesystem"
+            );
+        }
+        assert!(store.load(&"a".repeat(SNAPSHOT_ID_LEN)).unwrap_err().is_missing());
+    }
+
+    #[test]
+    fn a_snapshot_from_another_chain_is_refused() {
+        let scratch = Scratch::new();
+        let info = SnapshotStore::new(&scratch.0, 1).store(KEY.block_number, &session_state()).unwrap();
+
+        // Same file in chain 137's directory, as a copy would leave it.
+        let polygon = SnapshotStore::new(&scratch.0, 137);
+        let target = polygon.path_for(&info.id).unwrap();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(SnapshotStore::new(&scratch.0, 1).path_for(&info.id).unwrap(), &target).unwrap();
+
+        assert!(matches!(polygon.load(&info.id), Err(CacheError::KeyMismatch { .. })));
+    }
+
+    #[test]
+    fn a_fork_cache_is_not_a_session_snapshot() {
+        let scratch = Scratch::new();
+        let cache = scratch.cache();
+        let (snapshot, ..) = populated();
+        cache.store(KEY, &snapshot).unwrap();
+
+        let store = SnapshotStore::new(&scratch.0, 1);
+        let id = "0".repeat(SNAPSHOT_ID_LEN);
+        fs::copy(cache.path_for(KEY), store.path_for(&id).unwrap()).unwrap();
+        assert!(matches!(store.load(&id), Err(CacheError::NotAForkyardCache { .. })));
     }
 }

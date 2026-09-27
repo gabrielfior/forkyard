@@ -28,6 +28,7 @@ endpoints only do that on a paid tier.
 | `bench_architecture.py` | `branching`, `checkpoint`, `writers` |
 | `bench_load.py` | `arrivals`, `freshness`, `quota` |
 | `bench_cache.py` | `warmstart`, `blocks` |
+| `bench_latency.py` | `startup`, `resume` |
 | `bench_common.py` | process lifecycle, port allocation, RSS sampling, percentiles, CSV output |
 | `run_benchmark.py` | the standard agent-workload sweep (its own CLI) |
 | `agent.py`, `actions.py`, `backend.py`, `contracts.py` | the workload itself |

@@ -9,6 +9,9 @@
 //! optional `{"block_number": N}` body pins the session to block N, each
 //! height fetched once and shared; `forkyard_forkFrom` opens one from
 //! *this* session's current state instead of the shared base.
+//! `forkyard_snapshot` saves a session to disk and answers with an id, and
+//! `{"snapshot_id": "…"}` as the `POST /session` body reopens it — in this
+//! process or a later one.
 //!
 //! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
 //! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
@@ -273,6 +276,7 @@ enum RpcMethod {
     ForkyardSetBalance,
     ForkyardSetStorageAt,
     ForkyardForkFrom,
+    ForkyardSnapshot,
     ForkyardDiscard,
 }
 
@@ -293,6 +297,7 @@ impl RpcMethod {
             "forkyard_setBalance" => Some(Self::ForkyardSetBalance),
             "forkyard_setStorageAt" => Some(Self::ForkyardSetStorageAt),
             "forkyard_forkFrom" => Some(Self::ForkyardForkFrom),
+            "forkyard_snapshot" => Some(Self::ForkyardSnapshot),
             "forkyard_discard" => Some(Self::ForkyardDiscard),
             _ => None,
         }
@@ -394,6 +399,21 @@ where
                 guard.insert(child, inherited);
             }
             Ok(json!({ "session_id": child }))
+        }
+
+        // What `snapshot` writes is the session's state, not this crate's
+        // side table: a resumed session starts its synthetic block counter
+        // and receipt log afresh, as `POST /session` does.
+        RpcMethod::ForkyardSnapshot => {
+            let info = state.manager.snapshot(session_id).await?;
+            Ok(json!({
+                "snapshot_id": info.id,
+                "block_number": info.block_number,
+                "accounts": info.accounts,
+                "storage_slots": info.storage_slots,
+                "contracts": info.contracts,
+                "bytes": info.bytes,
+            }))
         }
 
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
@@ -578,9 +598,14 @@ where
 /// because the common request is a bodyless POST meaning "a session at
 /// whatever block this server is on."
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct OpenSessionRequest {
     #[serde(default)]
     block_number: Option<u64>,
+    /// Reopen a `forkyard_snapshot` instead of forking fresh. Carries its
+    /// own block, so it can't be combined with `block_number`.
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 /// Opens a session, honouring an optional `{"block_number": N}` body.
@@ -600,9 +625,13 @@ where
         }
     };
 
-    let opened = match request.block_number {
-        Some(number) => state.manager.fork_at_block(number).await,
-        None => state.manager.fork().await,
+    let opened = match (request.block_number, request.snapshot_id) {
+        (Some(_), Some(_)) => {
+            return json!({ "error": "a snapshot carries its own block: pass snapshot_id or block_number, not both" })
+        }
+        (None, Some(snapshot_id)) => state.manager.resume(&snapshot_id).await,
+        (Some(number), None) => state.manager.fork_at_block(number).await,
+        (None, None) => state.manager.fork().await,
     };
     match opened {
         Ok(id) => json!({ "session_id": id }),
@@ -1398,5 +1427,32 @@ mod tests {
             err.message.contains("forkyard_setBalance"),
             "should name the cheatcode, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reopens_through_post_session() {
+        let dir = std::env::temp_dir().join(format!("forkyard-http-snapshots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = SessionManager::new(TestFallback::default(), revm::context::BlockEnv::default(), 1, Duration::from_secs(60))
+            .with_snapshots(forkyard_engine::persist::SnapshotStore::new(&dir, 1));
+        let state = AppState { manager: Arc::new(manager), chain_id: 1, rpc_state: Mutex::new(HashMap::new()) };
+
+        let original = opened_id(&open_session(&state, b"").await);
+        let funded = Address::from([0x77; 20]);
+        set_balance(&state, original, funded, "0x99").await;
+        let info = dispatch(&state, original, "forkyard_snapshot", &[]).await.unwrap();
+        let snapshot_id = info["snapshot_id"].as_str().unwrap();
+        dispatch(&state, original, "forkyard_discard", &[]).await.unwrap();
+
+        let body = serde_json::to_vec(&json!({ "snapshot_id": snapshot_id })).unwrap();
+        let resumed = opened_id(&open_session(&state, &body).await);
+        assert_eq!(balance_of(&state, resumed, funded).await, json!("0x99"));
+
+        let both = serde_json::to_vec(&json!({ "snapshot_id": snapshot_id, "block_number": 5 })).unwrap();
+        assert!(open_session(&state, &both).await["error"].as_str().unwrap().contains("not both"));
+
+        let unknown = open_session(&state, br#"{"snapshot_id": "0123456789abcdef0123456789abcdef"}"#).await;
+        assert!(unknown.get("session_id").is_none(), "an unknown id must not open a fresh session");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

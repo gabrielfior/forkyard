@@ -761,18 +761,30 @@ def test_measure_anvil_records_a_failed_snapshot_without_reverting_a_stale_id(mo
     assert ("evm_revert", ["0x1"]) not in manager.calls
 
 
-def test_measure_forkyard_times_a_branch_off_the_base_and_its_discard(monkeypatch):
+def test_measure_forkyard_times_a_branch_its_discard_and_a_snapshot_round_trip(monkeypatch):
     opened: list[str] = []
     discarded: list[str] = []
+    snapshots: list[str] = []
+    resumed: list[str] = []
+
+    class FakeManager:
+        def request_blocking(self, method, params):
+            assert method == "forkyard_snapshot"
+            snapshots.append(method)
+            return {"snapshot_id": f"{len(snapshots):032x}", "bytes": 1234}
+
+    class FakeWeb3:
+        manager = FakeManager()
 
     class FakeForkyard:
         def __init__(self, session_url=None, *, base_url=None):
             self.session_url = session_url or f"{base_url}/session/base"
-            self.stored: list[tuple[str, str, str]] = []
 
         def set_storage(self, address, slot, value):
-            self.stored.append((address, slot, value))
             dirty_writes.append(slot)
+
+        def web3(self):
+            return FakeWeb3()
 
         def discard(self):
             discarded.append(self.session_url)
@@ -783,19 +795,37 @@ def test_measure_forkyard_times_a_branch_off_the_base_and_its_discard(monkeypatc
         opened.append(base_url)
         return f"{base_url}/session/{len(opened)}"
 
+    class FakeResponse:
+        def __init__(self, body):
+            self._body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._body
+
+    def fake_post(url, json=None, timeout=None):
+        resumed.append(json["snapshot_id"])
+        return FakeResponse({"session_id": 100 + len(resumed)})
+
     monkeypatch.setattr(bench_architecture, "ForkyardBackend", FakeForkyard)
     monkeypatch.setattr(bench_architecture, "open_forkyard_session", fake_open)
+    monkeypatch.setattr(bench_architecture.requests, "post", fake_post)
 
     samples = measure_forkyard("http://127.0.0.1:18600", state_size=4, repeats=3)
 
-    assert [s.operation for s in samples] == ["fork", "discard"] * 3
+    assert [s.operation for s in samples] == ["fork", "discard", "snapshot", "resume"] * 3
     assert all(s.ok for s in samples), [s.error for s in samples]
-    # Every forkyard row is blob-free by construction: branching off the
-    # shared base serializes nothing, which is the whole claim.
-    assert all(s.blob_bytes == 0 for s in samples)
-    assert len(dirty_writes) == 4, "the dirty session must be written before forking"
+    # Branching off the shared base serializes nothing; a snapshot is the
+    # one forkyard operation with a blob, and its size is reported.
+    assert all(s.blob_bytes == 0 for s in samples if s.operation in ("fork", "discard"))
+    assert all(s.blob_bytes == 1234 for s in samples if s.operation in ("snapshot", "resume"))
+    assert len(dirty_writes) == 4 + 3, "the dirty writes, then one fresh slot per snapshot"
+    assert len(set(dirty_writes)) == len(dirty_writes), "each snapshot must be of new state"
     assert len(opened) == 3, "one fresh session per repeat"
-    assert len(discarded) == 4, "three branched sessions plus the dirty base"
+    assert resumed == [f"{n:032x}" for n in (1, 2, 3)], "each resume reopens the snapshot just taken"
+    assert len(discarded) == 7, "three branched, three resumed, plus the dirty base"
 
 
 def test_measure_forkyard_does_not_discard_a_session_it_failed_to_open(monkeypatch):
@@ -859,7 +889,7 @@ def test_cli_help_says_what_is_being_compared(monkeypatch, capsys):
     # rather than on wherever the terminal width happened to break a line.
     help_text = " ".join(capsys.readouterr().out.split())
     assert "anvil_dumpState" in help_text
-    assert "forkyard has no snapshot RPC" in help_text
+    assert "forkyard_snapshot" in help_text
 
 
 def test_checkpoint_cli_refuses_to_run_without_an_endpoint(monkeypatch, capsys):

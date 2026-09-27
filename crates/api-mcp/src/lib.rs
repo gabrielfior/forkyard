@@ -1,8 +1,9 @@
 //! The production surface: an MCP server exposing `fork` / `simulate` /
 //! `advance` / `discard`, the reads `get_balance` / `get_storage` /
-//! `get_code`, and the same `set_balance` and `set_storage` test
-//! cheatcodes `forkyard-api-http` has, as tools backed directly by a
-//! `forkyard-session::SessionManager`.
+//! `get_code`, the same `set_balance` and `set_storage` test
+//! cheatcodes `forkyard-api-http` has, and `snapshot` / `resume` for
+//! saving a session to disk and reopening it later, as tools backed
+//! directly by a `forkyard-session::SessionManager`.
 //!
 //! `simulate` and `advance` carry `data`, so they express a contract call
 //! rather than only an ETH transfer, and answer with the call's return
@@ -66,6 +67,13 @@ fn parse_u256_hex(s: &str) -> Result<U256, ErrorData> {
 struct SessionArgs {
     /// Session id returned by `fork`.
     session_id: SessionId,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ResumeArgs {
+    /// Snapshot id returned by `snapshot`.
+    snapshot_id: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -291,6 +299,21 @@ where
     #[tool(description = "Run a transfer and commit the diff into this session's private overlay only. Never broadcasts to the real chain.")]
     async fn advance(&self, Parameters(args): Parameters<TransferArgs>) -> Result<CallToolResult, ErrorData> {
         run_transfer(&self.manager, args, true).await
+    }
+
+    #[tool(description = "Save a session's current state to disk and return a short snapshot_id. The session stays live. Pass the id to `resume` — later, after a restart, or from another agent — to reopen that exact state as a new, independent session, without replaying the transactions that built it.")]
+    async fn snapshot(&self, Parameters(args): Parameters<SessionArgs>) -> Result<CallToolResult, ErrorData> {
+        let info = self.manager.snapshot(args.session_id).await.map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
+            "{{\"snapshot_id\":\"{}\",\"block_number\":{},\"accounts\":{},\"storage_slots\":{},\"contracts\":{},\"bytes\":{}}}",
+            info.id, info.block_number, info.accounts, info.storage_slots, info.contracts, info.bytes
+        ))]))
+    }
+
+    #[tool(description = "Open a new session from a snapshot_id returned by `snapshot`, at the block the snapshot was taken. Returns the new session_id. Resuming one id twice gives two independent sessions.")]
+    async fn resume(&self, Parameters(args): Parameters<ResumeArgs>) -> Result<CallToolResult, ErrorData> {
+        let id = self.manager.resume(&args.snapshot_id).await.map_err(tool_err)?;
+        Ok(CallToolResult::success(vec![ContentBlock::text(id.to_string())]))
     }
 
     #[tool(description = "Discard a session ahead of its TTL. Not required — an idle session expires on its own — but available once a caller knows it's done.")]
@@ -545,7 +568,7 @@ mod tests {
 
         let tools = client.list_tools(None).await.expect("tools/list should succeed");
         let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
-        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard"] {
+        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard", "snapshot", "resume"] {
             assert!(names.contains(&expected), "missing tool {expected:?}, got {names:?}");
         }
 
@@ -607,7 +630,7 @@ mod tests {
 
         let tools = client.list_tools(None).await.expect("tools/list should succeed");
         let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
-        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard"] {
+        for expected in ["fork", "get_balance", "set_balance", "set_storage", "simulate", "advance", "discard", "snapshot", "resume"] {
             assert!(names.contains(&expected), "missing tool {expected:?}, got {names:?}");
         }
 
@@ -1335,5 +1358,64 @@ mod tests {
 
         client.cancel().await.expect("cancel");
         task.await.expect("server task").expect("server");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_resume_round_trip_a_session_over_mcp() {
+        let dir = std::env::temp_dir().join(format!("forkyard-mcp-snapshots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = Arc::new(
+            SessionManager::new(TestFallback, revm::context::BlockEnv::default(), 1, Duration::from_secs(60))
+                .with_snapshots(forkyard_engine::persist::SnapshotStore::new(&dir, 1)),
+        );
+        let server = ForkyardMcpServer::new(manager);
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            server.serve(server_io).await?.waiting().await?;
+            eyre::Result::<()>::Ok(())
+        });
+        let client = NullClient.serve(client_io).await.expect("client should connect");
+
+        let session_id: u64 =
+            text_of(&client.call_tool(call("fork", serde_json::json!({}))).await.expect("fork")).parse().unwrap();
+        let funded = Address::from([0x66; 20]);
+        client
+            .call_tool(call(
+                "set_balance",
+                serde_json::json!({ "session_id": session_id, "address": funded.to_string(), "balance": "0x2a" }),
+            ))
+            .await
+            .expect("set_balance");
+
+        let snapshot = client
+            .call_tool(call("snapshot", serde_json::json!({ "session_id": session_id })))
+            .await
+            .expect("snapshot");
+        let info: serde_json::Value = serde_json::from_str(text_of(&snapshot)).unwrap();
+        let snapshot_id = info["snapshot_id"].as_str().unwrap().to_string();
+
+        // The original is gone; the snapshot is all that's left of it.
+        client.call_tool(call("discard", serde_json::json!({ "session_id": session_id }))).await.expect("discard");
+
+        let resumed: u64 = text_of(
+            &client.call_tool(call("resume", serde_json::json!({ "snapshot_id": snapshot_id }))).await.expect("resume"),
+        )
+        .parse()
+        .unwrap();
+        let balance = client
+            .call_tool(call(
+                "get_balance",
+                serde_json::json!({ "session_id": resumed, "address": funded.to_string() }),
+            ))
+            .await
+            .expect("get_balance");
+        assert!(text_of(&balance).contains("\"balance\":\"0x2a\""), "{}", text_of(&balance));
+
+        let bad = client.call_tool(call("resume", serde_json::json!({ "snapshot_id": "../../etc/passwd" }))).await;
+        assert!(bad.is_err(), "a malformed id must be refused, not resolved to a path");
+
+        client.cancel().await.expect("cancel");
+        task.await.expect("server task").expect("server");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

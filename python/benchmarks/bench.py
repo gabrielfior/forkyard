@@ -10,6 +10,7 @@ import sys
 
 from bench_architecture import branching_main, checkpoint_main, writers_main
 from bench_cache import blocks_main, warmstart_main
+from bench_latency import resume_main, startup_main
 from bench_load import arrivals_main, freshness_main, quota_main
 
 COMMANDS = {
@@ -21,6 +22,8 @@ COMMANDS = {
     "quota": (quota_main, "sustainable agents under a provider rate limit"),
     "warmstart": (warmstart_main, "restart cost, cold against warm"),
     "blocks": (blocks_main, "agents spread across many fork blocks"),
+    "startup": (startup_main, "spawn to first session and first read, cold then warm"),
+    "resume": (resume_main, "reopen a saved session vs replay the actions that built it"),
 }
 
 

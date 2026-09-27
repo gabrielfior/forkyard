@@ -38,6 +38,7 @@ repetition), which is part of why the spread column is here.
   - [Many blocks in one process](#many-blocks-in-one-process)
   - [Restart cost](#restart-cost)
   - [Whole-workload wall clock](#whole-workload-wall-clock)
+- [Latency pass (2026-09-26)](#latency-pass-2026-09-26)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
 - [Measurement variance](#measurement-variance)
 
@@ -110,6 +111,8 @@ takes the median and spread over repeated runs and skips the warm-up for you.
 | Freshness | `uv run python bench.py freshness --agents 5,25 --duration 120 --refresh-secs 30 --poll-secs 4 --anvil-base-port 21000 --rpc-url $RPC_URL --out freshness.csv` |
 | Quota | `uv run python bench.py quota --quotas 10,50 --agents 5,25 --rpc-url $RPC_URL --out quota.csv` (add `--limit-mode reject --burst 200`) |
 | Restart | `uv run python bench.py warmstart --agents 5 --contracts 8 --rpc-url $RPC_URL --out warmstart.csv` |
+| Startup | `uv run python bench.py startup --runs 7 --rpc-url $RPC_URL --out startup.csv`; add `--binary <path> --label <name>` to compare two builds |
+| Resume | `uv run python bench.py resume --prefix-actions 5,20,50 --repeats 5 --rpc-url $RPC_URL --out resume.csv` |
 | Many blocks | `uv run python bench.py blocks --agents 24 --blocks 1,2,4,8 --base-block 25795072 --block-stride 1000 --rounds 2 --rpc-url $RPC_URL --out blocks.csv` |
 
 Each command writes to `--out`; some also write a `.summary.csv` sibling, and
@@ -223,7 +226,9 @@ to its siblings and its parent.
 
 **Anvil's `evm_snapshot`/`evm_revert` are excellent and this says so**: about a
 millisecond flat, regardless of how much state is dirty. To rewind a single
-timeline that is the right primitive, and forkyard has nothing better.
+timeline that is the right primitive, and forkyard's own — `forkyard_snapshot`
+then `POST /session {"snapshot_id"}`, below — is slower, because it writes a
+file rather than keeping a checkpoint in memory.
 
 What grows with state is the serializing path, `anvil_dumpState`/`loadState`:
 
@@ -237,6 +242,21 @@ Dump and load grow with dirty state; snapshot, revert and forkyard's branch do
 not. The branch and the dump are not the same operation — forkyard's branch
 never carries the writes — so compare the shape of each column, flat against
 growing, rather than the milliseconds.
+
+`forkyard_snapshot` *is* the same operation as a dump: it carries the writes,
+and it grows with them. Re-run 2026-09-26 (median of five, same host, load
+average ~10), both tools in one pass:
+
+| Dirty slots | forkyard snapshot | forkyard resume | snapshot file | anvil dump | anvil load | blob | anvil snapshot / revert |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 100 | 3.3 ms | 1.7 ms | 6.4 KB | 0.8 ms | 0.7 ms | 3.3 KB | 0.6 / 0.6 ms |
+| 1,000 | 4.6 ms | 1.9 ms | 63 KB | 2.2 ms | 2.8 ms | 8.4 KB | 1.2 / 1.4 ms |
+| 10,000 | 9.5 ms | 6.9 ms | 642 KB | 6.2 ms | 8.3 ms | 56 KB | 1.4 / 1.3 ms |
+
+Anvil wins this table. Its blob is compressed and forkyard's JSON is not (about
+64 bytes a slot), and a forkyard snapshot is fsynced to disk before it answers —
+most of its 3 ms floor. What that buys is in the next section: the snapshot
+outlives the process, and any process sharing the directory can resume it by id.
 
 ### Many blocks in one process
 
@@ -300,20 +320,101 @@ The pattern across all three: forkyard is ahead while its worker pool is not the
 constraint — single agents, churn, arrivals up to ~5/s — and behind once it is.
 At 50 concurrent agents and at 20 arrivals/s, Anvil's flat per-process cost wins.
 
+## Latency pass (2026-09-26)
+
+Three changes aimed at start time and per-call latency, each measured against
+the build before it (`main` at `63957c6`) in the same session, on the same
+Apple M3 Pro (12 cores), same Tenderly archive endpoint, block 25795072. The
+host was busy — load average 8.3–10.8 throughout — so the spreads matter.
+
+**1. A pinned warm start makes no upstream call.** The persisted cache now
+records the block's header fields. With `FORKYARD_FORK_BLOCK_NUMBER` set, a warm
+start reads the cache before touching the network and skips the header fetch
+that used to be its one remaining upstream call. `bench.py startup`, spawn to
+first usable session and to one contract read, seven warm runs after one cold:
+
+| Build | Ready (median) | Range | First read | Upstream calls |
+| --- | --- | --- | --- | --- |
+| main | 208.0 ms | 192–257 ms | 214.4 ms | 1 |
+| this branch | **11.5 ms** | 8.5–14.9 ms | **19.6 ms** | **0** |
+
+Cold starts are unchanged (~0.9 s to ready, 21 upstream calls). Following the
+tip instead of pinning still costs the one header fetch, since the block — and so
+the cache file — isn't known until it's back.
+
+Rewriting the cache in a binary format was the other half of the plan and was
+dropped after measuring: loading the real 1.6 MB cache file for this block takes
+**2.6 ms** as JSON (`cargo run --release -p forkyard-engine --example
+bench_cache_load -- ~/.forkyard/cache 1 25795072`), about a quarter of the new
+warm start, and not worth a format migration.
+
+**2. Sessions save to disk and resume in under a millisecond.**
+`forkyard_snapshot` / `POST /session {"snapshot_id"}` (MCP: `snapshot` /
+`resume`). `bench.py resume` builds a session with N real actions (funding, DAI
+approvals, Uniswap V2 swaps, transfers — each a signed transaction waited to
+receipt), then times getting back to that state three ways. Every resumed
+session's marker balance is checked; all 45 resumes were correct.
+
+| Actions N | Replay on a fresh session | Snapshot | Resume, same process | Resume after restart |
+| --- | --- | --- | --- | --- |
+| 5 | 23.0 ms | 4.6 ms | 0.9 ms | 0.9 ms |
+| 20 | 87.8 ms | 5.2 ms | 1.0 ms | 0.8 ms |
+| 50 | 210.7 ms | 4.2 ms | **0.9 ms** | **0.8 ms** |
+
+Median of five; replay is timed with the shared cache already warm, the fairest
+case for it. Resume is flat in N because the snapshot is flat in N: ~90 KB here,
+almost all of it bytecode of the contracts the session touched, not the
+transactions.
+
+**3. Concurrency: workers default to one per core, and repeat reads skip the
+fetch thread.** `FORKYARD_NUM_WORKERS` now defaults to the core count instead
+of 4. Separately, every read that missed a session's own state went to
+`foundry-fork-db`'s single backend thread, *cache hits included*: one request
+and one reply per read, with every session on every worker queued on that one
+thread. A shared concurrent read cache now answers repeats on the calling
+thread. `cargo run --release -p forkyard-fetch --example bench_read_through`,
+warm reads with no network:
+
+| Threads | Through the backend thread | Read-through | |
+| --- | --- | --- | --- |
+| 1 | 5,854 ns | 28 ns | 209× |
+| 4 | 2,252 ns | 29 ns | 79× |
+| 12 | 1,424 ns | 52 ns | 28× |
+
+End to end, the standard workload (`run_benchmark.py --agents 1,10,50
+--actions-per-agent 5`), median of five after a discarded warm-up, each build
+and Anvil in the same pass:
+
+| Agents | forkyard main | forkyard this branch | spread | anvil |
+| --- | --- | --- | --- | --- |
+| 1 | 0.63 s | 0.72 s | 1.05× | 1.65 s |
+| 10 | 2.06 s | **1.27 s** | 1.31× | 2.27 s |
+| 50 | 7.67 s | **3.72 s** | 1.22× | 3.92 s |
+
+At 50 agents forkyard went from about half Anvil's speed to level with it. The
+1-agent row did *not* improve and reads slightly worse. That gap held in six more
+interleaved runs (0.66 s against 0.72 s, ranges 0.63–0.82 and 0.62–0.86), and
+it sits in `set_balance` and `approve`: those spend most of their time on the
+first upstream fetch of each agent's fresh random addresses, which this change
+doesn't touch. The best reading is round-trip noise to the endpoint, not a
+regression, but it has not been ruled out.
+
 ## Where Anvil is the better tool
 
-**Concurrency past a few tens of agents.** This is the clearest one. forkyard
-shards sessions over `FORKYARD_NUM_WORKERS` threads — 4 by default — and that
-queue becomes the ceiling: at 50 concurrent agents the standard workload took
-6.34 s against Anvil's 2.72 s, and at 20 arrivals/second forkyard's p50 was
-6,233 ms against 1,181 ms. Anvil's per-process cost is flat, and warm it has no
-fetch penalty left to pay. Raising the worker count helps a lot (100 agents:
-13.1 s at 4 workers, 5.5 s at 12) but does not change the shape.
+**Concurrency past a few tens of agents.** This was the clearest one, and is
+now narrower. forkyard shards sessions over `FORKYARD_NUM_WORKERS` threads, and
+with the old default of 4 that queue was the ceiling: at 50 concurrent agents
+the standard workload took 6.34 s against Anvil's 2.72 s, and at 20
+arrivals/second forkyard's p50 was 6,233 ms against 1,181 ms. Since the
+[latency pass](#latency-pass-2026-09-26) workers default to one per core, and 50
+agents are level (3.72 s against 3.92 s). The arrivals sweep has not been re-run,
+and a fixed pool is still a ceiling Anvil's flat per-process cost doesn't have.
 
 **Rewinding one timeline.** `evm_snapshot`/`evm_revert` cost about a millisecond
-flat no matter how much state is dirty. forkyard has no equivalent primitive,
-and for "try this, undo it, try the next" inside one agent, Anvil's design is
-simply the right one.
+flat no matter how much state is dirty. forkyard's equivalent, snapshot then
+resume, costs 5 ms at 100 dirty slots and 16 ms at 10,000, because it writes a
+durable file. For "try this, undo it, try the next" inside one agent, Anvil's
+design is still the faster one.
 
 **Unshared state.** When agents touch disjoint state the shared cache has
 nothing to share, the upstream advantage falls to under 2×, and forkyard is left
