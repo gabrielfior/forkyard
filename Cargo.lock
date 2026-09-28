@@ -2051,6 +2051,7 @@ dependencies = [
  "foundry-fork-db",
  "reqwest",
  "revm",
+ "serde_json",
  "tokio",
 ]
 

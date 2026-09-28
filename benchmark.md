@@ -41,6 +41,7 @@ repetition), which is part of why the spread column is here.
 - [Latency pass (2026-09-26)](#latency-pass-2026-09-26)
 - [Fifty agents under a second (2026-09-27)](#fifty-agents-under-a-second-2026-09-27)
 - [One warm HTTP/2 connection upstream (2026-09-27)](#one-warm-http2-connection-upstream-2026-09-27)
+- [100 and 1,000 agents (2026-09-28)](#100-and-1000-agents-2026-09-28)
 - [Where Anvil is the better tool](#where-anvil-is-the-better-tool)
 - [Measurement variance](#measurement-variance)
 
@@ -539,6 +540,58 @@ Its upstream call count goes from 0 to 1, the background keep-alive, made after
 the server is already serving.
 
 `forkyard-loadgen --settle-ms N` reproduces the steady-state rows.
+
+## 100 and 1,000 agents (2026-09-28)
+
+The standard workload at larger scale, through the Rust client, three reps
+after a discarded warm-up, forkyard at `9db76cb` unless stated.
+
+| | Wall clock | Failed actions | Peak memory |
+| --- | --- | --- | --- |
+| forkyard, 100 agents | **1.02 s** (0.97–1.02) | 0 | **55 MB** |
+| Anvil, 100 agents | 5.74 s (5.42–7.33) | 0 | 2.7 GB across 100 processes |
+| forkyard, 1,000 agents | 7.68 s (7.41–9.86) | 108–196 a run | 178 MB |
+| Anvil, 1,000 agents | not run | | |
+
+Anvil wasn't run at 1,000. At the ~29 MB a process it measured at 50 agents,
+it needs about 29 GB, and the host had 15 GB free. At 100 agents upstream reads
+cost both tools the same ~170 ms. Anvil loses its time before any work starts:
+spawning a process per agent took a median of 1.2 s, against 3 ms to open a
+forkyard session.
+
+**At 1,000 agents the ceiling is Tenderly's rate limit.** In one run 427
+batches came back `-32005: rate limit exceeded`. The worker retried each job
+blocking, that was refused too, and the error went back to the agent. So every
+failure was a surfaced upstream error, not a wrong answer. And every one traced
+back to one root: `set_balance` refused for 3–5% of agents, which were then
+never funded and failed every transaction after ("sender holds 0 wei").
+
+**Fix:** a rate-limited batch is now retried with jittered exponential backoff
+(100 ms doubling to a 2 s cap, six retries, ~6 s in all), asking only for
+what's still missing each time. A cap on batches in flight to one upstream
+(`FORKYARD_UPSTREAM_MAX_IN_FLIGHT`) is there to queue runaway bursts. At
+1,000 agents, one run per cap:
+
+| Cap | 16 | 32 | 64 | 128 | 1,024 |
+| --- | --- | --- | --- | --- | --- |
+| Wall clock | 32.6 s | 16.4 s | 8.5 s | 6.6 s | 6.8 s |
+| Failed actions | 0 | 0 | 0 | 0 | 0 |
+
+The retries alone removed the failures. A tight cap only slows things down,
+since it throttles harder than the provider does. So the default is a loose 256,
+a safety valve rather than a limiter. Interleaved with the previous build,
+three pairs each:
+
+| Agents | before: wall, failed | after: wall, failed |
+| --- | --- | --- |
+| 50 | 3.39\*, 0.94, 1.09 s; 0 | 1.02, 0.94, 1.07 s; 0 |
+| 100 | 1.14, 0.92, 1.12 s; 0 | 1.23, 1.87\*, 1.10 s; 0 |
+| 1,000 | 10.32, 10.40, 10.82 s; **117–178** | **6.53, 6.57, 6.51 s; 0** |
+
+\* In both outliers dozens of agents stall at the same instant, ~2.5 s before
+and ~1 s after. The build without any retry shows the same shape, so it's the
+upstream, not a retry. At 1,000 agents the 6.5 s is what Tenderly's limit
+allows. Going faster there takes a higher quota, not a client change.
 
 ## Where Anvil is the better tool
 

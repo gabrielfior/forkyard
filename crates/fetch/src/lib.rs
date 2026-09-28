@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -97,6 +98,33 @@ pub struct ReadThrough<D> {
 /// `eth_chainId` calls a minute, process-wide.
 const KEEPALIVE: Duration = Duration::from_secs(20);
 
+/// Default cap on batches in flight to one upstream at once
+/// (`set_upstream_max_in_flight` overrides it). A burst beyond it queues here
+/// instead of arriving at the provider all at once and being refused: 1,000
+/// agents opening together had 427 batches rejected with `-32005: rate
+/// limit exceeded`.
+pub const DEFAULT_UPSTREAM_MAX_IN_FLIGHT: usize = 256;
+
+static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(DEFAULT_UPSTREAM_MAX_IN_FLIGHT);
+
+/// Set the cap for upstream clients created from now on — call it before
+/// the first fork. `0` is taken as `1`.
+pub fn set_upstream_max_in_flight(max: usize) {
+    MAX_IN_FLIGHT.store(max.max(1), Ordering::Relaxed);
+}
+
+/// Retries of a rate-limited batch before its error is returned. With
+/// `retry_delay`'s schedule, about 6 s of backing off in all.
+const RATE_LIMIT_RETRIES: u32 = 6;
+
+/// The one upstream connection for a URL in this process, and the cap on
+/// what's in flight over it — shared, so the cap holds across every fork.
+#[derive(Clone)]
+struct Upstream {
+    client: RpcClient,
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
 /// The one upstream client for `rpc_url` in this process, shared by every
 /// fork — the default block, pinned blocks, each re-fork at a new tip — so
 /// they all resolve over one warm, HTTP/2-multiplexed connection.
@@ -106,11 +134,11 @@ const KEEPALIVE: Duration = Duration::from_secs(20);
 /// connection: 50 agents opening at once each found no connection yet and
 /// dialed their own, and every agent's first miss took ~100 ms longer
 /// than any later one. Must be called inside a tokio runtime.
-fn shared_client(rpc_url: &str) -> eyre::Result<RpcClient> {
-    static CLIENTS: OnceLock<Mutex<HashMap<String, RpcClient>>> = OnceLock::new();
-    let mut clients = CLIENTS.get_or_init(Default::default).lock().unwrap();
-    if let Some(client) = clients.get(rpc_url) {
-        return Ok(client.clone());
+fn shared_upstream(rpc_url: &str) -> eyre::Result<Upstream> {
+    static UPSTREAMS: OnceLock<Mutex<HashMap<String, Upstream>>> = OnceLock::new();
+    let mut upstreams = UPSTREAMS.get_or_init(Default::default).lock().unwrap();
+    if let Some(upstream) = upstreams.get(rpc_url) {
+        return Ok(upstream.clone());
     }
     let client = RpcClient::new_http(rpc_url.parse()?);
     let keepalive = client.clone();
@@ -121,13 +149,34 @@ fn shared_client(rpc_url: &str) -> eyre::Result<RpcClient> {
             tokio::time::sleep(KEEPALIVE).await;
         }
     });
-    clients.insert(rpc_url.to_string(), client.clone());
-    Ok(client)
+    let upstream = Upstream {
+        client,
+        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT.load(Ordering::Relaxed))),
+    };
+    upstreams.insert(rpc_url.to_string(), upstream.clone());
+    Ok(upstream)
+}
+
+/// A provider saying "slow down" rather than "no": JSON-RPC's `-32005`
+/// (what Infura, Alchemy, QuickNode and Tenderly return) or an HTTP 429.
+fn is_rate_limited(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("-32005") || error.contains("429") || error.contains("rate limit") || error.contains("too many requests")
+}
+
+/// Exponential from 100 ms, capped at 2 s, with jitter, so a burst refused
+/// together doesn't retry together.
+fn retry_delay(attempt: u32) -> Duration {
+    let base = (100u64 << attempt.min(5)).min(2_000);
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.subsec_nanos()).unwrap_or(0);
+    // ±25% around `base`.
+    let jitter = u64::from(nanos) % (base / 2 + 1);
+    Duration::from_millis(base * 3 / 4 + jitter)
 }
 
 /// Straight to upstream, bypassing the backend thread, for `resolve`.
 struct Batcher {
-    client: RpcClient,
+    upstream: Upstream,
     block: BlockId,
     /// Where the backend keeps what it fetched — written to as well, so
     /// what a batch resolved is persisted like anything else (`cache_snapshot`).
@@ -193,9 +242,29 @@ where
         result.map_err(|e| e.to_string())
     }
 
+    /// `send_batch`, retried with backoff while the provider is rate
+    /// limiting. Each retry asks only for what's still missing: a partly
+    /// answered batch keeps what it got.
     fn resolve_batched(&self, batch: &Batcher, keys: &[StateKey]) -> Result<(), String> {
+        let mut attempt = 0;
+        loop {
+            let missing: Vec<StateKey> = keys.iter().copied().filter(|k| !self.is_cached(k)).collect();
+            match self.send_batch(batch, &missing) {
+                Err(error) if is_rate_limited(&error) && attempt < RATE_LIMIT_RETRIES => {
+                    std::thread::sleep(retry_delay(attempt));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn send_batch(&self, batch: &Batcher, keys: &[StateKey]) -> Result<(), String> {
+        if keys.is_empty() {
+            return Ok(());
+        }
         let block = batch.block;
-        let mut request = batch.client.new_batch();
+        let mut request = batch.upstream.client.new_batch();
         let mut accounts = Vec::new();
         let mut slots = Vec::new();
         let mut hashes = Vec::new();
@@ -221,6 +290,8 @@ where
             }
         }
         batch.runtime.block_on(async {
+            // Held until the reply is in: the cap is on requests in flight.
+            let _permit = batch.upstream.in_flight.acquire().await.map_err(err)?;
             request.send().await.map_err(err)?;
             for (address, balance, nonce, code) in accounts {
                 let (balance, nonce, code) = (balance.await.map_err(err)?, nonce.await.map_err(err)?, code.await.map_err(err)?);
@@ -339,7 +410,7 @@ fn fork_from_provider<P: Provider<Ethereum> + 'static>(
     let meta = BlockchainDbMeta::new(block_env, rpc_url.to_string());
     let db = BlockchainDb::new(meta, None);
     let batch = Batcher {
-        client: shared_client(rpc_url)?,
+        upstream: shared_upstream(rpc_url)?,
         block: pin,
         db: db.clone(),
         runtime: tokio::runtime::Handle::try_current()?,
@@ -558,5 +629,121 @@ mod tests {
         });
         assert!(misses.is_empty());
         assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn rate_limit_errors_are_told_apart_from_real_failures() {
+        assert!(is_rate_limited("server returned an error response: error code -32005: rate limit exceeded"));
+        assert!(is_rate_limited("HTTP error 429 with body: Too Many Requests"));
+        assert!(!is_rate_limited("error code -32000: header not found"));
+        assert!(!is_rate_limited("connection refused"));
+    }
+
+    #[test]
+    fn backoff_grows_is_capped_and_is_jittered_within_bounds() {
+        for attempt in 0..10 {
+            let base = (100u64 << attempt.min(5)).min(2_000);
+            let delay = retry_delay(attempt).as_millis() as u64;
+            assert!(delay >= base * 3 / 4 && delay <= base * 5 / 4, "attempt {attempt}: {delay} ms around {base}");
+        }
+        assert!(retry_delay(9) <= Duration::from_millis(2_500), "capped");
+    }
+
+    /// A one-endpoint JSON-RPC server that refuses the first `refuse`
+    /// batches with `-32005`, then answers every account as empty.
+    async fn rate_limited_upstream(refuse: usize) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let batches = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&batches);
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let seen = Arc::clone(&seen);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    loop {
+                        let mut chunk = [0u8; 8192];
+                        let Ok(n) = socket.read(&mut chunk).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        // One request at a time: headers, then Content-Length bytes.
+                        while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..end]).to_ascii_lowercase();
+                            let len: usize = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+                                .unwrap_or(0);
+                            if buf.len() < end + 4 + len {
+                                break;
+                            }
+                            let body: serde_json::Value = serde_json::from_slice(&buf[end + 4..end + 4 + len]).unwrap();
+                            buf.drain(..end + 4 + len);
+                            let reply = match &body {
+                                serde_json::Value::Array(calls) => {
+                                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                                    serde_json::Value::Array(calls.iter().map(|call| {
+                                        let id = call["id"].clone();
+                                        if n < refuse {
+                                            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32005,"message":"rate limit exceeded"}})
+                                        } else {
+                                            let result = if call["method"] == "eth_getCode" { "0x" } else { "0x0" };
+                                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                                        }
+                                    }).collect())
+                                }
+                                single => serde_json::json!({"jsonrpc":"2.0","id":single["id"].clone(),"result":"0x1"}),
+                            };
+                            let payload = reply.to_string();
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{payload}",
+                                payload.len()
+                            );
+                            if socket.write_all(response.as_bytes()).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (url, batches)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rate_limited_batch_is_retried_until_it_goes_through() {
+        let (url, batches) = rate_limited_upstream(2).await;
+        let block_env = BlockEnv { number: U256::from(1u64), ..Default::default() };
+        let fork = fork_with_block_env(&url, block_env).await.unwrap();
+        let address = Address::with_last_byte(9);
+
+        let resolver = fork.clone();
+        let result = tokio::task::spawn_blocking(move || resolver.resolve(&[StateKey::Account(address)]))
+            .await
+            .unwrap();
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(batches.load(Ordering::SeqCst), 3, "two refusals, then the one that went through");
+        let (info, misses) = speculate(|| fork.basic_ref(address).unwrap());
+        assert!(misses.is_empty(), "the account must be cached once the retry succeeds");
+        assert_eq!(info.unwrap().balance, U256::ZERO);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_that_never_relents_gets_its_error_back() {
+        let (url, batches) = rate_limited_upstream(usize::MAX).await;
+        let block_env = BlockEnv { number: U256::from(1u64), ..Default::default() };
+        let fork = fork_with_block_env(&url, block_env).await.unwrap();
+
+        let result = tokio::task::spawn_blocking(move || fork.resolve(&[StateKey::Account(Address::with_last_byte(8))]))
+            .await
+            .unwrap();
+
+        let error = result.unwrap_err();
+        assert!(is_rate_limited(&error), "{error}");
+        assert_eq!(batches.load(Ordering::SeqCst), 1 + RATE_LIMIT_RETRIES as usize);
     }
 }

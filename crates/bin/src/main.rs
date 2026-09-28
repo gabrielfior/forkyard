@@ -129,6 +129,12 @@ async fn main() -> eyre::Result<()> {
     let ttl_secs: u64 = env_or("FORKYARD_SESSION_TTL_SECS", 3600);
     let ingest_poll_secs: u64 = env_or("FORKYARD_INGEST_POLL_SECS", 12);
     let chain_id: u64 = env_or("FORKYARD_CHAIN_ID", 1);
+    // Batches in flight to the upstream at once; a burst past it queues
+    // here rather than being refused by the provider's rate limit.
+    forkyard_fetch::set_upstream_max_in_flight(env_or(
+        "FORKYARD_UPSTREAM_MAX_IN_FLIGHT",
+        forkyard_fetch::DEFAULT_UPSTREAM_MAX_IN_FLIGHT,
+    ));
     let fork_block_number: Option<u64> =
         std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
