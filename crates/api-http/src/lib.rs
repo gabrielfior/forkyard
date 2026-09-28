@@ -9,6 +9,9 @@
 //! optional `{"block_number": N}` body pins the session to block N, each
 //! height fetched once and shared; `forkyard_forkFrom` opens one from
 //! *this* session's current state instead of the shared base.
+//! `forkyard_snapshot` saves a session to disk and answers with an id, and
+//! `{"snapshot_id": "…"}` as the `POST /session` body reopens it — in this
+//! process or a later one.
 //!
 //! Covers `eth_chainId`, `eth_blockNumber`, `eth_getBalance`,
 //! `eth_getTransactionCount`, `eth_gasPrice`, `eth_estimateGas`,
@@ -268,11 +271,13 @@ enum RpcMethod {
     EthGetStorageAt,
     EthGetCode,
     EthSendRawTransaction,
+    EthSendRawTransactionSync,
     EthGetTransactionReceipt,
     EthEstimateGas,
     ForkyardSetBalance,
     ForkyardSetStorageAt,
     ForkyardForkFrom,
+    ForkyardSnapshot,
     ForkyardDiscard,
 }
 
@@ -288,11 +293,13 @@ impl RpcMethod {
             "eth_getStorageAt" => Some(Self::EthGetStorageAt),
             "eth_getCode" => Some(Self::EthGetCode),
             "eth_sendRawTransaction" => Some(Self::EthSendRawTransaction),
+            "eth_sendRawTransactionSync" => Some(Self::EthSendRawTransactionSync),
             "eth_getTransactionReceipt" => Some(Self::EthGetTransactionReceipt),
             "eth_estimateGas" => Some(Self::EthEstimateGas),
             "forkyard_setBalance" => Some(Self::ForkyardSetBalance),
             "forkyard_setStorageAt" => Some(Self::ForkyardSetStorageAt),
             "forkyard_forkFrom" => Some(Self::ForkyardForkFrom),
+            "forkyard_snapshot" => Some(Self::ForkyardSnapshot),
             "forkyard_discard" => Some(Self::ForkyardDiscard),
             _ => None,
         }
@@ -396,6 +403,21 @@ where
             Ok(json!({ "session_id": child }))
         }
 
+        // What `snapshot` writes is the session's state, not this crate's
+        // side table: a resumed session starts its synthetic block counter
+        // and receipt log afresh, as `POST /session` does.
+        RpcMethod::ForkyardSnapshot => {
+            let info = state.manager.snapshot(session_id).await?;
+            Ok(json!({
+                "snapshot_id": info.id,
+                "block_number": info.block_number,
+                "accounts": info.accounts,
+                "storage_slots": info.storage_slots,
+                "contracts": info.contracts,
+                "bytes": info.bytes,
+            }))
+        }
+
         // Explicit session teardown ahead of its TTL, over the JSON-RPC
         // surface — the HTTP-side counterpart to the `discard` MCP tool
         // (`crates/api-mcp`), which has no equivalent route here today.
@@ -409,7 +431,12 @@ where
             Ok(json!(true))
         }
 
-        RpcMethod::EthSendRawTransaction => {
+        // `…Sync` is EIP-7966: the receipt in the reply, instead of a hash
+        // to poll `eth_getTransactionReceipt` with. A session executes the
+        // transaction before answering either way, so the poll was always
+        // a wasted round trip. The optional timeout parameter is ignored:
+        // nothing here is ever pending.
+        RpcMethod::EthSendRawTransaction | RpcMethod::EthSendRawTransactionSync => {
             let raw = parse_raw_tx(params, 0)?;
             let envelope = TxEnvelope::decode_2718(&mut raw.as_slice()).map_err(RpcErrorObj::invalid_params)?;
             let TxEnvelope::Legacy(signed) = &envelope else {
@@ -442,8 +469,11 @@ where
             let entry = guard.entry(session_id).or_default();
             entry.block_number += 1;
             let receipt = build_receipt(tx_hash, sender, tx.to, &result, real_start + entry.block_number);
-            entry.receipts.insert(format!("{tx_hash:#x}"), receipt);
+            entry.receipts.insert(format!("{tx_hash:#x}"), receipt.clone());
 
+            if method == RpcMethod::EthSendRawTransactionSync {
+                return Ok(receipt);
+            }
             Ok(json!(format!("{tx_hash:#x}")))
         }
 
@@ -578,9 +608,14 @@ where
 /// because the common request is a bodyless POST meaning "a session at
 /// whatever block this server is on."
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct OpenSessionRequest {
     #[serde(default)]
     block_number: Option<u64>,
+    /// Reopen a `forkyard_snapshot` instead of forking fresh. Carries its
+    /// own block, so it can't be combined with `block_number`.
+    #[serde(default)]
+    snapshot_id: Option<String>,
 }
 
 /// Opens a session, honouring an optional `{"block_number": N}` body.
@@ -600,9 +635,13 @@ where
         }
     };
 
-    let opened = match request.block_number {
-        Some(number) => state.manager.fork_at_block(number).await,
-        None => state.manager.fork().await,
+    let opened = match (request.block_number, request.snapshot_id) {
+        (Some(_), Some(_)) => {
+            return json!({ "error": "a snapshot carries its own block: pass snapshot_id or block_number, not both" })
+        }
+        (None, Some(snapshot_id)) => state.manager.resume(&snapshot_id).await,
+        (Some(number), None) => state.manager.fork_at_block(number).await,
+        (None, None) => state.manager.fork().await,
     };
     match opened {
         Ok(id) => json!({ "session_id": id }),
@@ -880,6 +919,27 @@ mod tests {
         assert_eq!(receipt["status"], json!("0x1"));
         assert_eq!(receipt["gasUsed"], json!("0x5208"));
         assert_eq!(receipt["blockNumber"], json!("0x1"));
+    }
+
+    #[tokio::test]
+    async fn send_raw_transaction_sync_answers_with_the_receipt_itself() {
+        let state = test_state();
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        let recipient = PrivateKeySigner::random().address();
+        set_balance(&state, id, sender.address(), "0xde0b6b3a7640000").await;
+
+        let raw_hex = signed_transfer_hex(&sender, recipient, 100, 20_000_000_000);
+        // EIP-7966's optional second parameter, a timeout, is accepted.
+        let receipt = dispatch(&state, id, "eth_sendRawTransactionSync", &[json!(raw_hex), json!(1000)]).await.unwrap();
+        assert_eq!(receipt["status"], json!("0x1"));
+        assert_eq!(receipt["gasUsed"], json!("0x5208"));
+
+        // The same receipt an ordinary send would have left to poll for.
+        let polled =
+            dispatch(&state, id, "eth_getTransactionReceipt", &[receipt["transactionHash"].clone()]).await.unwrap();
+        assert_eq!(polled, receipt);
+        assert_eq!(balance_of(&state, id, recipient).await, json!("0x64"));
     }
 
     /// Regression test for a real bug caught live via the Python
@@ -1398,5 +1458,32 @@ mod tests {
             err.message.contains("forkyard_setBalance"),
             "should name the cheatcode, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_reopens_through_post_session() {
+        let dir = std::env::temp_dir().join(format!("forkyard-http-snapshots-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let manager = SessionManager::new(TestFallback::default(), revm::context::BlockEnv::default(), 1, Duration::from_secs(60))
+            .with_snapshots(forkyard_engine::persist::SnapshotStore::new(&dir, 1));
+        let state = AppState { manager: Arc::new(manager), chain_id: 1, rpc_state: Mutex::new(HashMap::new()) };
+
+        let original = opened_id(&open_session(&state, b"").await);
+        let funded = Address::from([0x77; 20]);
+        set_balance(&state, original, funded, "0x99").await;
+        let info = dispatch(&state, original, "forkyard_snapshot", &[]).await.unwrap();
+        let snapshot_id = info["snapshot_id"].as_str().unwrap();
+        dispatch(&state, original, "forkyard_discard", &[]).await.unwrap();
+
+        let body = serde_json::to_vec(&json!({ "snapshot_id": snapshot_id })).unwrap();
+        let resumed = opened_id(&open_session(&state, &body).await);
+        assert_eq!(balance_of(&state, resumed, funded).await, json!("0x99"));
+
+        let both = serde_json::to_vec(&json!({ "snapshot_id": snapshot_id, "block_number": 5 })).unwrap();
+        assert!(open_session(&state, &both).await["error"].as_str().unwrap().contains("not both"));
+
+        let unknown = open_session(&state, br#"{"snapshot_id": "0123456789abcdef0123456789abcdef"}"#).await;
+        assert!(unknown.get("session_id").is_none(), "an unknown id must not open a fresh session");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

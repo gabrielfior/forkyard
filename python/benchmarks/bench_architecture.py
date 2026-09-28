@@ -6,8 +6,10 @@ import argparse
 import concurrent.futures
 import csv
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -33,6 +35,7 @@ from bench_common import (
     process_pids,
 )
 from dataclasses import dataclass
+import requests
 from eth_account import Account
 from eth_utils import keccak
 from rpc_proxy import CountingProxy
@@ -807,6 +810,31 @@ def measure_forkyard(base_url: str, state_size: int, repeats: int) -> list[Sampl
                 return 0
 
             samples.append(_measure("forkyard", "discard", state_size, discard))
+
+            # The rewind forkyard has had since `forkyard_snapshot`: save the
+            # dirty session, reopen it. One fresh slot per repeat, untimed,
+            # so every snapshot is new state — the store is content-addressed
+            # and would otherwise skip the write it is meant to be timing.
+            dirty.set_storage(DIRTY_CONTRACT, slot_hex(state_size + len(samples)), value_hex(0))
+            snapshot: list[dict] = []
+
+            def take_snapshot() -> int:
+                snapshot.append(dirty.web3().manager.request_blocking("forkyard_snapshot", []))
+                return int(snapshot[0]["bytes"])
+
+            samples.append(_measure("forkyard", "snapshot", state_size, take_snapshot))
+
+            def resume() -> int:
+                if not snapshot:
+                    raise RuntimeError("forkyard_snapshot did not return an id")
+                resp = requests.post(f"{base_url}/session", json={"snapshot_id": snapshot[0]["snapshot_id"]}, timeout=60)
+                resp.raise_for_status()
+                if "session_id" not in resp.json():
+                    raise RuntimeError(f"resume failed: {resp.json()}")
+                ForkyardBackend(session_url=f"{base_url}/session/{resp.json()['session_id']}").discard()
+                return int(snapshot[0]["bytes"])
+
+            samples.append(_measure("forkyard", "resume", state_size, resume))
         return samples
     finally:
         dirty.discard()
@@ -824,10 +852,10 @@ def checkpoint_main() -> None:
             "Measure what a checkpoint costs as touched state grows. Anvil "
             "serializes: evm_snapshot/evm_revert and anvil_dumpState/"
             "anvil_loadState are timed over X dirtied storage slots, with the "
-            "dump blob's size recorded. forkyard has no snapshot RPC, so its "
-            "equivalent is timed instead: branching a fresh session off the "
-            "shared base (POST /session) and discarding it. Expect Anvil's "
-            "cost and blob to grow with X and forkyard's to stay flat."
+            "dump blob's size recorded. forkyard is timed opening a fresh "
+            "session off the shared base (POST /session) and discarding it, "
+            "and saving the dirty session with forkyard_snapshot and reopening "
+            "it with POST /session {snapshot_id}, the snapshot's size recorded."
         ),
     )
     parser.add_argument("--rpc-url", default=os.environ.get("RPC_URL"),
@@ -855,6 +883,7 @@ def checkpoint_main() -> None:
         f.flush()
 
         forkyard_proc: subprocess.Popen | None = None
+        snapshot_dir = tempfile.mkdtemp(prefix="forkyard-checkpoint-snapshots-")
         try:
             if "forkyard" in backends:
                 forkyard_proc = subprocess.Popen(
@@ -865,6 +894,7 @@ def checkpoint_main() -> None:
                         "FORKYARD_PORT": str(CHECKPOINT_FORKYARD_PORT),
                         "FORKYARD_MCP_HTTP_PORT": str(CHECKPOINT_FORKYARD_MCP_PORT),
                         "FORKYARD_FORK_BLOCK_NUMBER": str(args.block_height),
+                        "FORKYARD_SNAPSHOT_DIR": snapshot_dir,
                     },
                 )
                 base_url = f"http://127.0.0.1:{CHECKPOINT_FORKYARD_PORT}"
@@ -891,6 +921,7 @@ def checkpoint_main() -> None:
         finally:
             if forkyard_proc is not None:
                 _terminate(forkyard_proc)
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
 
 
 # --- bench_writers: How many *isolated concurrent writers* fit in a gigabyte.

@@ -1976,6 +1976,7 @@ dependencies = [
  "forkyard-fetch",
  "forkyard-ingest",
  "forkyard-session",
+ "revm",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -1994,6 +1995,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "eyre",
+ "forkyard-engine",
  "forkyard-fetch",
  "forkyard-session",
  "reqwest",
@@ -2011,6 +2013,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "eyre",
+ "forkyard-engine",
  "forkyard-session",
  "revm",
  "rmcp",
@@ -2037,14 +2040,18 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rpc-client",
  "alloy-rpc-types",
  "alloy-signer",
  "alloy-signer-local",
+ "dashmap",
  "dotenvy",
  "eyre",
  "forkyard-engine",
  "foundry-fork-db",
+ "reqwest",
  "revm",
+ "serde_json",
  "tokio",
 ]
 
@@ -2058,6 +2065,22 @@ dependencies = [
  "revm",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "forkyard-loadgen"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "libc",
+ "reqwest",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

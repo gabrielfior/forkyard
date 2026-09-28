@@ -73,10 +73,22 @@ def _timed(label: str, fn: Callable[[], None]) -> ActionResult:
     return (label, elapsed_ms, ok, error)
 
 
+def _chain_constants(w3: Web3) -> tuple[int, int]:
+    """Chain id and gas price, fetched once per client instead of once per
+    transaction: two of the five round trips every send used to make. Safe
+    to reuse on both backends — a forkyard session's gas price is fixed at
+    fork, and an Anvil fork's basefee only falls as it mines near-empty blocks."""
+    cached = getattr(w3, "_bench_chain_constants", None)
+    if cached is None:
+        cached = (w3.eth.chain_id, w3.eth.gas_price)
+        w3._bench_chain_constants = cached
+    return cached
+
+
 def _send_signed(w3: Web3, signer_key: str, to: str, value: int, data: bytes, nonce: int, gas: int) -> None:
-    gas_price = w3.eth.gas_price
+    chain_id, gas_price = _chain_constants(w3)
     tx = {
-        "chainId": w3.eth.chain_id,
+        "chainId": chain_id,
         "nonce": nonce,
         "gas": gas,
         "gasPrice": gas_price,
@@ -85,10 +97,12 @@ def _send_signed(w3: Web3, signer_key: str, to: str, value: int, data: bytes, no
         "data": data,
     }
     signed = Account.sign_transaction(tx, signer_key)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=10)
-    if receipt.status != 1:
-        raise RuntimeError(f"transaction {tx_hash.to_0x_hex()} reverted")
+    # EIP-7966: the receipt comes back in the reply, where send + poll for
+    # the receipt was two round trips. Both backends implement it.
+    receipt = w3.manager.request_blocking("eth_sendRawTransactionSync", ["0x" + signed.raw_transaction.hex()])
+    status = receipt["status"]
+    if (int(status, 16) if isinstance(status, str) else int(status)) != 1:
+        raise RuntimeError(f"transaction {receipt['transactionHash']} reverted")
 
 
 def transfer(backend: Backend, signer_key: str, to: str, value: int, nonce: int) -> ActionResult:

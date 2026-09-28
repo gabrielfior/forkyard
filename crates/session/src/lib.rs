@@ -14,7 +14,7 @@
 //! on each worker's own recv loop expires sessions past the TTL — "no
 //! cleanup job an agent has to remember to call."
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -24,13 +24,15 @@ use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
-use forkyard_engine::{BaseSnapshot, Session};
+use forkyard_engine::persist::{SnapshotInfo, SnapshotStore};
+use forkyard_engine::{BaseSnapshot, Session, SessionState};
+pub use forkyard_fetch::StateKey;
 use revm::context::result::{EVMError, ExecutionResult, InvalidTransaction};
 use revm::context::{BlockEnv, TxEnv};
 use revm::database_interface::DatabaseRef;
-use revm::primitives::{Address, Bytes, StorageKey, StorageValue, KECCAK_EMPTY};
+use revm::primitives::{Address, Bytes, StorageKey, StorageValue, TxKind, KECCAK_EMPTY};
 use revm::state::AccountInfo;
-use revm::{Database, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
+use revm::{Database, DatabaseCommit, ExecuteEvm, MainBuilder, MainContext};
 use tokio::sync::{oneshot, OnceCell};
 
 pub type SessionId = u64;
@@ -115,6 +117,42 @@ where
 {
 }
 
+/// Fetches what a speculative pass found missing into `F`'s cache,
+/// blocking the calling thread — never a worker's: a worker hands it to a
+/// thread of its own and serves other sessions meanwhile. The default reads
+/// each key through `F` in parallel; `forkyard-bin` swaps in
+/// `forkyard_fetch::Fork::resolve`, which sends them as one batch.
+pub type Resolver<F> = Arc<dyn Fn(&F, &[StateKey]) -> Result<(), String> + Send + Sync>;
+
+fn default_resolver<F: Fallback>() -> Resolver<F>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    Arc::new(|fallback: &F, keys: &[StateKey]| {
+        std::thread::scope(|scope| {
+            let reads: Vec<_> = keys.iter().map(|key| scope.spawn(move || read_key(fallback, key))).collect();
+            reads.into_iter().try_for_each(|r| r.join().map_err(|_| "resolver panicked".to_string())?)
+        })
+    })
+}
+
+fn read_key<F: Fallback>(fallback: &F, key: &StateKey) -> Result<(), String>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    let result = match *key {
+        StateKey::Account(address) => fallback.basic_ref(address).map(drop),
+        StateKey::Storage(address, index) => fallback.storage_ref(address, index).map(drop),
+        StateKey::BlockHash(number) => fallback.block_hash_ref(number).map(drop),
+    };
+    result.map_err(|e| e.to_string())
+}
+
+/// Speculative passes one job may take before it's run blocking instead —
+/// a bound on a pathological chain of dependent reads, not a normal path:
+/// a pass that finds nothing new missing is clean by definition.
+const MAX_SPECULATIVE_ROUNDS: u32 = 16;
+
 #[derive(Debug)]
 pub enum SessionError {
     Unknown(SessionId),
@@ -136,6 +174,10 @@ pub enum SessionError {
     /// serve it, or no block-fork factory was configured. A caller error to
     /// report, not a panic to take a worker down with.
     BlockUnavailable(u64, String),
+    /// A snapshot couldn't be written or read back — no store configured,
+    /// an unknown or malformed id, a file from another chain. Carries the
+    /// store's own explanation, which already names the file.
+    Snapshot(String),
 }
 
 impl fmt::Display for SessionError {
@@ -150,6 +192,7 @@ impl fmt::Display for SessionError {
             Self::BlockUnavailable(number, reason) => {
                 write!(f, "cannot open a session at block {number}: {reason}")
             }
+            Self::Snapshot(reason) => write!(f, "snapshot: {reason}"),
         }
     }
 }
@@ -164,7 +207,16 @@ enum Job<F: DatabaseRef> {
         base: Arc<BaseSnapshot>,
         fallback: F,
         block_env: BlockEnv,
+        /// A snapshot's state to lay over the base — `resume`. `None` is
+        /// an ordinary fresh fork.
+        seed: Option<Box<SessionState>>,
         reply: oneshot::Sender<()>,
+    },
+    /// Everything `id` holds that its shared base doesn't, and the block
+    /// it holds it at — what `snapshot` writes to disk.
+    State {
+        id: SessionId,
+        reply: oneshot::Sender<Result<(Box<SessionState>, u64), SessionError>>,
     },
     /// Branch `parent` on the worker that owns it, handing the child back
     /// for `fork_from` to register. Two hops, because parent and child are
@@ -234,6 +286,33 @@ enum Job<F: DatabaseRef> {
         value: StorageValue,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
+    /// Posted by a resolver thread back to the worker that parked `id`'s
+    /// job: its keys are in, retry. `failed` retries blocking, so an
+    /// upstream error surfaces as the job's own error rather than looping.
+    Unblock { id: SessionId, failed: bool },
+}
+
+impl<F: DatabaseRef> Job<F> {
+    /// The session whose order this job must keep: jobs for one session
+    /// run in arrival order even while one of them waits on upstream.
+    fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Job::Fork { id, .. }
+            | Job::Adopt { id, .. }
+            | Job::State { id, .. }
+            | Job::Simulate { id, .. }
+            | Job::Advance { id, .. }
+            | Job::Discard { id, .. }
+            | Job::Storage { id, .. }
+            | Job::Code { id, .. }
+            | Job::Basic { id, .. }
+            | Job::BlockEnvOf { id, .. }
+            | Job::SetAccount { id, .. }
+            | Job::SetStorage { id, .. } => Some(*id),
+            Job::Branch { parent, .. } => Some(*parent),
+            Job::Unblock { .. } => None,
+        }
+    }
 }
 
 /// A registry of sessions sharing `fallback` and `base`, sharded across
@@ -258,6 +337,12 @@ where
     /// to fetch a block says so via `BlockUnavailable`.
     block_forks: Option<Arc<dyn BlockForkFactory<F>>>,
     pinned: Mutex<PinnedBlocks<F>>,
+    /// `None` unless `with_snapshots` was called; `snapshot` and `resume`
+    /// then say so rather than guessing a directory.
+    snapshots: Option<SnapshotStore>,
+    /// Shared with every worker, so `with_resolver` can swap it after the
+    /// workers are already running.
+    resolver: Arc<RwLock<Resolver<F>>>,
 }
 
 impl<F: Fallback> SessionManager<F>
@@ -273,11 +358,12 @@ where
     /// returns alongside the fork itself.
     pub fn new(fallback: F, block_env: BlockEnv, num_workers: usize, ttl: Duration) -> Self {
         let num_workers = num_workers.max(1);
+        let resolver = Arc::new(RwLock::new(default_resolver::<F>()));
         let mut workers = Vec::with_capacity(num_workers);
         let mut counts = Vec::with_capacity(num_workers);
         for idx in 0..num_workers {
             let count = Arc::new(AtomicUsize::new(0));
-            workers.push(spawn_worker(idx, ttl, Arc::clone(&count)));
+            workers.push(spawn_worker(idx, ttl, Arc::clone(&count), Arc::clone(&resolver)));
             counts.push(count);
         }
         Self {
@@ -293,7 +379,25 @@ where
                 recency: Vec::new(),
                 cap: DEFAULT_MAX_PINNED_BLOCKS,
             }),
+            snapshots: None,
+            resolver,
         }
+    }
+
+    /// Resolve speculative misses with `resolver` instead of one read per
+    /// key through the fallback — e.g. batched into one upstream request.
+    pub fn with_resolver(
+        self,
+        resolver: impl Fn(&F, &[StateKey]) -> Result<(), String> + Send + Sync + 'static,
+    ) -> Self {
+        *self.resolver.write().unwrap() = Arc::new(resolver);
+        self
+    }
+
+    /// Enable `snapshot` and `resume`, writing to and reading from `store`.
+    pub fn with_snapshots(mut self, store: SnapshotStore) -> Self {
+        self.snapshots = Some(store);
+        self
     }
 
     /// Enable `fork_at_block`: `factory` builds the fallback for one block,
@@ -384,16 +488,27 @@ where
     /// the actual thing this crate exists for. O(1) modulo the channel
     /// hop: no state is copied, only an `Arc` and a cheap `F` clone.
     pub async fn fork(&self) -> Result<SessionId, SessionError> {
+        self.fork_seeded(None).await
+    }
+
+    async fn fork_seeded(&self, seed: Option<Box<SessionState>>) -> Result<SessionId, SessionError> {
+        let base = self.base();
+        let fallback = self.fallback.read().unwrap().clone();
+        let block_env = self.block_env();
+        self.register(base, fallback, block_env, seed).await
+    }
+
+    async fn register(
+        &self,
+        base: Arc<BaseSnapshot>,
+        fallback: F,
+        block_env: BlockEnv,
+        seed: Option<Box<SessionState>>,
+    ) -> Result<SessionId, SessionError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
-            .send(Job::Fork {
-                id,
-                base: self.base(),
-                fallback: self.fallback.read().unwrap().clone(),
-                block_env: self.block_env(),
-                reply,
-            })
+            .send(Job::Fork { id, base, fallback, block_env, seed, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
         Ok(id)
@@ -409,6 +524,14 @@ where
     /// pinned session must survive `refresh_fallback`, which moves the
     /// default base out from under it.
     pub async fn fork_at_block(&self, block_number: u64) -> Result<SessionId, SessionError> {
+        self.fork_at_block_seeded(block_number, None).await
+    }
+
+    async fn fork_at_block_seeded(
+        &self,
+        block_number: u64,
+        seed: Option<Box<SessionState>>,
+    ) -> Result<SessionId, SessionError> {
         let (base, fallback, block_env) = {
             let cell = self.pinned.lock().unwrap().get_or_insert(block_number);
             let factory = Arc::clone(self.block_forks.as_ref().ok_or_else(|| {
@@ -426,14 +549,64 @@ where
                 .map_err(|reason| SessionError::BlockUnavailable(block_number, reason))?;
             (Arc::clone(&pinned.base), pinned.fallback.clone(), pinned.block_env.clone())
         };
+        self.register(base, fallback, block_env, seed).await
+    }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// `id`'s own state — what it wrote and what it read through, branch
+    /// ancestry included — and the block it's at. Laid over any base at
+    /// that block by `restore`, it reproduces the session.
+    pub async fn session_state(&self, id: SessionId) -> Result<(u64, SessionState), SessionError> {
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
-            .send(Job::Fork { id, base, fallback, block_env, reply })
+            .send(Job::State { id, reply })
             .map_err(|_| SessionError::WorkerGone)?;
-        rx.await.map_err(|_| SessionError::WorkerGone)?;
-        Ok(id)
+        let (state, block_number) = rx.await.map_err(|_| SessionError::WorkerGone)??;
+        Ok((block_number, *state))
+    }
+
+    /// A new session at `block_number` holding `state` — the inverse of
+    /// `session_state`. On the default base when that's the block this
+    /// manager is on, otherwise through `fork_at_block`'s pinned blocks
+    /// (so a snapshot outlives the chain tip moving on).
+    pub async fn restore(&self, block_number: u64, state: SessionState) -> Result<SessionId, SessionError> {
+        let seed = Some(Box::new(state));
+        if u64::try_from(self.block_env().number).ok() == Some(block_number) {
+            self.fork_seeded(seed).await
+        } else {
+            self.fork_at_block_seeded(block_number, seed).await
+        }
+    }
+
+    /// Write `id`'s state to the snapshot store and return its id: a few
+    /// KB for a typical session, since the shared base isn't in it. The
+    /// session itself is untouched and stays live.
+    pub async fn snapshot(&self, id: SessionId) -> Result<SnapshotInfo, SessionError> {
+        let store = self.snapshot_store()?;
+        let (block_number, state) = self.session_state(id).await?;
+        tokio::task::spawn_blocking(move || store.store(block_number, &state))
+            .await
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?
+            .map_err(|e| SessionError::Snapshot(e.to_string()))
+    }
+
+    /// Open a new session from a snapshot id `snapshot` handed out — in
+    /// this process or any other sharing the store's directory, before or
+    /// after a restart. Resuming the same id twice gives two independent
+    /// sessions, the way `fork_from` does.
+    pub async fn resume(&self, snapshot_id: &str) -> Result<SessionId, SessionError> {
+        let store = self.snapshot_store()?;
+        let snapshot_id = snapshot_id.to_string();
+        let (block_number, state) = tokio::task::spawn_blocking(move || store.load(&snapshot_id))
+            .await
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?
+            .map_err(|e| SessionError::Snapshot(e.to_string()))?;
+        self.restore(block_number, state).await
+    }
+
+    fn snapshot_store(&self) -> Result<SnapshotStore, SessionError> {
+        self.snapshots
+            .clone()
+            .ok_or_else(|| SessionError::Snapshot("this session manager was built without a snapshot store".to_string()))
     }
 
     /// The block one session is pinned to, not the manager's default. An
@@ -619,23 +792,62 @@ fn spawn_worker<F: Fallback>(
     idx: usize,
     ttl: Duration,
     count: Arc<AtomicUsize>,
+    resolver: Arc<RwLock<Resolver<F>>>,
 ) -> std_mpsc::Sender<Job<F>>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     let (tx, rx) = std_mpsc::channel::<Job<F>>();
+    let requeue = tx.clone();
     std::thread::Builder::new()
         .name(format!("forkyard-worker-{idx}"))
-        .spawn(move || worker_loop(rx, ttl, count))
+        .spawn(move || {
+            let worker =
+                Worker { sessions: HashMap::new(), blocked: HashMap::new(), requeue, resolver, count: Arc::clone(&count) };
+            worker_loop(worker, rx, ttl, count)
+        })
         .expect("failed to spawn forkyard worker thread");
     tx
 }
 
-fn worker_loop<F: Fallback>(rx: std_mpsc::Receiver<Job<F>>, ttl: Duration, count: Arc<AtomicUsize>)
+/// One worker thread's state. A worker never waits on the network: a job
+/// whose pass missed upstream state is parked, its keys fetched on another
+/// thread, and it runs again on `Job::Unblock` — while every other session
+/// on this worker carries on. The fixed pool used to stall whole shards
+/// behind one ~200 ms upstream read.
+struct Worker<F: Fallback>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    let mut sessions: HashMap<SessionId, (Session<F>, Instant)> = HashMap::new();
+    sessions: HashMap<SessionId, (Session<F>, Instant)>,
+    /// Sessions whose front job is waiting on upstream, with every later
+    /// job for that session queued behind it.
+    blocked: HashMap<SessionId, Blocked<F>>,
+    /// This worker's own inbox, for resolver threads to post `Unblock` to.
+    requeue: std_mpsc::Sender<Job<F>>,
+    resolver: Arc<RwLock<Resolver<F>>>,
+    /// Live sessions on this worker, for `active_session_count` — updated
+    /// before a fork or discard is answered, so a caller that just got its
+    /// reply never reads the old count.
+    count: Arc<AtomicUsize>,
+}
+
+struct Blocked<F: DatabaseRef> {
+    queue: VecDeque<Job<F>>,
+    /// Passes the front job has taken so far.
+    rounds: u32,
+}
+
+enum Outcome<F: DatabaseRef> {
+    Done,
+    /// The job back, unanswered, with what its pass found missing.
+    Deferred(Box<Job<F>>, Vec<StateKey>),
+}
+
+fn worker_loop<F: Fallback>(mut worker: Worker<F>, rx: std_mpsc::Receiver<Job<F>>, ttl: Duration, count: Arc<AtomicUsize>)
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
     loop {
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(job) => {
@@ -643,24 +855,236 @@ where
                 // caught at this boundary — revm has no unsafe/FFI in its
                 // hot path, so this is sound — and only poisons this one
                 // worker's sessions, not the other shards.
-                if std::panic::catch_unwind(AssertUnwindSafe(|| handle_job(&mut sessions, job))).is_err() {
+                if std::panic::catch_unwind(AssertUnwindSafe(|| worker.accept(job))).is_err() {
                     tracing::error!("forkyard worker job panicked; that session's state may be inconsistent");
                 }
-                count.store(sessions.len(), Ordering::Relaxed);
+                count.store(worker.sessions.len(), Ordering::Relaxed);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                let before = sessions.len();
+                let before = worker.sessions.len();
                 let now = Instant::now();
-                sessions.retain(|_, (_, touched)| now.duration_since(*touched) < ttl);
-                let removed = before - sessions.len();
+                worker.sessions.retain(|_, (_, touched)| now.duration_since(*touched) < ttl);
+                let removed = before - worker.sessions.len();
                 if removed > 0 {
                     tracing::info!(removed, "reaped expired sessions");
-                    count.store(sessions.len(), Ordering::Relaxed);
+                    count.store(worker.sessions.len(), Ordering::Relaxed);
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+}
+
+impl<F: Fallback> Worker<F>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    fn accept(&mut self, job: Job<F>) {
+        if let Job::Unblock { id, failed } = job {
+            return self.unblock(id, failed);
+        }
+        if let Some(blocked) = job.session_id().and_then(|id| self.blocked.get_mut(&id)) {
+            blocked.queue.push_back(job);
+            return;
+        }
+        if let Outcome::Deferred(job, keys) = self.handle(job, false) {
+            self.park(*job, keys, Blocked { queue: VecDeque::new(), rounds: 0 });
+        }
+    }
+
+    /// Put `job` at the front of its session's queue and resolve `keys` on
+    /// a thread of its own.
+    fn park(&mut self, job: Job<F>, keys: Vec<StateKey>, mut blocked: Blocked<F>) {
+        let id = job.session_id().expect("only a session's job can miss its state");
+        // It missed, so it ran, so the session exists.
+        let fallback = self.sessions.get(&id).map(|(session, _)| session.fallback().clone());
+        blocked.rounds += 1;
+        let rounds = blocked.rounds;
+        blocked.queue.push_front(job);
+        self.blocked.insert(id, blocked);
+
+        // From here on `Unblock` must arrive, whatever happens, or every job
+        // for this session waits behind this one for good: a resolver panic
+        // counts as a failed resolve, and so does failing to spawn.
+        let resolver = Arc::clone(&self.resolver.read().unwrap());
+        let requeue = self.requeue.clone();
+        let spawned = std::thread::Builder::new().name("forkyard-resolve".into()).spawn(move || {
+            let start = Instant::now();
+            let failed = match &fallback {
+                Some(fallback) => {
+                    !matches!(std::panic::catch_unwind(AssertUnwindSafe(|| resolver(fallback, &keys))), Ok(Ok(())))
+                }
+                None => true,
+            };
+            tracing::debug!(session = id, keys = keys.len(), round = rounds, failed, elapsed_ms = start.elapsed().as_millis() as u64, "resolved a speculative pass's misses");
+            let _ = requeue.send(Job::Unblock { id, failed });
+        });
+        if let Err(error) = spawned {
+            tracing::warn!(session = id, %error, "could not spawn a resolver thread; retrying the job blocking");
+            let _ = self.requeue.send(Job::Unblock { id, failed: true });
+        }
+    }
+
+    /// Run `id`'s queue from the front until it's empty or a job misses
+    /// again.
+    fn unblock(&mut self, id: SessionId, failed: bool) {
+        let Some(mut blocked) = self.blocked.remove(&id) else { return };
+        let mut blocking = failed || blocked.rounds >= MAX_SPECULATIVE_ROUNDS;
+        while let Some(job) = blocked.queue.pop_front() {
+            match self.handle(job, blocking) {
+                Outcome::Done => {
+                    blocking = false;
+                    blocked.rounds = 0;
+                }
+                Outcome::Deferred(job, keys) => return self.park(*job, keys, blocked),
+            }
+        }
+    }
+
+    /// Run one job. With `blocking` false, a job that reads upstream state
+    /// comes back `Deferred` instead of waiting for it.
+    fn handle(&mut self, job: Job<F>, blocking: bool) -> Outcome<F> {
+        let sessions = &mut self.sessions;
+        match job {
+            Job::Simulate { id, tx, disable_checks, reply } => {
+                let Some((session, touched)) = sessions.get_mut(&id) else {
+                    let _ = reply.send(Err(SessionError::Unknown(id)));
+                    return Outcome::Done;
+                };
+                *touched = Instant::now();
+                match execute(session, &tx, false, disable_checks, blocking) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(keys) => return Outcome::Deferred(Box::new(Job::Simulate { id, tx, disable_checks, reply }), keys),
+                }
+            }
+            Job::Advance { id, tx, reply } => {
+                let Some((session, touched)) = sessions.get_mut(&id) else {
+                    let _ = reply.send(Err(SessionError::Unknown(id)));
+                    return Outcome::Done;
+                };
+                *touched = Instant::now();
+                match execute(session, &tx, true, false, blocking) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(keys) => return Outcome::Deferred(Box::new(Job::Advance { id, tx, reply }), keys),
+                }
+            }
+            Job::Storage { id, address, key, reply } => {
+                let Some((session, touched)) = sessions.get_mut(&id) else {
+                    let _ = reply.send(Err(SessionError::Unknown(id)));
+                    return Outcome::Done;
+                };
+                *touched = Instant::now();
+                let read = attempt(session, blocking, |session| {
+                    Database::storage(session, address, key).map_err(|e| SessionError::Execution(format!("{e}")))
+                });
+                match read {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(keys) => return Outcome::Deferred(Box::new(Job::Storage { id, address, key, reply }), keys),
+                }
+            }
+            Job::Code { id, address, reply } => {
+                let Some((session, touched)) = sessions.get_mut(&id) else {
+                    let _ = reply.send(Err(SessionError::Unknown(id)));
+                    return Outcome::Done;
+                };
+                *touched = Instant::now();
+                match attempt(session, blocking, |session| code_of(session, address)) {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(keys) => return Outcome::Deferred(Box::new(Job::Code { id, address, reply }), keys),
+                }
+            }
+            Job::Basic { id, address, reply } => {
+                let Some((session, touched)) = sessions.get_mut(&id) else {
+                    let _ = reply.send(Err(SessionError::Unknown(id)));
+                    return Outcome::Done;
+                };
+                *touched = Instant::now();
+                let read = attempt(session, blocking, |session| {
+                    Database::basic(session, address).map_err(|e| SessionError::Execution(format!("{e}")))
+                });
+                match read {
+                    Ok(result) => {
+                        let _ = reply.send(result);
+                    }
+                    Err(keys) => return Outcome::Deferred(Box::new(Job::Basic { id, address, reply }), keys),
+                }
+            }
+            other => handle_job(sessions, &self.count, other),
+        }
+        Outcome::Done
+    }
+}
+
+/// Run `f` against `session` speculatively — every upstream miss recorded,
+/// none waited for (`forkyard_fetch::speculate`) — and keep what it cached
+/// only if nothing was missing. `Err` carries the missing keys; `f`'s
+/// result is dropped, since it was computed from placeholder values.
+/// `blocking` runs `f` the old way, waiting on each read.
+fn attempt<F: Fallback, R>(
+    session: &mut Session<F>,
+    blocking: bool,
+    f: impl FnOnce(&mut Session<F>) -> R,
+) -> Result<R, Vec<StateKey>> {
+    if blocking {
+        return Ok(f(session));
+    }
+    session.begin_speculation();
+    let pass = std::panic::catch_unwind(AssertUnwindSafe(|| forkyard_fetch::speculate(|| f(&mut *session))));
+    let (result, misses) = match pass {
+        Ok(pass) => pass,
+        Err(panic) => {
+            // Roll back before the panic travels on: the pass may have
+            // cached placeholders, and the worker survives to serve this
+            // session again.
+            session.end_speculation(false);
+            std::panic::resume_unwind(panic);
+        }
+    };
+    session.end_speculation(misses.is_empty());
+    if misses.is_empty() {
+        Ok(result)
+    } else {
+        Err(misses)
+    }
+}
+
+/// Run `tx`; with `commit`, write its diff into the overlay — but only
+/// after a clean pass, never one computed from placeholders.
+fn execute<F: Fallback>(
+    session: &mut Session<F>,
+    tx: &TxEnv,
+    commit: bool,
+    disable_checks: bool,
+    blocking: bool,
+) -> Result<Result<ExecutionResult, SessionError>, Vec<StateKey>>
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    let outcome = attempt(session, blocking, |session| {
+        // Sender and recipient are known before anything runs. Touch them
+        // first, so a pass that stops early — an unfunded sender fails
+        // validation before the recipient is ever read — still reports
+        // both, and one round trip fetches the pair.
+        let _ = Database::basic(session, tx.caller);
+        if let TxKind::Call(to) = tx.kind {
+            let _ = Database::basic(session, to);
+        }
+        transact(session, tx.clone(), disable_checks)
+    })?;
+    Ok(outcome.map(|(result, state)| {
+        if commit {
+            DatabaseCommit::commit(session, state);
+        }
+        result
+    }))
 }
 
 /// Resolve an account's bytecode the way the EVM does: the account's own
@@ -683,14 +1107,33 @@ fn code_of<F: Fallback>(session: &mut Session<F>, address: Address) -> Result<By
         .map_err(|e| SessionError::Execution(format!("{e}")))
 }
 
-fn handle_job<F: Fallback>(sessions: &mut HashMap<SessionId, (Session<F>, Instant)>, job: Job<F>)
+/// Every job that never reads upstream state, so never defers.
+fn handle_job<F: Fallback>(sessions: &mut HashMap<SessionId, (Session<F>, Instant)>, count: &AtomicUsize, job: Job<F>)
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
     match job {
-        Job::Fork { id, base, fallback, block_env, reply } => {
-            sessions.insert(id, (Session::fork(base, fallback, block_env), Instant::now()));
+        Job::Fork { id, base, fallback, block_env, seed, reply } => {
+            let session = match seed {
+                Some(state) => Session::restore(base, fallback, block_env, *state),
+                None => Session::fork(base, fallback, block_env),
+            };
+            sessions.insert(id, (session, Instant::now()));
+            count.store(sessions.len(), Ordering::Relaxed);
             let _ = reply.send(());
+        }
+        Job::State { id, reply } => {
+            let result = match sessions.get_mut(&id) {
+                Some((session, touched)) => {
+                    // Snapshotting counts as activity, like branching.
+                    *touched = Instant::now();
+                    u64::try_from(session.block_env().number)
+                        .map(|number| (Box::new(session.state()), number))
+                        .map_err(|_| SessionError::Execution("block number does not fit a u64".to_string()))
+                }
+                None => Err(SessionError::Unknown(id)),
+            };
+            let _ = reply.send(result);
         }
         Job::Branch { parent, reply } => {
             let result = match sessions.get_mut(&parent) {
@@ -706,50 +1149,13 @@ where
         }
         Job::Adopt { id, session, reply } => {
             sessions.insert(id, (*session, Instant::now()));
+            count.store(sessions.len(), Ordering::Relaxed);
             let _ = reply.send(());
-        }
-        Job::Simulate { id, tx, disable_checks, reply } => {
-            let result = run(sessions, id, *tx, false, disable_checks);
-            let _ = reply.send(result);
-        }
-        Job::Advance { id, tx, reply } => {
-            let result = run(sessions, id, *tx, true, false);
-            let _ = reply.send(result);
         }
         Job::Discard { id, reply } => {
             sessions.remove(&id);
+            count.store(sessions.len(), Ordering::Relaxed);
             let _ = reply.send(());
-        }
-        Job::Storage { id, address, key, reply } => {
-            let result = match sessions.get_mut(&id) {
-                Some((session, touched)) => {
-                    *touched = Instant::now();
-                    Database::storage(session, address, key)
-                        .map_err(|e| SessionError::Execution(format!("{e}")))
-                }
-                None => Err(SessionError::Unknown(id)),
-            };
-            let _ = reply.send(result);
-        }
-        Job::Code { id, address, reply } => {
-            let result = match sessions.get_mut(&id) {
-                Some((session, touched)) => {
-                    *touched = Instant::now();
-                    code_of(session, address)
-                }
-                None => Err(SessionError::Unknown(id)),
-            };
-            let _ = reply.send(result);
-        }
-        Job::Basic { id, address, reply } => {
-            let result = match sessions.get_mut(&id) {
-                Some((session, touched)) => {
-                    *touched = Instant::now();
-                    Database::basic(session, address).map_err(|e| SessionError::Execution(format!("{e}")))
-                }
-                None => Err(SessionError::Unknown(id)),
-            };
-            let _ = reply.send(result);
         }
         Job::BlockEnvOf { id, reply } => {
             let result = match sessions.get_mut(&id) {
@@ -785,21 +1191,25 @@ where
             };
             let _ = reply.send(result);
         }
+        Job::Simulate { .. }
+        | Job::Advance { .. }
+        | Job::Storage { .. }
+        | Job::Code { .. }
+        | Job::Basic { .. }
+        | Job::Unblock { .. } => unreachable!("routed through Worker::handle and Worker::accept"),
     }
 }
 
-fn run<F: Fallback>(
-    sessions: &mut HashMap<SessionId, (Session<F>, Instant)>,
-    id: SessionId,
+/// One EVM pass over `tx`, uncommitted: the result and the diff it would
+/// write.
+fn transact<F: Fallback>(
+    session: &mut Session<F>,
     tx: TxEnv,
-    commit: bool,
     disable_checks: bool,
-) -> Result<ExecutionResult, SessionError>
+) -> Result<(ExecutionResult, revm::state::EvmState), SessionError>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
-    let (session, touched) = sessions.get_mut(&id).ok_or(SessionError::Unknown(id))?;
-    *touched = Instant::now();
     let block_env = session.block_env().clone();
     let ctx = revm::Context::mainnet().with_db(session).with_block(block_env);
     // Real nodes' eth_estimateGas disables balance/base-fee checks too —
@@ -815,11 +1225,8 @@ where
         ctx
     };
     let mut evm = ctx.build_mainnet();
-    if commit {
-        evm.transact_commit(tx).map_err(execution_error)
-    } else {
-        evm.transact(tx).map(|result_and_state| result_and_state.result).map_err(execution_error)
-    }
+    let out = evm.transact(tx).map_err(execution_error)?;
+    Ok((out.result, out.state))
 }
 
 /// Keeps a validation rejection typed and stringifies everything else.
@@ -1614,5 +2021,283 @@ mod tests {
             },
             other => panic!("expected a typed rejection, got {other:?}"),
         }
+    }
+
+    /// A snapshot directory unique to one test, removed afterwards.
+    struct SnapshotDir(std::path::PathBuf);
+
+    impl SnapshotDir {
+        fn new() -> Self {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "forkyard-session-snapshots-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self(path)
+        }
+
+        fn store(&self) -> SnapshotStore {
+            SnapshotStore::new(&self.0, 1)
+        }
+    }
+
+    impl Drop for SnapshotDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_resumes_into_an_independent_session_with_the_same_state() {
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        let original = mgr.fork().await.unwrap();
+        let touched = Address::from([0x91; 20]);
+        fund(&mgr, original, touched, 321).await;
+        let slot = StorageKey::from(4u64);
+        mgr.set_storage(original, touched, slot, U256::from(88u64)).await.unwrap();
+
+        let info = mgr.snapshot(original).await.unwrap();
+        let resumed = mgr.resume(&info.id).await.unwrap();
+
+        assert_ne!(resumed, original);
+        assert_eq!(balance_of(&mgr, resumed, touched).await, U256::from(321));
+        assert_eq!(mgr.storage(resumed, touched, slot).await.unwrap(), U256::from(88u64));
+
+        // Independent from here on, both ways.
+        fund(&mgr, resumed, touched, 1).await;
+        assert_eq!(balance_of(&mgr, original, touched).await, U256::from(321));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_survives_the_process_that_took_it() {
+        let dir = SnapshotDir::new();
+        let touched = Address::from([0x92; 20]);
+        let id = {
+            let before = manager().with_snapshots(dir.store());
+            let session = before.fork().await.unwrap();
+            fund(&before, session, touched, 654).await;
+            before.snapshot(session).await.unwrap().id
+        };
+
+        // A fresh manager sharing only the directory — a restart.
+        let after = manager().with_snapshots(dir.store());
+        let resumed = after.resume(&id).await.unwrap();
+        assert_eq!(balance_of(&after, resumed, touched).await, U256::from(654));
+    }
+
+    #[tokio::test]
+    async fn a_branch_snapshots_with_everything_it_inherited() {
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        let parent = mgr.fork().await.unwrap();
+        let from_parent = Address::from([0x93; 20]);
+        fund(&mgr, parent, from_parent, 10).await;
+        let child = mgr.fork_from(parent).await.unwrap();
+        mgr.discard(parent).await.unwrap();
+
+        let resumed = mgr.resume(&mgr.snapshot(child).await.unwrap().id).await.unwrap();
+        assert_eq!(balance_of(&mgr, resumed, from_parent).await, U256::from(10));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_at_a_pinned_block_resumes_at_that_block() {
+        let dir = SnapshotDir::new();
+        let (mgr, _calls) = pinning_manager(DEFAULT_MAX_PINNED_BLOCKS);
+        let mgr = mgr.with_snapshots(dir.store());
+        let at_100 = mgr.fork_at_block(100).await.unwrap();
+        let written = Address::from([0x94; 20]);
+        mgr.set_account(at_100, written, AccountInfo { balance: U256::from(5), ..Default::default() })
+            .await
+            .unwrap();
+
+        let resumed = mgr.resume(&mgr.snapshot(at_100).await.unwrap().id).await.unwrap();
+
+        assert_eq!(mgr.session_block_env(resumed).await.unwrap().number, U256::from(100));
+        // Unwritten state comes from block 100's fallback, not the default's.
+        assert_eq!(watched_balance(&mgr, resumed).await, U256::from(100));
+        assert_eq!(mgr.basic(resumed, written).await.unwrap().unwrap().balance, U256::from(5));
+    }
+
+    #[tokio::test]
+    async fn snapshots_without_a_store_or_with_a_bad_id_are_errors() {
+        let mgr = manager();
+        let id = mgr.fork().await.unwrap();
+        assert!(matches!(mgr.snapshot(id).await, Err(SessionError::Snapshot(_))));
+
+        let dir = SnapshotDir::new();
+        let mgr = manager().with_snapshots(dir.store());
+        assert!(matches!(mgr.resume("not-an-id").await, Err(SessionError::Snapshot(_))));
+        assert!(matches!(mgr.resume(&"a".repeat(32)).await, Err(SessionError::Snapshot(_))));
+        assert!(matches!(mgr.snapshot(12345).await, Err(SessionError::Unknown(12345))));
+    }
+
+    /// An upstream that takes `delay` per read and counts them — and fails
+    /// every read with `fail` set. Wrapped in the real `ReadThrough`, so
+    /// the worker's speculative path runs exactly as in production.
+    #[derive(Clone)]
+    struct SlowFallback {
+        delay: Duration,
+        reads: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    impl DatabaseRef for SlowFallback {
+        type Error = FundedFallbackError;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(self.delay);
+            if self.fail {
+                return Err(FundedFallbackError);
+            }
+            let balance = if address == FUNDED { U256::from(FUNDED_BALANCE) } else { U256::ZERO };
+            Ok(Some(AccountInfo { balance, ..Default::default() }))
+        }
+        fn code_by_hash_ref(&self, _code_hash: B256) -> Result<Bytecode, Self::Error> {
+            Ok(Bytecode::default())
+        }
+        fn storage_ref(&self, _address: Address, _index: U256) -> Result<U256, Self::Error> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(self.delay);
+            Ok(U256::ZERO)
+        }
+        fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
+            Ok(B256::ZERO)
+        }
+    }
+
+    type Slow = forkyard_fetch::ReadThrough<SlowFallback>;
+
+    /// One worker, so every session below shares it — the case where a
+    /// blocking read used to stall everyone.
+    /// Every key set the resolver was handed, in order.
+    type Rounds = Arc<Mutex<Vec<Vec<StateKey>>>>;
+
+    fn slow_manager(delay: Duration, fail: bool) -> (Arc<SessionManager<Slow>>, Rounds) {
+        let fallback = forkyard_fetch::ReadThrough::new(SlowFallback { delay, reads: Arc::default(), fail });
+        let rounds: Rounds = Arc::default();
+        let seen = Arc::clone(&rounds);
+        let mgr = SessionManager::new(fallback, BlockEnv::default(), 1, Duration::from_secs(60)).with_resolver(
+            move |fallback: &Slow, keys: &[StateKey]| {
+                seen.lock().unwrap().push(keys.to_vec());
+                fallback.resolve(keys)
+            },
+        );
+        (Arc::new(mgr), rounds)
+    }
+
+    #[tokio::test]
+    async fn a_session_waiting_on_upstream_does_not_stall_the_others_on_its_worker() {
+        let (mgr, _) = slow_manager(Duration::from_millis(400), false);
+        let cold = mgr.fork().await.unwrap();
+        let warm = mgr.fork().await.unwrap();
+        let known = Address::from([0xa1; 20]);
+        mgr.set_account(warm, known, AccountInfo { balance: U256::from(9), ..Default::default() }).await.unwrap();
+
+        let slow = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.basic(cold, FUNDED).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = Instant::now();
+        assert_eq!(mgr.basic(warm, known).await.unwrap().unwrap().balance, U256::from(9));
+        assert!(
+            start.elapsed() < Duration::from_millis(200),
+            "a warm read waited {:?} behind another session's upstream fetch",
+            start.elapsed()
+        );
+
+        let fetched = slow.await.unwrap().unwrap().unwrap();
+        assert_eq!(fetched.balance, U256::from(FUNDED_BALANCE), "the parked read answers once its data is in");
+    }
+
+    #[tokio::test]
+    async fn a_transaction_that_missed_commits_exactly_once_and_fetches_sender_and_recipient_together() {
+        let (mgr, rounds) = slow_manager(Duration::from_millis(20), false);
+        let id = mgr.fork().await.unwrap();
+        let recipient = Address::from([0xa2; 20]);
+
+        let result = mgr.advance(id, spend_funded_balance(recipient)).await.unwrap();
+        assert!(result.is_success());
+        assert_eq!(balance_of_slow(&mgr, id, recipient).await, U256::from(FUNDED_BALANCE));
+        let sender = mgr.basic(id, FUNDED).await.unwrap().unwrap();
+        assert_eq!((sender.balance, sender.nonce), (U256::ZERO, 1), "one commit, not one per pass");
+
+        let first = rounds.lock().unwrap()[0].clone();
+        assert!(
+            first.contains(&StateKey::Account(FUNDED)) && first.contains(&StateKey::Account(recipient)),
+            "sender and recipient must share one round trip: {first:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn jobs_for_one_session_keep_their_order_while_one_waits_on_upstream() {
+        let (mgr, _) = slow_manager(Duration::from_millis(200), false);
+        let id = mgr.fork().await.unwrap();
+        let recipient = Address::from([0xa3; 20]);
+
+        let advance = {
+            let mgr = Arc::clone(&mgr);
+            tokio::spawn(async move { mgr.advance(id, spend_funded_balance(recipient)).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Sent while the advance is parked: it must queue behind it and see
+        // its result, not overtake it.
+        assert_eq!(balance_of_slow(&mgr, id, recipient).await, U256::from(FUNDED_BALANCE));
+        assert!(advance.await.unwrap().unwrap().is_success());
+    }
+
+    #[tokio::test]
+    async fn an_upstream_failure_surfaces_as_the_jobs_error_instead_of_retrying_forever() {
+        let (mgr, _) = slow_manager(Duration::from_millis(1), true);
+        let id = mgr.fork().await.unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), mgr.basic(id, FUNDED)).await;
+        assert!(matches!(outcome, Ok(Err(SessionError::Execution(_)))), "{outcome:?}");
+    }
+
+    async fn balance_of_slow(mgr: &SessionManager<Slow>, id: SessionId, address: Address) -> U256 {
+        mgr.basic(id, address).await.unwrap().unwrap_or_default().balance
+    }
+
+    #[test]
+    fn a_pass_that_panics_leaves_no_placeholder_behind() {
+        let fallback: Slow =
+            forkyard_fetch::ReadThrough::new(SlowFallback { delay: Duration::ZERO, reads: Arc::default(), fail: false });
+        let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fallback, BlockEnv::default());
+        let slot = StorageKey::from(1u64);
+
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = attempt(&mut session, false, |session| {
+                // Answered with a placeholder zero, and cached as it is.
+                let _ = Database::storage(session, FUNDED, slot);
+                panic!("revm fell over mid-pass");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(session.state().storage.is_empty(), "the panicked pass's placeholder must be rolled back");
+
+        // The next blocking pass on this thread reads the real account.
+        let info = attempt(&mut session, true, |session| Database::basic(session, FUNDED).unwrap()).unwrap();
+        assert_eq!(info.unwrap().balance, U256::from(FUNDED_BALANCE));
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_panics_still_unblocks_the_session() {
+        let fallback: Slow =
+            forkyard_fetch::ReadThrough::new(SlowFallback { delay: Duration::ZERO, reads: Arc::default(), fail: false });
+        let mgr = SessionManager::new(fallback, BlockEnv::default(), 1, Duration::from_secs(60))
+            .with_resolver(|_: &Slow, _: &[StateKey]| panic!("resolver blew up"));
+        let id = mgr.fork().await.unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), mgr.basic(id, FUNDED)).await;
+        let info = answer.expect("the session must not hang").expect("the blocking retry reads it directly");
+        assert_eq!(info.unwrap().balance, U256::from(FUNDED_BALANCE));
+
+        // And the session keeps working afterwards.
+        mgr.set_account(id, FUNDED, AccountInfo::default()).await.unwrap();
+        assert_eq!(mgr.basic(id, FUNDED).await.unwrap().unwrap().balance, U256::ZERO);
     }
 }

@@ -23,11 +23,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forkyard_api_mcp::ForkyardMcpServer;
-use forkyard_engine::persist::{default_cache_dir, CacheKey, ForkCache};
+use forkyard_engine::persist::{default_cache_dir, default_snapshot_dir, CacheKey, ForkCache, SnapshotStore};
 use forkyard_engine::BaseSnapshot;
 use forkyard_fetch::Fork;
 use forkyard_ingest::ChainTipFollower;
 use forkyard_session::{BlockForkFuture, SessionManager, DEFAULT_MAX_PINNED_BLOCKS};
+use revm::context::BlockEnv;
 use tracing_subscriber::EnvFilter;
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
@@ -68,7 +69,7 @@ fn persist_cache(
         _ => fetched,
     };
 
-    match cache.store(key, &snapshot) {
+    match cache.store_with_block_env(key, &snapshot, &manager.block_env()) {
         Ok(()) => tracing::info!(
             path = %cache.path_for(key).display(),
             accounts = snapshot.account_count(),
@@ -78,6 +79,31 @@ fn persist_cache(
         ),
         Err(error) => {
             tracing::warn!(%error, "could not persist the fork cache; the next start at this block will be cold")
+        }
+    }
+}
+
+/// The persisted cache for `key` and the block env it recorded, or `None`
+/// — logged, never fatal — for any file that can't be used.
+fn load_cache(cache: &ForkCache, key: CacheKey) -> Option<(BaseSnapshot, Option<BlockEnv>)> {
+    match cache.load_with_block_env(key) {
+        Ok((base, block_env)) => {
+            tracing::info!(
+                path = %cache.path_for(key).display(),
+                accounts = base.account_count(),
+                storage_slots = base.storage_count(),
+                contracts = base.code_count(),
+                "loaded a persisted fork cache — this start is warm"
+            );
+            Some((base, block_env))
+        }
+        Err(error) if error.is_missing() => {
+            tracing::info!(path = %cache.path_for(key).display(), "no persisted fork cache for this block yet — cold start");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "ignoring the persisted fork cache and starting cold");
+            None
         }
     }
 }
@@ -95,10 +121,20 @@ async fn main() -> eyre::Result<()> {
         .expect("set RPC_URL to an EVM RPC endpoint (see .env.example)");
     let port: u16 = env_or("FORKYARD_PORT", 8555);
     let mcp_http_port: u16 = env_or("FORKYARD_MCP_HTTP_PORT", 8556);
-    let num_workers: usize = env_or("FORKYARD_NUM_WORKERS", 4);
+    // One worker per core: a worker blocked on an upstream miss stalls
+    // every session sharded onto it, so a fixed 4 was the ceiling the
+    // 50-agent benchmark ran into on a 12-core machine.
+    let default_workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let num_workers: usize = env_or("FORKYARD_NUM_WORKERS", default_workers);
     let ttl_secs: u64 = env_or("FORKYARD_SESSION_TTL_SECS", 3600);
     let ingest_poll_secs: u64 = env_or("FORKYARD_INGEST_POLL_SECS", 12);
     let chain_id: u64 = env_or("FORKYARD_CHAIN_ID", 1);
+    // Batches in flight to the upstream at once; a burst past it queues
+    // here rather than being refused by the provider's rate limit.
+    forkyard_fetch::set_upstream_max_in_flight(env_or(
+        "FORKYARD_UPSTREAM_MAX_IN_FLIGHT",
+        forkyard_fetch::DEFAULT_UPSTREAM_MAX_IN_FLIGHT,
+    ));
     let fork_block_number: Option<u64> =
         std::env::var("FORKYARD_FORK_BLOCK_NUMBER").ok().and_then(|v| v.parse().ok());
 
@@ -120,37 +156,48 @@ async fn main() -> eyre::Result<()> {
     // serializing the whole snapshot that often for surviving a SIGKILL.
     let cache_flush_secs: u64 = env_or("FORKYARD_CACHE_FLUSH_SECS", 0);
 
-    let (fork, block_env) = match fork_block_number {
-        Some(n) => forkyard_fetch::fork_at(&rpc_url, n).await?,
-        None => forkyard_fetch::fork(&rpc_url).await?,
+    // A pinned block is known before anything is fetched, so its cache can
+    // be read first — and if it recorded the block env, the header fetch
+    // is skipped too: a warm pinned start serves before making any upstream
+    // call (the only one is the background connection keep-alive).
+    // Following the tip, the block (and so the cache file) is only known
+    // once the header has been fetched.
+    let pinned_cache = fork_block_number
+        .zip(cache.as_ref())
+        .and_then(|(n, cache)| load_cache(cache, CacheKey::new(chain_id, n)));
+    let (fork, block_env, seeded_base) = match (fork_block_number, pinned_cache) {
+        (Some(_), Some((base, Some(block_env)))) => {
+            tracing::info!("using the block env the cache recorded — no header fetch");
+            let fork = forkyard_fetch::fork_with_block_env(&rpc_url, block_env.clone()).await?;
+            (fork, block_env, Some(base))
+        }
+        (Some(n), pinned_cache) => {
+            let (fork, block_env) = forkyard_fetch::fork_at(&rpc_url, n).await?;
+            (fork, block_env, pinned_cache.map(|(base, _)| base))
+        }
+        (None, _) => {
+            let (fork, block_env) = forkyard_fetch::fork(&rpc_url).await?;
+            let base = cache
+                .as_ref()
+                .zip(u64::try_from(block_env.number).ok())
+                .and_then(|(cache, n)| load_cache(cache, CacheKey::new(chain_id, n)))
+                .map(|(base, _)| base);
+            (fork, block_env, base)
+        }
     };
-
     // Before any session exists, so even the first read of a restarted
     // process is warm. Any unusable cache file (missing, truncated, wrong
-    // chain or block, older format) is logged and ignored — never fatal.
-    let seeded = cache.as_ref().zip(u64::try_from(block_env.number).ok()).and_then(|(cache, block_number)| {
-        let key = CacheKey::new(chain_id, block_number);
-        match cache.load(key) {
-            Ok(base) => {
-                tracing::info!(
-                    path = %cache.path_for(key).display(),
-                    accounts = base.account_count(),
-                    storage_slots = base.storage_count(),
-                    contracts = base.code_count(),
-                    "loaded a persisted fork cache — this start is warm"
-                );
-                Some((key, base))
-            }
-            Err(error) if error.is_missing() => {
-                tracing::info!(path = %cache.path_for(key).display(), "no persisted fork cache for this block yet — cold start");
-                None
-            }
-            Err(error) => {
-                tracing::warn!(%error, "ignoring the persisted fork cache and starting cold");
-                None
-            }
-        }
-    });
+    // chain or block, older format) was logged and ignored — never fatal.
+    let seeded = seeded_base
+        .zip(u64::try_from(block_env.number).ok())
+        .map(|(base, block_number)| (CacheKey::new(chain_id, block_number), base));
+
+    // Snapshots are user data, not a cache: they're on even with
+    // `FORKYARD_CACHE_DISABLED`, and live in their own directory.
+    let snapshot_dir =
+        std::env::var_os("FORKYARD_SNAPSHOT_DIR").map(PathBuf::from).unwrap_or_else(default_snapshot_dir);
+    let snapshots = SnapshotStore::new(&snapshot_dir, chain_id);
+
     // The factory is the only thing that knows the RPC URL —
     // `forkyard-session` deliberately doesn't, which keeps it testable
     // against an in-memory fallback with no network.
@@ -164,13 +211,23 @@ async fn main() -> eyre::Result<()> {
                 })
             },
             max_pinned_blocks,
-        );
+        )
+        .with_snapshots(snapshots)
+        // Whatever a speculative pass missed goes upstream as one JSON-RPC
+        // batch rather than a request per key.
+        .with_resolver(|fork: &Fork, keys: &[forkyard_session::StateKey]| fork.resolve(keys));
     if let Some((_, base)) = &seeded {
         manager = manager.with_base(base.clone());
     }
     let manager = Arc::new(manager);
     let seeded = seeded.map(Arc::new);
-    tracing::info!(num_workers, ttl_secs, max_pinned_blocks, "forked upstream chain, session manager ready");
+    tracing::info!(
+        num_workers,
+        ttl_secs,
+        max_pinned_blocks,
+        snapshot_dir = %snapshot_dir.display(),
+        "forked upstream chain, session manager ready"
+    );
 
     // Background chain-tip follower — only when the fork isn't pinned to an
     // explicit block. A pinned historical block and "keep following the

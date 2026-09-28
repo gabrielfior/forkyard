@@ -102,3 +102,28 @@ def test_upstream_row_keeps_only_the_five_busiest_methods():
     top = json.loads(upstream_row("forkyard", 1, 1, 1, stats)["top_methods"])
 
     assert list(top) == ["m7", "m6", "m5", "m4", "m3"]
+
+
+def test_backend_factories_survive_pickling_for_client_processes():
+    import pickle
+    from run_benchmark import AnvilFactory, ForkyardFactory
+
+    forkyard = pickle.loads(pickle.dumps(ForkyardFactory("http://127.0.0.1:1")))
+    assert forkyard(3).keywords == {"base_url": "http://127.0.0.1:1"}
+
+    anvil = pickle.loads(pickle.dumps(AnvilFactory(19000, 2, "http://up", 5, True)))
+    assert anvil == AnvilFactory(19000, 2, "http://up", 5, True)
+
+
+def test_one_client_process_runs_every_agent_in_threads(monkeypatch):
+    seen: list[int] = []
+
+    def fake_run_agent(make_backend, backend_name, rng, agent_id, *args, **kwargs):
+        seen.append(agent_id)
+        return [ActionRecord(backend_name, 1, 3, agent_id, "acquire", 1.0, True, "")]
+
+    monkeypatch.setattr(run_benchmark, "run_agent", fake_run_agent)
+    records, total_ms = run_benchmark._run_agents(lambda i: None, "forkyard", 3, 1, 5, 1)
+    assert sorted(seen) == [0, 1, 2]
+    assert [r.agent_id for r in records] == [0, 1, 2]
+    assert total_ms >= 0

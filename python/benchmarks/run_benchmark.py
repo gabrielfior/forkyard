@@ -7,13 +7,16 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import functools
 import json
+import multiprocessing
 import os
 import random
 import shutil
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from typing import Callable, IO
 
 import requests
@@ -126,20 +129,47 @@ def _wait_for_forkyard(base_url: str, timeout_s: float = 20.0) -> None:
     raise RuntimeError(f"forkyard on {base_url} did not become ready in {timeout_s}s: {last_error}")
 
 
-def _run_agents(
+@dataclass(frozen=True)
+class ForkyardFactory:
+    """`make_backend_for_agent` for forkyard, as a picklable value rather than
+    a lambda, so `_run_agents` can hand it to other processes."""
+
+    base_url: str
+
+    def __call__(self, agent_index: int) -> Callable[[], Backend]:
+        return functools.partial(ForkyardBackend, base_url=self.base_url)
+
+
+@dataclass(frozen=True)
+class AnvilFactory:
+    """`make_backend_for_agent` for Anvil. A port window per agent: a
+    discarded process leaves its port in TIME_WAIT, so the next episode
+    must not reuse it."""
+
+    base_port: int
+    episodes: int
+    rpc_url: str
+    block_height: int
+    rpc_cache: bool
+
+    def __call__(self, agent_index: int) -> Callable[[], Backend]:
+        start = self.base_port + agent_index * self.episodes
+        ports = iter(range(start, start + self.episodes))
+        return lambda: AnvilBackend(next(ports), self.rpc_url, self.block_height, rpc_cache=self.rpc_cache)
+
+
+def _run_agent_threads(
     make_backend_for_agent: Callable[[int], Callable[[], Backend]],
+    agent_ids: list[int],
     backend_name: str,
     num_agents: int,
     block_height: int,
     actions_per_agent: int,
     episodes: int,
-    contracts_per_agent: list[list[str]] | None = None,
-) -> tuple[list[ActionRecord], float]:
-    """Run `num_agents` agents concurrently, returning their records and the
-    wall-clock they took together. Shared by both backends so their timed
-    regions cannot drift apart."""
-    start = time.monotonic()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_agents) as pool:
+    contracts_per_agent: list[list[str]] | None,
+) -> list[ActionRecord]:
+    """Run `agent_ids` concurrently, one thread each, in this process."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(agent_ids))) as pool:
         futures = [
             pool.submit(
                 lambda i=i: run_agent(
@@ -154,11 +184,64 @@ def _run_agents(
                     contracts=contracts_per_agent[i] if contracts_per_agent else None,
                 )
             )
-            for i in range(num_agents)
+            for i in agent_ids
         ]
-        all_records = [r for f in futures for r in f.result()]
-    total_ms = (time.monotonic() - start) * 1000
-    return all_records, total_ms
+        return [r for f in futures for r in f.result()]
+
+
+def _warm_client_process(hold_s: float) -> int:
+    """Occupy one pool process for `hold_s`, so N of these force N distinct
+    processes up — interpreter start and the web3 import land here, before
+    the clock, not in some agent's first action."""
+    time.sleep(hold_s)
+    return os.getpid()
+
+
+def _run_agents(
+    make_backend_for_agent: Callable[[int], Callable[[], Backend]],
+    backend_name: str,
+    num_agents: int,
+    block_height: int,
+    actions_per_agent: int,
+    episodes: int,
+    contracts_per_agent: list[list[str]] | None = None,
+    client_processes: int = 1,
+) -> tuple[list[ActionRecord], float]:
+    """Run `num_agents` agents concurrently, returning their records and the
+    wall-clock they took together. Shared by both backends so their timed
+    regions cannot drift apart.
+
+    `client_processes` > 1 spreads the agents' threads over that many
+    processes. One Python process can't drive 50 agents' signing and
+    JSON-RPC encoding faster than one core allows: measured, the client was
+    busy 1.6 s of a 1.8 s forkyard run, so beyond that point this was timing
+    the harness, not the backend. `make_backend_for_agent` must then be
+    picklable (`ForkyardFactory`, `AnvilFactory`)."""
+    if client_processes <= 1:
+        start = time.monotonic()
+        records = _run_agent_threads(
+            make_backend_for_agent, list(range(num_agents)), backend_name, num_agents,
+            block_height, actions_per_agent, episodes, contracts_per_agent,
+        )
+        return records, (time.monotonic() - start) * 1000
+
+    chunks = [list(range(p, num_agents, client_processes)) for p in range(min(client_processes, num_agents))]
+    context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=len(chunks), mp_context=context) as pool:
+        warmed = set(pool.map(_warm_client_process, [0.5] * len(chunks)))
+        if len(warmed) < len(chunks):
+            print(f"warning: only {len(warmed)} of {len(chunks)} client processes warmed up", file=sys.stderr)
+        start = time.monotonic()
+        futures = [
+            pool.submit(
+                _run_agent_threads, make_backend_for_agent, chunk, backend_name, num_agents,
+                block_height, actions_per_agent, episodes, contracts_per_agent,
+            )
+            for chunk in chunks
+        ]
+        records = [r for f in futures for r in f.result()]
+        total_ms = (time.monotonic() - start) * 1000
+    return sorted(records, key=lambda r: r.agent_id), total_ms
 
 
 def run_forkyard_sweep(
@@ -166,6 +249,7 @@ def run_forkyard_sweep(
     port: int, mcp_port: int, episodes: int = 1,
     contracts_per_agent: list[list[str]] | None = None,
     cold_cache: bool = False,
+    client_processes: int = 1,
 ) -> tuple[list[ActionRecord], float]:
     env = {
         **os.environ,
@@ -197,9 +281,9 @@ def run_forkyard_sweep(
         # analogue. Hoisting the session open out of the agent would break
         # that symmetry with run_anvil_sweep.
         return _run_agents(
-            lambda i: (lambda: ForkyardBackend(base_url=base_url)),
+            ForkyardFactory(base_url),
             "forkyard", num_agents, block_height, actions_per_agent, episodes,
-            contracts_per_agent,
+            contracts_per_agent, client_processes,
         )
     finally:
         _terminate(process)
@@ -210,19 +294,15 @@ def run_anvil_sweep(
     base_port: int, episodes: int = 1,
     contracts_per_agent: list[list[str]] | None = None,
     anvil_rpc_cache: bool = True,
+    client_processes: int = 1,
 ) -> tuple[list[ActionRecord], float]:
     # Timed per agent and episode: spawn + wait-until-ready, actions, and
     # the discard that kills the process. Anvil has no shared startup to
     # exclude, which is why run_forkyard_sweep excludes only forkyard's.
-    def factory_for(agent_index: int) -> Callable[[], Backend]:
-        # A port window per agent: a discarded process leaves its port in
-        # TIME_WAIT, so the next episode must not reuse it.
-        ports = iter(range(base_port + agent_index * episodes, base_port + (agent_index + 1) * episodes))
-        return lambda: AnvilBackend(next(ports), rpc_url, block_height, rpc_cache=anvil_rpc_cache)
-
     return _run_agents(
-        factory_for, "anvil", num_agents, block_height, actions_per_agent, episodes,
-        contracts_per_agent,
+        AnvilFactory(base_port, episodes, rpc_url, block_height, anvil_rpc_cache),
+        "anvil", num_agents, block_height, actions_per_agent, episodes,
+        contracts_per_agent, client_processes,
     )
 
 
@@ -256,6 +336,12 @@ def main() -> None:
              "the same contracts (shared) or its own (disjoint). Isolates how "
              "much of the difference between the two architectures is one cache "
              "being shared rather than N caches being separate.",
+    )
+    parser.add_argument(
+        "--client-processes", type=int, default=1,
+        help="spread each sweep's agents over this many client processes (both "
+             "backends alike). 1, the default, is one process of threads, which "
+             "saturates a core at ~50 agents and then measures itself.",
     )
     parser.add_argument("--rpc-url", required=True)
     parser.add_argument("--out", default="results.csv")
@@ -300,10 +386,10 @@ def main() -> None:
                         for sweep_fn, label in [
                             (lambda bh=block_height, na=num_agents, cpa=contracts_per_agent: run_forkyard_sweep(
                                 rpc_url, bh, na, args.actions_per_agent, 18555, 18556, args.episodes, cpa,
-                                args.cold_caches), "forkyard"),
+                                args.cold_caches, args.client_processes), "forkyard"),
                             (lambda bh=block_height, na=num_agents, cpa=contracts_per_agent: run_anvil_sweep(
                                 rpc_url, bh, na, args.actions_per_agent, 19000, args.episodes, cpa,
-                                not args.cold_caches), "anvil"),
+                                not args.cold_caches, args.client_processes), "anvil"),
                         ]:
                             print(
                                 f"running {label}: block={block_height} agents={num_agents} "

@@ -1,0 +1,22 @@
+[package]
+name = "forkyard-loadgen"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "forkyard-loadgen"
+path = "src/main.rs"
+
+[dependencies]
+alloy-consensus = { version = "=2.3.0", features = ["k256"] }
+alloy-eips = "=2.3.0"
+alloy-network = "=2.3.0"
+alloy-primitives = "1.6.1"
+alloy-signer-local = "=2.3.0"
+alloy-sol-types = "1.6.1"
+libc = "0.2.189"
+reqwest = { version = "0.13.4", features = ["json"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time"] }

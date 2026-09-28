@@ -171,6 +171,49 @@ pub struct Session<F: DatabaseRef = NoFallback> {
     overlay_accounts: HashMap<Address, AccountInfo>,
     overlay_code: HashMap<B256, Bytecode>,
     overlay_storage: HashMap<(Address, StorageKey), StorageValue>,
+    /// Every entry `branch` has folded into `base` since the shared base
+    /// this lineage started from. `base` alone can't say which of its
+    /// entries are this session's and which are everyone's, and `state`
+    /// needs exactly that. Structurally shared, so a branch pays for its
+    /// parent's overlay once here, as it already does in `base`.
+    inherited: Inherited,
+    /// `Some` during a speculative pass (`begin_speculation`): every key
+    /// this session cached from its fallback since, so the pass can be
+    /// undone exactly — its reads may have been made-up defaults.
+    read_log: Option<Vec<ReadKey>>,
+}
+
+/// A key the overlay gained from a fallback read, not a write.
+enum ReadKey {
+    Account(Address),
+    Code(B256),
+    Storage(Address, StorageKey),
+}
+
+#[derive(Clone, Default)]
+struct Inherited {
+    accounts: ImHashMap<Address, AccountInfo>,
+    code: ImHashMap<B256, Bytecode>,
+    storage: ImHashMap<(Address, StorageKey), StorageValue>,
+}
+
+/// Everything one session holds that the shared base doesn't: what it
+/// wrote, and what it read through its fallback. Laid over a base at the
+/// same block, it reproduces the session exactly — which is what makes it
+/// a snapshot small enough to put on disk and resume in another process
+/// (`persist::SnapshotStore`). Sorted, so equal state serializes to equal
+/// bytes.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct SessionState {
+    pub accounts: Vec<(Address, AccountInfo)>,
+    pub code: Vec<(B256, Bytecode)>,
+    pub storage: Vec<((Address, StorageKey), StorageValue)>,
+}
+
+impl SessionState {
+    pub fn is_empty(&self) -> bool {
+        self.accounts.is_empty() && self.code.is_empty() && self.storage.is_empty()
+    }
 }
 
 impl<F: DatabaseRef> Session<F> {
@@ -188,7 +231,109 @@ impl<F: DatabaseRef> Session<F> {
             overlay_accounts: HashMap::new(),
             overlay_code: HashMap::new(),
             overlay_storage: HashMap::new(),
+            inherited: Inherited::default(),
+            read_log: None,
         }
+    }
+
+    /// The fallback this session reads through — so a caller can resolve,
+    /// off this thread, what a speculative pass found missing.
+    pub fn fallback(&self) -> &F {
+        &self.fallback
+    }
+
+    /// Start logging what this session caches from its fallback. Pair
+    /// with `end_speculation`.
+    pub fn begin_speculation(&mut self) {
+        self.read_log = Some(Vec::new());
+    }
+
+    /// Stop logging; with `keep` false, forget every fallback read cached
+    /// since `begin_speculation`. Exact, because a fallback read is only
+    /// ever cached for a key the overlay didn't already hold. Writes made
+    /// in between are the caller's to not have made — commit only after a
+    /// clean pass.
+    pub fn end_speculation(&mut self, keep: bool) {
+        let Some(log) = self.read_log.take() else { return };
+        if keep {
+            return;
+        }
+        for key in log {
+            match key {
+                ReadKey::Account(address) => {
+                    self.overlay_accounts.remove(&address);
+                }
+                ReadKey::Code(hash) => {
+                    self.overlay_code.remove(&hash);
+                }
+                ReadKey::Storage(address, index) => {
+                    self.overlay_storage.remove(&(address, index));
+                }
+            }
+        }
+    }
+
+    fn log_read(&mut self, key: ReadKey) {
+        if let Some(log) = self.read_log.as_mut() {
+            log.push(key);
+        }
+    }
+
+    /// `fork`, then lay `state` — a previous session's `state()` at the
+    /// same block — over it. The caller owns the "same block" part, as with
+    /// `SessionManager::with_base`: another block's state is wrong, not
+    /// stale.
+    pub fn restore(
+        base: Arc<BaseSnapshot>,
+        fallback: F,
+        block_env: revm::context::BlockEnv,
+        state: SessionState,
+    ) -> Self {
+        let mut session = Self::fork(base, fallback, block_env);
+        session.overlay_accounts.extend(state.accounts);
+        session.overlay_code.extend(state.code);
+        session.overlay_storage.extend(state.storage);
+        session
+    }
+
+    /// This session's own state, inherited from branching and its own
+    /// overlay together, overlay winning — the inverse of `restore`.
+    ///
+    /// Code is gathered for every contract account that carries none
+    /// inline, from wherever this session can see it without a fallback:
+    /// a restored session would otherwise ask the fallback by hash, which
+    /// a fork backend can't answer.
+    pub fn state(&self) -> SessionState {
+        let mut accounts: HashMap<Address, AccountInfo> =
+            self.inherited.accounts.iter().map(|(a, i)| (*a, i.clone())).collect();
+        accounts.extend(self.overlay_accounts.iter().map(|(a, i)| (*a, i.clone())));
+
+        let mut code: HashMap<B256, Bytecode> =
+            self.inherited.code.iter().map(|(h, c)| (*h, c.clone())).collect();
+        code.extend(self.overlay_code.iter().map(|(h, c)| (*h, c.clone())));
+        for info in accounts.values() {
+            if info.code_hash == revm::primitives::KECCAK_EMPTY || code.contains_key(&info.code_hash) {
+                continue;
+            }
+            let found = info.code.clone().or_else(|| self.base.code.get(&info.code_hash).cloned());
+            if let Some(bytecode) = found {
+                code.insert(info.code_hash, bytecode);
+            }
+        }
+
+        let mut storage: HashMap<(Address, StorageKey), StorageValue> =
+            self.inherited.storage.iter().map(|(k, v)| (*k, *v)).collect();
+        storage.extend(self.overlay_storage.iter().map(|(k, v)| (*k, *v)));
+
+        let mut state = SessionState {
+            accounts: accounts.into_iter().collect(),
+            code: code.into_iter().collect(),
+            storage: storage.into_iter().collect(),
+        };
+        state.accounts.sort_by_key(|(address, _)| *address);
+        state.code.sort_by_key(|(hash, _)| *hash);
+        state.storage.sort_by_key(|(key, _)| *key);
+        state
     }
 
     /// The real block this session's fork is pinned to — what
@@ -228,16 +373,20 @@ impl<F: DatabaseRef> Session<F> {
         F: Clone,
     {
         let mut accounts = self.base.accounts.clone();
+        let mut inherited = self.inherited.clone();
         for (address, info) in &self.overlay_accounts {
             accounts.insert(*address, info.clone());
+            inherited.accounts.insert(*address, info.clone());
         }
         let mut code = self.base.code.clone();
         for (hash, bytecode) in &self.overlay_code {
             code.insert(*hash, bytecode.clone());
+            inherited.code.insert(*hash, bytecode.clone());
         }
         let mut storage = self.base.storage.clone();
         for (key, value) in &self.overlay_storage {
             storage.insert(*key, *value);
+            inherited.storage.insert(*key, *value);
         }
 
         Self {
@@ -249,6 +398,8 @@ impl<F: DatabaseRef> Session<F> {
             overlay_accounts: HashMap::new(),
             overlay_code: HashMap::new(),
             overlay_storage: HashMap::new(),
+            inherited,
+            read_log: None,
         }
     }
 }
@@ -292,6 +443,7 @@ where
             .map_err(SessionDbError::Fallback)?;
         if let Some(info) = &info {
             self.overlay_accounts.insert(address, info.clone());
+            self.log_read(ReadKey::Account(address));
         }
         Ok(info)
     }
@@ -306,6 +458,7 @@ where
         match self.fallback.code_by_hash_ref(code_hash) {
             Ok(code) => {
                 self.overlay_code.insert(code_hash, code.clone());
+                self.log_read(ReadKey::Code(code_hash));
                 Ok(code)
             }
             // A missing fallback (NoFallback) is the common "no code, this
@@ -329,6 +482,7 @@ where
         match self.fallback.storage_ref(address, index) {
             Ok(value) => {
                 self.overlay_storage.insert((address, index), value);
+                self.log_read(ReadKey::Storage(address, index));
                 Ok(value)
             }
             // No fallback configured / slot genuinely empty both read as
@@ -517,5 +671,93 @@ mod tests {
         session.set_storage(address, key, value);
 
         assert_eq!(Database::storage(&mut session, address, key).unwrap(), value);
+    }
+
+    #[test]
+    fn restoring_a_sessions_state_reproduces_it_on_a_fresh_fork() {
+        let base_only = Address::from([0x61; 20]);
+        let base = Arc::new(BaseSnapshot::from_parts([(base_only, funded(7))], [], [], []));
+        let mut original = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let written = Address::from([0x62; 20]);
+        let key = StorageKey::from(3u64);
+        original.set_account(written, funded(900));
+        original.set_storage(written, key, StorageValue::from(11u64));
+
+        let state = original.state();
+        assert_eq!(state.accounts.len(), 1, "the shared base is not the session's to carry: {state:?}");
+
+        let mut restored = Session::restore(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default(), state);
+        assert_eq!(restored.basic(written).unwrap().unwrap().balance, revm::primitives::U256::from(900u64));
+        assert_eq!(Database::storage(&mut restored, written, key).unwrap(), StorageValue::from(11u64));
+        assert_eq!(restored.basic(base_only).unwrap().unwrap().balance, revm::primitives::U256::from(7u64));
+    }
+
+    #[test]
+    fn a_branchs_state_carries_what_it_inherited_from_its_parent() {
+        let base = Arc::new(BaseSnapshot::default());
+        let mut parent = Session::fork(Arc::clone(&base), NoFallback, revm::context::BlockEnv::default());
+        let from_parent = Address::from([0x71; 20]);
+        parent.set_account(from_parent, funded(1));
+
+        let mut child = parent.branch();
+        let from_child = Address::from([0x72; 20]);
+        child.set_account(from_child, funded(2));
+        drop(parent);
+
+        // Laid over the *original* base, since that's all a resuming
+        // process has — the parent's folded base died with the parent.
+        let mut restored = Session::restore(base, NoFallback, revm::context::BlockEnv::default(), child.state());
+        assert_eq!(restored.basic(from_parent).unwrap().unwrap().balance, revm::primitives::U256::from(1u64));
+        assert_eq!(restored.basic(from_child).unwrap().unwrap().balance, revm::primitives::U256::from(2u64));
+    }
+
+    #[test]
+    fn state_carries_code_a_contract_account_only_references_by_hash() {
+        let code = Bytecode::new_raw(revm::primitives::Bytes::from(vec![0x60, 0x01]));
+        let code_hash = code.hash_slow();
+        let contract = Address::from([0x81; 20]);
+        // The code lives only in the shared base; the session merely
+        // touched the account, e.g. its balance.
+        let base = Arc::new(BaseSnapshot::from_parts([], [(code_hash, code.clone())], [], []));
+        let mut session = Session::fork(base, NoFallback, revm::context::BlockEnv::default());
+        session.set_account(contract, AccountInfo { code_hash, code: None, ..funded(5) });
+
+        let state = session.state();
+        assert_eq!(state.code, vec![(code_hash, code)], "a resumed session must not ask a fork backend for code by hash");
+    }
+
+    #[test]
+    fn equal_state_comes_back_in_the_same_order() {
+        let mut a = Session::fork(Arc::new(BaseSnapshot::default()), NoFallback, revm::context::BlockEnv::default());
+        let mut b = Session::fork(Arc::new(BaseSnapshot::default()), NoFallback, revm::context::BlockEnv::default());
+        let addresses: Vec<Address> = (1u8..40).map(|n| Address::from([n; 20])).collect();
+        for address in &addresses {
+            a.set_account(*address, funded(1));
+        }
+        for address in addresses.iter().rev() {
+            b.set_account(*address, funded(1));
+        }
+        assert_eq!(a.state(), b.state());
+    }
+
+    #[test]
+    fn an_abandoned_speculation_forgets_its_fallback_reads_but_not_earlier_state() {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let code = Bytecode::new_raw(revm::primitives::Bytes::from(vec![0x60, 0x00]));
+        let fallback = CountingCodeFallback { code: code.clone(), hits };
+        let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fallback, revm::context::BlockEnv::default());
+        let written = Address::from([0x91; 20]);
+        session.set_account(written, funded(3));
+
+        session.begin_speculation();
+        session.code_by_hash(code.hash_slow()).unwrap();
+        session.end_speculation(false);
+        assert!(session.state().code.is_empty(), "a read from an abandoned pass must not stay cached");
+        assert_eq!(session.basic(written).unwrap().unwrap().balance, revm::primitives::U256::from(3u64));
+
+        session.begin_speculation();
+        session.code_by_hash(code.hash_slow()).unwrap();
+        session.end_speculation(true);
+        assert_eq!(session.state().code.len(), 1, "a clean pass keeps what it read");
     }
 }
