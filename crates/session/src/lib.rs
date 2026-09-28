@@ -903,17 +903,26 @@ where
         blocked.queue.push_front(job);
         self.blocked.insert(id, blocked);
 
+        // From here on `Unblock` must arrive, whatever happens, or every job
+        // for this session waits behind this one for good: a resolver panic
+        // counts as a failed resolve, and so does failing to spawn.
         let resolver = Arc::clone(&self.resolver.read().unwrap());
         let requeue = self.requeue.clone();
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().name("forkyard-resolve".into()).spawn(move || {
             let start = Instant::now();
             let failed = match &fallback {
-                Some(fallback) => resolver(fallback, &keys).is_err(),
+                Some(fallback) => {
+                    !matches!(std::panic::catch_unwind(AssertUnwindSafe(|| resolver(fallback, &keys))), Ok(Ok(())))
+                }
                 None => true,
             };
             tracing::debug!(session = id, keys = keys.len(), round = rounds, failed, elapsed_ms = start.elapsed().as_millis() as u64, "resolved a speculative pass's misses");
             let _ = requeue.send(Job::Unblock { id, failed });
         });
+        if let Err(error) = spawned {
+            tracing::warn!(session = id, %error, "could not spawn a resolver thread; retrying the job blocking");
+            let _ = self.requeue.send(Job::Unblock { id, failed: true });
+        }
     }
 
     /// Run `id`'s queue from the front until it's empty or a job misses
@@ -1028,7 +1037,17 @@ fn attempt<F: Fallback, R>(
         return Ok(f(session));
     }
     session.begin_speculation();
-    let (result, misses) = forkyard_fetch::speculate(|| f(&mut *session));
+    let pass = std::panic::catch_unwind(AssertUnwindSafe(|| forkyard_fetch::speculate(|| f(&mut *session))));
+    let (result, misses) = match pass {
+        Ok(pass) => pass,
+        Err(panic) => {
+            // Roll back before the panic travels on: the pass may have
+            // cached placeholders, and the worker survives to serve this
+            // session again.
+            session.end_speculation(false);
+            std::panic::resume_unwind(panic);
+        }
+    };
     session.end_speculation(misses.is_empty());
     if misses.is_empty() {
         Ok(result)
@@ -2241,5 +2260,44 @@ mod tests {
 
     async fn balance_of_slow(mgr: &SessionManager<Slow>, id: SessionId, address: Address) -> U256 {
         mgr.basic(id, address).await.unwrap().unwrap_or_default().balance
+    }
+
+    #[test]
+    fn a_pass_that_panics_leaves_no_placeholder_behind() {
+        let fallback: Slow =
+            forkyard_fetch::ReadThrough::new(SlowFallback { delay: Duration::ZERO, reads: Arc::default(), fail: false });
+        let mut session = Session::fork(Arc::new(BaseSnapshot::default()), fallback, BlockEnv::default());
+        let slot = StorageKey::from(1u64);
+
+        let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _ = attempt(&mut session, false, |session| {
+                // Answered with a placeholder zero, and cached as it is.
+                let _ = Database::storage(session, FUNDED, slot);
+                panic!("revm fell over mid-pass");
+            });
+        }));
+        assert!(panicked.is_err());
+        assert!(session.state().storage.is_empty(), "the panicked pass's placeholder must be rolled back");
+
+        // The next blocking pass on this thread reads the real account.
+        let info = attempt(&mut session, true, |session| Database::basic(session, FUNDED).unwrap()).unwrap();
+        assert_eq!(info.unwrap().balance, U256::from(FUNDED_BALANCE));
+    }
+
+    #[tokio::test]
+    async fn a_resolver_that_panics_still_unblocks_the_session() {
+        let fallback: Slow =
+            forkyard_fetch::ReadThrough::new(SlowFallback { delay: Duration::ZERO, reads: Arc::default(), fail: false });
+        let mgr = SessionManager::new(fallback, BlockEnv::default(), 1, Duration::from_secs(60))
+            .with_resolver(|_: &Slow, _: &[StateKey]| panic!("resolver blew up"));
+        let id = mgr.fork().await.unwrap();
+
+        let answer = tokio::time::timeout(Duration::from_secs(5), mgr.basic(id, FUNDED)).await;
+        let info = answer.expect("the session must not hang").expect("the blocking retry reads it directly");
+        assert_eq!(info.unwrap().balance, U256::from(FUNDED_BALANCE));
+
+        // And the session keeps working afterwards.
+        mgr.set_account(id, FUNDED, AccountInfo::default()).await.unwrap();
+        assert_eq!(mgr.basic(id, FUNDED).await.unwrap().unwrap().balance, U256::ZERO);
     }
 }

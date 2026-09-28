@@ -53,12 +53,34 @@ thread_local! {
 /// resolved (`ReadThrough::resolve`). A worker thread never waits on the
 /// network this way; it moves on to another session instead.
 pub fn speculate<R>(f: impl FnOnce() -> R) -> (R, Vec<StateKey>) {
-    let outer = MISSES.with(|m| m.borrow_mut().replace(Vec::new()));
+    let restore = Restore(Some(MISSES.with(|m| m.borrow_mut().replace(Vec::new()))));
     let result = f();
-    let mut misses = MISSES.with(|m| std::mem::replace(&mut *m.borrow_mut(), outer)).unwrap_or_default();
+    let mut misses = restore.finish().unwrap_or_default();
     misses.sort();
     misses.dedup();
     (result, misses)
+}
+
+/// Puts back what this thread was recording before `speculate` began —
+/// on return *and* on unwind. A worker survives a job's panic, and a
+/// thread left speculating would answer every later read, blocking ones
+/// included, with a placeholder instead of real state.
+struct Restore(Option<Option<Vec<StateKey>>>);
+
+impl Restore {
+    /// The misses recorded since `speculate` began.
+    fn finish(mut self) -> Option<Vec<StateKey>> {
+        let outer = self.0.take().expect("finished once");
+        MISSES.with(|m| std::mem::replace(&mut *m.borrow_mut(), outer))
+    }
+}
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        if let Some(outer) = self.0.take() {
+            MISSES.with(|m| *m.borrow_mut() = outer);
+        }
+    }
 }
 
 /// `true`, with `key` recorded, when this thread is speculating: the
@@ -159,9 +181,18 @@ fn shared_upstream(rpc_url: &str) -> eyre::Result<Upstream> {
 
 /// A provider saying "slow down" rather than "no": JSON-RPC's `-32005`
 /// (what Infura, Alchemy, QuickNode and Tenderly return) or an HTTP 429.
+///
+/// Matched on the phrases alloy renders those as — `error code -32005`,
+/// `HTTP error 429` — never a bare number: error text carries hashes and
+/// addresses, and "429" turns up in about 1.5% of random 32-byte hex,
+/// which would turn a permanent error into ~6 s of pointless retries.
 fn is_rate_limited(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
-    error.contains("-32005") || error.contains("429") || error.contains("rate limit") || error.contains("too many requests")
+    error.contains("error code -32005")
+        || error.contains("\"code\":-32005")
+        || error.contains("http error 429")
+        || error.contains("rate limit exceeded")
+        || error.contains("too many requests")
 }
 
 /// Exponential from 100 ms, capped at 2 s, with jitter, so a burst refused
@@ -289,6 +320,11 @@ where
                 StateKey::BlockHash(number) => hashes.push(number),
             }
         }
+        // Only block hashes missing: no batch to send. alloy would send `[]`,
+        // which some providers answer with an error.
+        if accounts.is_empty() && slots.is_empty() {
+            return hashes.into_iter().try_for_each(|n| self.read_blocking(&StateKey::BlockHash(n)));
+        }
         batch.runtime.block_on(async {
             // Held until the reply is in: the cap is on requests in flight.
             let _permit = batch.upstream.in_flight.acquire().await.map_err(err)?;
@@ -300,9 +336,12 @@ where
                 let (code_hash, code) = if code.is_empty() {
                     (KECCAK_EMPTY, None)
                 } else {
-                    (keccak256(&code), Some(Bytecode::new_raw(code)))
+                    // Checked: upstream bytes that don't decode are an
+                    // error to report, not a panic on a resolver thread.
+                    (keccak256(&code), Some(Bytecode::new_raw_checked(code).map_err(|e| format!("code of {address}: {e}"))?))
                 };
-                let info = AccountInfo { balance, nonce: nonce.to::<u64>(), code_hash, code, ..Default::default() };
+                let nonce = u64::try_from(nonce).map_err(|_| format!("nonce of {address} does not fit a u64: {nonce}"))?;
+                let info = AccountInfo { balance, nonce, code_hash, code, ..Default::default() };
                 batch.db.accounts().write().insert(address, info.clone());
                 self.cache.accounts.insert(address, Some(info));
             }
@@ -745,5 +784,41 @@ mod tests {
         let error = result.unwrap_err();
         assert!(is_rate_limited(&error), "{error}");
         assert_eq!(batches.load(Ordering::SeqCst), 1 + RATE_LIMIT_RETRIES as usize);
+    }
+
+    #[test]
+    fn a_panic_mid_speculation_leaves_the_thread_reading_for_real() {
+        let (fork, hits) = counting(0);
+        let address = Address::with_last_byte(10);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            speculate(|| {
+                let _ = fork.basic_ref(address);
+                panic!("a job blew up mid-pass");
+            })
+        }));
+        assert!(panicked.is_err());
+
+        // What a worker's next blocking pass does: this must really fetch.
+        assert_eq!(fork.basic_ref(address).unwrap().unwrap().balance, U256::from(7u64));
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "the thread must not still be recording misses");
+    }
+
+    #[test]
+    fn only_a_rate_limit_is_retried_not_a_number_that_happens_to_contain_429() {
+        let pruned = "server returned an error response: error code -32000: missing trie node \
+                      0x3a4429ff00000000000000000000000000000000000000000000000000004290";
+        assert!(!is_rate_limited(pruned));
+        assert!(!is_rate_limited("nonce of 0x4290000000000000000000000000000000000429 does not fit a u64"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_miss_of_only_block_hashes_sends_no_empty_batch() {
+        let (url, batches) = rate_limited_upstream(0).await;
+        let fork = fork_with_block_env(&url, BlockEnv { number: U256::from(1u64), ..Default::default() }).await.unwrap();
+
+        // The hash goes to the backend's own lookup, which this fake
+        // upstream can't answer; what matters is that no batch went out.
+        let _ = tokio::task::spawn_blocking(move || fork.resolve(&[StateKey::BlockHash(1)])).await.unwrap();
+        assert_eq!(batches.load(Ordering::SeqCst), 0, "an empty `[]` batch must never be sent");
     }
 }
