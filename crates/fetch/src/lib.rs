@@ -6,7 +6,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 
 use alloy_network::Ethereum;
@@ -221,6 +221,46 @@ struct ReadCache {
     accounts: DashMap<Address, Option<AccountInfo>>,
     storage: DashMap<(Address, U256), U256>,
     block_hashes: DashMap<u64, B256>,
+    /// Keys some `resolve` is fetching right now. A session that misses one
+    /// waits for that fetch instead of sending its own: without this, N
+    /// sessions opening cold against the same contracts each fetched them —
+    /// 10 agents cost 343 upstream calls where one agent costs 37.
+    in_flight: Mutex<HashMap<StateKey, Arc<Flight>>>,
+}
+
+/// One key's fetch in progress, for anyone else who needs that key to wait on.
+#[derive(Default)]
+struct Flight {
+    landed: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl Flight {
+    fn wait(&self) {
+        let mut landed = self.landed.lock().unwrap();
+        while !*landed {
+            landed = self.wake.wait(landed).unwrap();
+        }
+    }
+}
+
+/// Ends the flights for `keys` when dropped — on success, error or unwind
+/// alike, so a failed fetch can never leave its waiters waiting for good.
+struct Landing<'a> {
+    cache: &'a ReadCache,
+    keys: Vec<StateKey>,
+}
+
+impl Drop for Landing<'_> {
+    fn drop(&mut self) {
+        let mut in_flight = self.cache.in_flight.lock().unwrap();
+        for key in &self.keys {
+            if let Some(flight) = in_flight.remove(key) {
+                *flight.landed.lock().unwrap() = true;
+                flight.wake.notify_all();
+            }
+        }
+    }
 }
 
 impl<D> ReadThrough<D> {
@@ -242,18 +282,52 @@ where
     /// Fetch every key into the shared cache, blocking the calling thread
     /// — one JSON-RPC batch for all of them when this fork has an upstream,
     /// so a speculative pass that missed k keys costs one round trip, not k.
+    /// A key another session is already fetching isn't asked for again:
+    /// this waits for that fetch, and fetches the key itself only if that
+    /// fetch failed.
     pub fn resolve(&self, keys: &[StateKey]) -> Result<(), String> {
-        let keys: Vec<StateKey> = keys.iter().copied().filter(|k| !self.is_cached(k)).collect();
-        if keys.is_empty() {
-            return Ok(());
+        loop {
+            let (mine, theirs) = self.claim(keys);
+            if !mine.is_empty() {
+                let landing = Landing { cache: &self.cache, keys: mine };
+                match &self.batch {
+                    Some(batch) => self.resolve_batched(batch, &landing.keys),
+                    None => std::thread::scope(|scope| {
+                        let reads: Vec<_> =
+                            landing.keys.iter().map(|key| scope.spawn(move || self.read_blocking(key))).collect();
+                        reads.into_iter().try_for_each(|r| r.join().map_err(|_| "resolver panicked".to_string())?)
+                    }),
+                }?;
+            }
+            if theirs.is_empty() {
+                return Ok(());
+            }
+            theirs.iter().for_each(|flight| flight.wait());
+            // Whatever those fetches failed to land is still missing, and no
+            // longer in flight: the next round claims it.
         }
-        match &self.batch {
-            Some(batch) => self.resolve_batched(batch, &keys),
-            None => std::thread::scope(|scope| {
-                let reads: Vec<_> = keys.iter().map(|key| scope.spawn(move || self.read_blocking(key))).collect();
-                reads.into_iter().try_for_each(|r| r.join().map_err(|_| "resolver panicked".to_string())?)
-            }),
+    }
+
+    /// Split the uncached `keys` into those this call now owns the fetch
+    /// of, and the flights of those someone else is already fetching.
+    fn claim(&self, keys: &[StateKey]) -> (Vec<StateKey>, Vec<Arc<Flight>>) {
+        let mut in_flight = self.cache.in_flight.lock().unwrap();
+        let (mut mine, mut theirs) = (Vec::new(), Vec::new());
+        for key in keys {
+            // Checked under the lock: a fetch caches what it got before its
+            // flight ends, so a key is always either cached or in flight.
+            if self.is_cached(key) {
+                continue;
+            }
+            match in_flight.get(key) {
+                Some(flight) => theirs.push(Arc::clone(flight)),
+                None => {
+                    in_flight.insert(*key, Arc::default());
+                    mine.push(*key);
+                }
+            }
         }
+        (mine, theirs)
     }
 
     fn is_cached(&self, key: &StateKey) -> bool {
@@ -650,6 +724,81 @@ mod tests {
         // Already cached: resolving again costs nothing.
         fork.resolve(&[StateKey::Account(address)]).unwrap();
         assert_eq!(hits.load(Ordering::Relaxed), 1);
+    }
+
+    /// `Counting`, but every read takes `delay` — long enough that
+    /// concurrent resolves of the same key overlap.
+    #[derive(Clone)]
+    struct Slow {
+        inner: Counting,
+        delay: Duration,
+    }
+
+    impl DatabaseRef for Slow {
+        type Error = Upstream;
+        fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            std::thread::sleep(self.delay);
+            self.inner.basic_ref(address)
+        }
+        fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+            self.inner.code_by_hash_ref(code_hash)
+        }
+        fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+            std::thread::sleep(self.delay);
+            self.inner.storage_ref(address, index)
+        }
+        fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+            self.inner.block_hash_ref(number)
+        }
+    }
+
+    fn slow(fail_first: usize) -> (ReadThrough<Slow>, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let inner = Counting { hits: Arc::clone(&hits), fail_first };
+        (ReadThrough::new(Slow { inner, delay: Duration::from_millis(100) }), hits)
+    }
+
+    /// Resolve `keys` from `n` sessions at once, all released together.
+    fn resolve_concurrently(fork: &ReadThrough<Slow>, n: usize, keys: &[StateKey]) -> Vec<Result<(), String>> {
+        let start = std::sync::Barrier::new(n);
+        std::thread::scope(|s| {
+            let resolves: Vec<_> = (0..n)
+                .map(|_| {
+                    let session = fork.clone();
+                    let start = &start;
+                    s.spawn(move || {
+                        start.wait();
+                        session.resolve(keys)
+                    })
+                })
+                .collect();
+            resolves.into_iter().map(|r| r.join().unwrap()).collect()
+        })
+    }
+
+    #[test]
+    fn sessions_missing_the_same_state_at_once_fetch_it_once() {
+        let (fork, hits) = slow(0);
+        let address = Address::with_last_byte(7);
+        let keys = [StateKey::Account(address), StateKey::Storage(address, U256::from(1u64))];
+
+        for result in resolve_concurrently(&fork, 10, &keys) {
+            result.unwrap();
+        }
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "ten cold sessions, one fetch per key");
+        assert_eq!(fork.basic_ref(address).unwrap().unwrap().balance, U256::from(7u64));
+    }
+
+    #[test]
+    fn a_session_waiting_on_a_failed_fetch_fetches_the_key_itself() {
+        // The first fetch fails; whoever waited on it must not give up or
+        // spin, but claim the key and fetch it once more.
+        let (fork, hits) = slow(1);
+        let keys = [StateKey::Account(Address::with_last_byte(8))];
+
+        let results = resolve_concurrently(&fork, 4, &keys);
+        assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1, "only the failed fetch's owner sees its error");
+        assert_eq!(hits.load(Ordering::Relaxed), 2, "one failed fetch, one retry, no more");
     }
 
     #[test]

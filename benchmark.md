@@ -61,8 +61,12 @@ with no Anvil counterpart — while Anvil's per-agent spawn is inside the timer,
 because Anvil pays it once per agent.
 
 **Both tools keep a persistent cache, and both are enabled.** Foundry writes
-fetched fork state to `~/.foundry/cache/rpc/<chain>/<block>/storage.json`;
-forkyard writes its own per `(chain, block)` under `FORKYARD_CACHE_DIR`. Both
+fetched fork state to `~/.foundry/cache/rpc/<chain>/<block>/storage.json`
+(`storage-<keccak(rpc_url)>.json`, one file per endpoint, on current Foundry
+`main`) — but only when a process shuts down cleanly, and as a whole-file
+overwrite of that one process's in-memory cache, so of many Anvils exiting
+together the last one to write wins. forkyard writes its own per
+`(chain, block)` under `FORKYARD_CACHE_DIR`. Both
 survive restarts, so warm-against-warm is the like-for-like comparison and the
 one a returning user gets. `--cold-caches` turns both off to measure a
 first-ever run at a block instead.
@@ -133,48 +137,71 @@ or RPC quota corrupts the first.
 Medians of five warm runs. **Spread** is max/min across those five: 1.0 means
 every run agreed, and anything above ~1.5 is a number to treat as approximate.
 
+**Every table in this section was re-run on 2026-09-30**, on the build that
+fixes concurrent cold fetches (see [state sharing](#upstream-rpc-load)), with
+the shipped defaults — one worker per core. The dated sections after it are kept
+as the record of what each change did at the time; where a later re-run moved
+one of their numbers, it says so beside it.
+
 ### Upstream RPC load
 
 The standard workload, both caches warm:
 
 | Agents | forkyard calls | anvil calls | forkyard per agent | anvil per agent |
 | --- | --- | --- | --- | --- |
-| 1 | 9 | 13 | 9.0 | 13.0 |
-| 10 | **84** | 142 | 8.4 | 14.2 |
-| 50 | **363** | 666 | **7.3** | 13.3 |
+| 1 | 8 | 15 | 8.0 | 15.0 |
+| 10 | **80** | 149 | 8.0 | 14.9 |
+| 50 | **359** | 689 | **7.2** | 13.8 |
 
 forkyard's counts were *identical in all five runs* at every tier; Anvil's
-varied (13 → 96 at one agent, 656 → 785 at fifty) as its cache filled unevenly
+varied (15 → 77 at one agent, 675 → 1,529 at fifty) as its cache filled unevenly
 across processes.
 
 The version that isolates sharing from everything else: a read-only workload
-where every agent reads the **same** 8 contracts, against one where each agent
-reads its **own** 8.
+where every agent reads the **same** 8 contracts. Re-run 2026-09-30 on the
+current build, median of five (min – max in brackets where the runs disagreed):
 
-| Agents | Shared: forkyard | Shared: anvil | Disjoint: forkyard | Disjoint: anvil |
+| Agents | Warm: forkyard | Warm: anvil | Cold: forkyard | Cold: anvil |
 | --- | --- | --- | --- | --- |
-| 1 | **1** | 3 | 1 | 58 |
-| 10 | **1** | 30 | 1 | 327 |
-| 50 | **1** | 300 | 1 | 1,734 |
+| 1 | **1** | 3 (3 – 78) | **37** | 78 |
+| 10 | **1** | 30 | **37** | 778 (430 – 780) |
+| 50 | **1** | 375 (150 – 1,661) | **37** | 2,014 (1,849 – 3,530) |
 
-Warm and sharing state, forkyard needs **one upstream call at any agent count**
-— the fork's own block-header lookup — because the contracts are already in the
-base every session reads from. Anvil, whose cache is per process, still pays
-about six calls per agent.
+**Warm**, forkyard makes one upstream call at any agent count — the
+`eth_chainId` that opens its shared connection — because the contracts are
+already in the persisted base every session reads from. Anvil's floor is
+**three calls per process**, `eth_chainId`, `eth_getBlockByNumber` and
+`eth_gasPrice`: startup, not state. At 10 agents that is all it made in every
+run; the state itself came from its disk cache. Above that floor it varies from
+run to run, because the disk cache is written only when a process exits, as a
+whole-file overwrite of that one process's in-memory cache (foundry `9ce8cd1`:
+`crates/anvil/src/cmd.rs:477-484`; foundry-fork-db `src/cache.rs:418-440`).
+When many Anvils exit together the last writer wins, and the next run finds
+only part of the state on disk.
 
-**The disjoint column stops being a control once caches are warm**, and it is
-worth saying why rather than quietly dropping it. Cold, it separates the two
-things forkyard's cache does: *sharing* one copy between concurrent sessions,
-and *persisting* it across runs. Warm, persistence alone answers the disjoint
-reads too — a previous run already fetched those contracts — so forkyard reports
-1 either way and the column no longer isolates anything. Cold, the same control
-gives 37 shared against 1,605 disjoint for forkyard, which is where the claim
-that sharing (not just persistence) is doing work actually comes from. Run
-`--cold-caches` to reproduce that half.
+**Cold**, the sharing itself shows. forkyard fetches the 8 contracts once — 37
+calls — however many sessions open on them at once; every Anvil fetches them
+for itself, ~78 calls each. At 50 agents that many Anvils hit the provider's
+rate limit (327 – 579 failed calls in three of the four runs that completed),
+so their count undercounts what they asked for: the one clean run made 3,530.
 
-Anvil's disjoint number is high for a warm run because 50 processes exiting at
-once each write the same per-block cache file, so it ends up holding only part
-of what was fetched — a per-process cache paying for a shared workload twice.
+**A regression this caught.** Between `1fb9791` (PR #4) and the fix, the
+batched resolver skipped keys already cached but not keys already *being
+fetched*, so concurrent cold sessions each fetched what they missed: 37 → 343
+→ 1,305 calls at 1 / 10 / 50 agents, against a flat 37 on `63957c6`. The
+fix makes a session that misses an in-flight key wait for that fetch
+(`crates/fetch`, `sessions_missing_the_same_state_at_once_fetch_it_once`).
+
+**A disjoint control** — each agent reading its *own* 8 contracts — separates
+the two things forkyard's cache does: *sharing* one copy between concurrent
+sessions, and *persisting* it across runs. It only works cold. Warm,
+persistence alone answers the disjoint reads too — a previous run already
+fetched those contracts — so forkyard reports 1 either way (an earlier sweep:
+Anvil 58 / 327 / 1,734 at 1 / 10 / 50, the last inflated by the same
+last-writer-wins file). Cold, that earlier sweep gave 37 shared against 1,605
+disjoint for forkyard, which is where the claim that sharing (not just
+persistence) is doing work actually comes from. Run `--cold-caches` to
+reproduce that half.
 
 Priced with Alchemy's published compute-unit table at $0.45/million CU this is
 cents per thousand agent runs either way. The cost argument only matters at
@@ -186,27 +213,35 @@ Every writer writes a value only it uses, to the same account every other writer
 targets, then reads it back. Zero isolation violations across all five runs, so
 these are genuinely isolated agents.
 
-| Concurrent writers | forkyard RSS | anvil RSS | forkyard per GB | anvil per GB |
-| --- | --- | --- | --- | --- |
-| 1 | 21.2 MB | 30.7 MB | 48 | 33 |
-| 10 | 21.5 MB | 292 MB | 476 | 35 |
-| 50 | **23.2 MB** | 1,434 MB | **2,211** | 36 |
+| Concurrent writers | forkyard RSS | forkyard RSS, warm cache loaded | anvil RSS | forkyard per GB | anvil per GB |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 17.8 MB | 98.9 MB | 30.8 MB | 56 | 32 |
+| 10 | 18.4 MB | 99.4 MB | 300 MB | 543 | 33 |
+| 50 | **20.7 MB** | 101.4 MB | 1,291 MB | **2,415** | 39 |
 
-forkyard's footprint moves 21.2 → 23.2 MB going from 1 to 50 concurrent
-writers. Anvil's is linear at ~29 MB each, which is what a process costs — its
+forkyard's footprint moves 17.8 → 20.7 MB going from 1 to 50 concurrent
+writers. Anvil's is linear at ~26 MB each, which is what a process costs — its
 own design decision, not a fault.
+
+**What the per-agent number leaves out is forkyard's warm cache.** The first
+column runs with `FORKYARD_CACHE_DISABLED=1`; the second loads the persisted
+cache for this block at startup, which a day of benchmarks had grown to a 14 MB
+file, and that alone is ~80 MB resident before the first session opens. It is
+flat in agents, not per agent, but it is real memory: a long-lived process at a
+busy block pays it.
 
 ### Acquiring an environment
 
 | Concurrent agents | forkyard `POST /session` | anvil spawn → ready |
 | --- | --- | --- |
-| 1 | **4.3 ms** | 627 ms |
-| 10 | 16.2 ms | 662 ms |
-| 50 | 215 ms | 686 ms |
+| 1 | **2.1 ms** | 634 ms |
+| 10 | **13.2 ms** | 659 ms |
+| 50 | **14.6 ms** | 858 ms |
 
-Uncontended the gap is ~150×. It closes as concurrency rises, because forkyard's
-session opens queue behind its four worker threads while Anvil's spawn cost
-stays flat — the shape behind every high-concurrency result below.
+Uncontended the gap is ~300×, and it no longer closes much under load: with
+four worker threads, the old default, 50 concurrent opens took 215 ms as they
+queued; with one worker per core they take 15 ms. Anvil's spawn cost is flat
+until the machine itself is busy (660 → 2,494 ms across the five 50-agent runs).
 
 ### Branching: K what-ifs from one state
 
@@ -215,13 +250,13 @@ where the architecture allows it. Whole-sweep seconds:
 
 | K | forkyard | anvil-processes | anvil-snapshot |
 | --- | --- | --- | --- |
-| 2 | **0.08** | 0.73 | 0.72 |
-| 8 | **0.18** | 1.97 | 10.67 |
-| 32 | **0.54** | 2.06 | 9.87 |
+| 2 | **0.06** | 1.57 | 1.91 |
+| 8 | **0.14** | 1.94 | 4.12 |
+| 32 | **0.44** | 2.44 | 12.85 |
 
-Creating one branch: forkyard `forkyard_forkFrom` **0.7 ms**, Anvil
-`evm_snapshot` + `evm_revert` 2.2 ms, spawning a process and replaying the
-prefix 1,156 ms. The snapshot stack is fast per operation but serial by
+Creating one branch: forkyard `forkyard_forkFrom` **0.6 ms**, Anvil
+`evm_snapshot` + `evm_revert` 5.9 ms, spawning a process and replaying the
+prefix 1,409 ms. The snapshot stack is fast per operation but serial by
 construction — one branch at a time — which is what the K=8 and K=32 columns
 show. Zero isolation violations: every child's diverging write stayed invisible
 to its siblings and its parent.
@@ -238,9 +273,9 @@ What grows with state is the serializing path, `anvil_dumpState`/`loadState`:
 
 | Dirty slots | anvil dump | anvil load | blob | forkyard fork | anvil snapshot/revert |
 | --- | --- | --- | --- | --- | --- |
-| 100 | 1.2 ms | 1.1 ms | 3.3 KB | 0.7 ms | 0.8 / 1.1 ms |
-| 1,000 | 2.0 ms | 2.0 ms | 8.4 KB | 0.7 ms | 1.0 / 1.2 ms |
-| 10,000 | 5.9 ms | 6.7 ms | 56 KB | **0.7 ms** | 0.8 / 1.0 ms |
+| 100 | 1.2 ms | 1.0 ms | 3.3 KB | 0.6 ms | 0.8 / 1.0 ms |
+| 1,000 | 1.6 ms | 1.5 ms | 8.4 KB | 0.6 ms | 0.8 / 0.9 ms |
+| 10,000 | 4.9 ms | 5.7 ms | 56 KB | **0.6 ms** | 0.6 / 0.8 ms |
 
 Dump and load grow with dirty state; snapshot, revert and forkyard's branch do
 not. The branch and the dump are not the same operation — forkyard's branch
@@ -248,16 +283,16 @@ never carries the writes — so compare the shape of each column, flat against
 growing, rather than the milliseconds.
 
 `forkyard_snapshot` *is* the same operation as a dump: it carries the writes,
-and it grows with them. Re-run 2026-09-26 (median of five, same host, load
-average ~10), both tools in one pass:
+and it grows with them. Both tools in the same pass as the table above:
 
-| Dirty slots | forkyard snapshot | forkyard resume | snapshot file | anvil dump | anvil load | blob | anvil snapshot / revert |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| 100 | 3.3 ms | 1.7 ms | 6.4 KB | 0.8 ms | 0.7 ms | 3.3 KB | 0.6 / 0.6 ms |
-| 1,000 | 4.6 ms | 1.9 ms | 63 KB | 2.2 ms | 2.8 ms | 8.4 KB | 1.2 / 1.4 ms |
-| 10,000 | 9.5 ms | 6.9 ms | 642 KB | 6.2 ms | 8.3 ms | 56 KB | 1.4 / 1.3 ms |
+| Dirty slots | forkyard snapshot | forkyard resume | snapshot file | anvil dump | anvil load | blob |
+| --- | --- | --- | --- | --- | --- | --- |
+| 100 | 4.3 ms | 1.7 ms | 6.4 KB | 1.2 ms | 1.0 ms | 3.3 KB |
+| 1,000 | 4.3 ms | 1.8 ms | 63 KB | 1.6 ms | 1.5 ms | 8.4 KB |
+| 10,000 | 7.0 ms | 2.8 ms | 642 KB | 4.9 ms | 5.7 ms | 56 KB |
 
-Anvil wins this table. Its blob is compressed and forkyard's JSON is not (about
+Anvil wins this table at small state; by 10,000 slots the round trip is level
+(9.8 ms against 10.6 ms). Its blob is compressed and forkyard's JSON is not (about
 64 bytes a slot), and a forkyard snapshot is fsynced to disk before it answers —
 most of its 3 ms floor. What that buys is in the next section: the snapshot
 outlives the process, and any process sharing the directory can resume it by id.
@@ -265,19 +300,29 @@ outlives the process, and any process sharing the directory can resume it by id.
 ### Many blocks in one process
 
 `POST /session {"block_number": N}` pins a session to its own block with one
-shared cache per block; Anvil's `--fork-block-number` is per process. Twelve
-agents spread over B blocks, run twice:
+shared cache per block; Anvil's `--fork-block-number` is per process.
+Twenty-four agents spread over B blocks, run twice:
 
 | B | forkyard calls (r1 / r2) | anvil calls (r1 / r2) | forkyard RSS | anvil RSS |
 | --- | --- | --- | --- | --- |
-| 1 | 20 / **0** | 36 / 36 | 15.3 MB | 271 MB |
-| 4 | 80 / **0** | 36 / 36 | 16.6 MB | 321 MB |
+| 1 | 19 / **0** | 763 † / 72 | 18.6 MB | 590 MB |
+| 4 | 76 / **0** | 72 / 72 | 19.0 MB | 499 MB |
+| 8 | 152 / **0** | 72 / 72 | 19.6 MB | 496 MB |
 
-forkyard's cost scales with the number of *blocks*, not agents — 20 calls per
+forkyard's cost scales with the number of *blocks*, not agents — 19 calls per
 block — and the second round is free because those bases are already warm in
-process. Anvil's is flat here because its own disk cache is warm too; what it
-cannot amortise is memory, at roughly 25 MB per process against one 16 MB
-process.
+process. Anvil's floor is 72 calls — three per process for its 24, the same
+count its startup calls come to elsewhere (this benchmark does not record
+methods) — whenever its disk cache holds the block. What it cannot amortise is
+memory, at roughly 20–25 MB per process against one 19 MB process. Second of
+two runs; the first agreed except where marked and at 8 blocks, where Anvil's
+first round re-read state (766 calls).
+
+† In both runs one of Anvil's 1-block rounds took ~120 s, with 17 and 24 of its
+24 sessions failing their block check, while the upstream dropped connections
+(hundreds of TLS and broken-pipe errors in the log): 24 processes fetching the
+same block at once. forkyard's rounds had none. Read it as a failure under that
+burst, not a timing.
 
 ### Restart cost
 
@@ -285,12 +330,14 @@ Both persistent caches enabled, 5 agents reading 8 contracts, cold run then warm
 
 | Backend | Cold calls | Warm calls | Cold time | Warm time |
 | --- | --- | --- | --- | --- |
-| forkyard | 37 | **1** | 3.13 s | **0.14 s** |
-| anvil | 90 | 15 | 9.24 s | 3.42 s |
+| forkyard | 37 | **1** | 3.24 s | **0.13 s** |
+| anvil | 90 | 15 | 10.07 s | 3.47 s |
 
-forkyard's warm floor is one call, the fork's own block-header lookup. Anvil's
-is 15, because each process re-resolves state that forkyard serves once from a
-shared base. Before forkyard had a persistent cache at all, this was the one
+forkyard's warm floor is one call: on the current build the background
+`eth_chainId` that opens its shared connection (the block-header lookup, before
+the zero-wait warm start). Anvil's is 15, three startup calls for each of its 5
+processes — `eth_chainId`, `eth_getBlockByNumber`, `eth_gasPrice` — its state
+coming from disk too. Before forkyard had a persistent cache at all, this was the one
 axis where Anvil was clearly ahead.
 
 ### Whole-workload wall clock
@@ -299,30 +346,33 @@ The standard agent workload, warm, median of five:
 
 | Agents | forkyard | spread | anvil | spread |
 | --- | --- | --- | --- | --- |
-| 1 | **0.62 s** | 1.09× | 1.51 s | 3.49× |
-| 10 | **1.76 s** | 3.62× | 2.13 s | 1.10× |
-| 50 | 6.34 s | 1.05× | **2.72 s** | 1.15× |
+| 1 | **0.54 s** | 1.08× | 1.52 s | 1.15× |
+| 10 | **1.02 s** | 1.06× | 1.86 s | 1.14× |
+| 50 | **1.52 s** | 1.18× | 5.53 s | 8.22× |
 
 Ten disposable forks per agent instead of one long-lived environment, same total
 work:
 
 | Agents | forkyard | anvil |
 | --- | --- | --- |
-| 1 | **3.53 s** | 11.32 s |
-| 10 | **9.18 s** | 13.57 s |
+| 1 | **3.48 s** | 11.29 s |
+| 10 | **4.32 s** | 13.85 s |
 
 And agents arriving over time rather than all at once (p50 from scheduled
 arrival to first successful simulation):
 
 | Arrival rate | forkyard p50 | anvil p50 |
 | --- | --- | --- |
-| 1/s | **340 ms** | 1,082 ms |
-| 5/s | **353 ms** | 1,092 ms |
-| 20/s | 6,233 ms | **1,181 ms** |
+| 1/s | **354 ms** | 1,007 ms |
+| 5/s | **351 ms** | 1,018 ms |
+| 20/s | **362 ms** | 1,167 ms |
 
-The pattern across all three: forkyard is ahead while its worker pool is not the
-constraint — single agents, churn, arrivals up to ~5/s — and behind once it is.
-At 50 concurrent agents and at 20 arrivals/s, Anvil's flat per-process cost wins.
+(Arrivals is a single run.) With four workers, the old default, forkyard was
+behind at 50 concurrent agents (6.34 s against 2.72 s) and at 20 arrivals/s
+(6,233 ms against 1,181 ms): its worker pool was the constraint. With one worker
+per core and workers that never block on upstream, it is ahead at every tier
+here. Anvil's 50-agent spread of 8.2× is one run that took 20 s; its other four
+were 2.4–5.5 s.
 
 ## Latency pass (2026-09-26)
 
@@ -366,7 +416,8 @@ session's marker balance is checked; all 45 resumes were correct.
 | 50 | 210.7 ms | 4.2 ms | **0.9 ms** | **0.8 ms** |
 
 Median of five; replay is timed with the shared cache already warm, the fairest
-case for it. Resume is flat in N because the snapshot is flat in N: ~90 KB here,
+case for it. Re-run 2026-09-30: replay 18.9 / 58.6 / 142.8 ms at N = 5 / 20 /
+50, resume after restart 2.0 / 1.4 / 1.1 ms, same process 0.9 ms throughout. Resume is flat in N because the snapshot is flat in N: ~90 KB here,
 almost all of it bytecode of the contracts the session touched, not the
 transactions.
 
@@ -480,6 +531,10 @@ pass, median of five after a discarded warm-up, 0 failed actions in any run:
 | 50 | **0.93 s** | 1.09× | 1.72 s | 1.12× |
 
 Four of the five 50-agent runs finished under a second; the fifth took 1.002 s.
+Re-run 2026-09-30: 0.61 / 0.97 / **1.10 s** (spread 1.18×) against Anvil's
+1.52 / 1.72 / 2.39 s. The same afternoon, the build before the cold-fetch fix
+measured 1.06 s at 50 agents against the fixed build's 1.05 s, so the move from
+0.93 s is the day's conditions, not the fix.
 Anvil is faster through this client too (it was 3.9 s through the Python one).
 The client was holding both back.
 
@@ -597,18 +652,19 @@ allows. Going faster there takes a higher quota, not a client change.
 
 **Concurrency past a few tens of agents.** This was the clearest one; since
 [the non-blocking workers](#fifty-agents-under-a-second-2026-09-27) the
-standard workload no longer shows it (50 agents: 0.93 s against 1.72 s), but
+standard workload no longer shows it (50 agents: 1.10 s against 2.39 s through
+the Rust client, re-run 2026-09-30), but
 the history is worth keeping. forkyard shards sessions over `FORKYARD_NUM_WORKERS` threads, and
 with the old default of 4 that queue was the ceiling: at 50 concurrent agents
 the standard workload took 6.34 s against Anvil's 2.72 s, and at 20
 arrivals/second forkyard's p50 was 6,233 ms against 1,181 ms. Since the
 [latency pass](#latency-pass-2026-09-26) workers default to one per core, and 50
-agents were level (3.72 s against 3.92 s). The arrivals sweep has not been re-run
-since either change.
+agents were level (3.72 s against 3.92 s). Re-run since both changes, 20
+arrivals/second is now 362 ms against 1,167 ms.
 
 **Rewinding one timeline.** `evm_snapshot`/`evm_revert` cost about a millisecond
 flat no matter how much state is dirty. forkyard's equivalent, snapshot then
-resume, costs 5 ms at 100 dirty slots and 16 ms at 10,000, because it writes a
+resume, costs 6 ms at 100 dirty slots and 10 ms at 10,000, because it writes a
 durable file. For "try this, undo it, try the next" inside one agent, Anvil's
 design is still the faster one.
 
