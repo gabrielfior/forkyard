@@ -4,6 +4,10 @@
 
 Instant, disposable forks of live EVM chain state — for AI agents that need to simulate a transaction before committing gas or capital.
 
+<a href="assets/video/forkyard.mp4"><img src="assets/video/forkyard-preview.gif" alt="Forkyard in 20 seconds: the problem with one Anvil per agent, how one process with many sessions solves it, the measured numbers, the architecture, and getting started" width="100%"></a>
+
+<sub>20-second overview — click for the full-quality video.</sub>
+
 One process, one shared warm cache, many isolated sessions — with MCP (stdio), MCP (Streamable HTTP) and JSON-RPC (HTTP) surfaces running side by side out of the box. [Anvil](https://book.getfoundry.sh/anvil/) is the standard here and stays the simpler choice for a single agent; [when each tool wins](#forkyard-or-anvil) is measured below.
 
 ## Install
