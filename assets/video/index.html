@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=block"
+      rel="stylesheet"
+    />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      :root {
+        --bg: #0a1011;
+        --panel: #111a1b;
+        --line: #22302f;
+        --fg: #e8f1f0;
+        --muted: #8a9c9b;
+        --teal: #12938a;
+        --teal-hi: #34d3c3;
+        --anvil: #4a5657;
+        --mono: "JetBrains Mono", ui-monospace, monospace;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 1920px; height: 1080px; overflow: hidden;
+        background: var(--bg); color: var(--fg);
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+      }
+      #root { position: relative; width: 100%; height: 100%; }
+      .clip { position: absolute; inset: 0; }
+      .scene { padding: 110px 140px; }
+      .kicker {
+        font-family: var(--mono); font-size: 24px; letter-spacing: 0.14em;
+        text-transform: uppercase; color: var(--teal-hi);
+      }
+      h2 { font-size: 68px; font-weight: 700; letter-spacing: -0.03em; margin-top: 18px; }
+      .sub { font-size: 30px; color: var(--muted); margin-top: 16px; max-width: 1400px; line-height: 1.35; }
+      code, .mono { font-family: var(--mono); }
+
+      /* ---------- scene 1: title ---------- */
+      #s1 { display: flex; flex-direction: column; align-items: center; justify-content: center; }
+      #s1 .mark { width: 240px; height: 240px; }
+      .lp, #trunk, .br { stroke-dasharray: 1; stroke-dashoffset: 1; }
+      #s1 .word { font-size: 132px; font-weight: 700; letter-spacing: -0.045em; margin-top: 24px; }
+      #s1 .tag { font-size: 38px; color: var(--muted); margin-top: 14px; text-align: center; line-height: 1.35; }
+      #s1 .tag b { color: var(--fg); font-weight: 600; }
+
+      /* ---------- scene 2: problem -> solution ---------- */
+      :root { --bad:#e8806f; --bad-dim:#3a2422; }
+      #s2 .hdr { position:absolute; left:140px; top:110px; }
+      #s2 .hdr > div { position:absolute; left:0; top:0; white-space:nowrap; }
+      .kicker.p { color:var(--bad); }
+      .box { position:absolute; background:var(--panel); border:2px solid var(--line); border-radius:18px; }
+      .stat { position:absolute; font-family:var(--mono); white-space:nowrap; }
+      .stat b { display:block; font-size:54px; font-weight:600; letter-spacing:-.02em; }
+      .stat span { font-size:22px; color:var(--muted); }
+      .stat.p b { color:var(--bad); } .stat.s b { color:var(--teal-hi); }
+
+.rpc { left:140px; top:620px; width:330px; white-space:nowrap; height:140px; display:flex; flex-direction:column; justify-content:center; padding:0 30px; }
+.rpc b { font-size:32px; } .rpc span { font-family:var(--mono); font-size:21px; color:var(--muted); margin-top:6px; }
+.proc { width:580px; white-space:nowrap; height:96px; display:flex; align-items:center; gap:16px; padding:0 26px; font-family:var(--mono); font-size:26px; border-color:var(--bad-dim); }
+.proc i { width:14px; height:14px; border-radius:50%; background:var(--bad); }
+.proc em { font-style:normal; font-size:20px; color:var(--muted); margin-left:auto; }
+svg.wires { position:absolute; left:0; top:0; }
+.pl { fill:none; stroke:var(--bad); stroke-width:3; stroke-dasharray:10 12; opacity:.8; }
+.one { fill:none; stroke:var(--teal-hi); stroke-width:6; stroke-linecap:round; }
+.fybox { left:820px; top:390px; width:580px; height:568px; border-color:var(--teal); padding:26px; }
+.fybox .t { font-size:32px; font-weight:700; } .fybox .c { font-family:var(--mono); font-size:21px; color:var(--teal-hi); margin-top:4px; }
+.sess { position:absolute; left:26px; right:26px; height:58px; border-radius:29px; border:2px solid var(--line); background:var(--bg);
+  display:flex; align-items:center; gap:14px; padding:0 22px; font-family:var(--mono); font-size:23px; }
+.sess i { width:12px; height:12px; border-radius:50%; background:var(--teal-hi); }
+.stats { position:absolute; left:1440px; top:400px; width:420px; height:560px; }
+.stats .stat { left:0; }
+
+      /* ---------- scene 3: numbers ---------- */
+      .rows { margin-top: 56px; display: flex; flex-direction: column; gap: 34px; }
+      .row { display: grid; grid-template-columns: 460px 1fr; align-items: center; column-gap: 40px; }
+      .row .label { font-size: 30px; font-weight: 600; line-height: 1.2; }
+      .row .label small { display: block; font-size: 22px; color: var(--muted); font-weight: 400; margin-top: 4px; }
+      .bars { display: flex; flex-direction: column; gap: 10px; }
+      .bar { display: flex; align-items: center; gap: 18px; height: 40px; }
+      .bar i { display: block; height: 100%; border-radius: 6px; transform-origin: left center; }
+      .bar.fy i { background: var(--teal-hi); }
+      .bar.av i { background: var(--anvil); }
+      .bar span { font-family: var(--mono); font-size: 24px; white-space: nowrap; }
+      .bar.fy span { color: var(--teal-hi); font-weight: 600; }
+      .bar.av span { color: var(--muted); }
+      .legend { position: absolute; right: 140px; top: 128px; display: flex; gap: 36px; font-size: 24px; color: var(--muted); }
+      .legend b { display: inline-block; width: 22px; height: 22px; border-radius: 5px; vertical-align: -4px; margin-right: 10px; }
+      .foot { position: absolute; left: 140px; bottom: 70px; font-size: 22px; color: var(--muted); }
+
+      /* ---------- scene 4: architecture ---------- */
+      .arch { margin-top: 110px; min-height: 400px; display: flex; align-items: stretch; gap: 0; }
+      .col {
+        flex: 1; background: var(--panel); border: 2px solid var(--line); border-radius: 22px;
+        padding: 34px 32px; display: flex; flex-direction: column; gap: 14px;
+      }
+      .col h3 { font-size: 38px; font-weight: 700; letter-spacing: -0.02em; }
+      .col .crate { font-family: var(--mono); font-size: 21px; color: var(--teal-hi); }
+      .col p { font-size: 27px; color: var(--muted); line-height: 1.4; }
+      .chip {
+        font-family: var(--mono); font-size: 24px; padding: 12px 16px; border-radius: 12px;
+        border: 2px solid var(--line); background: var(--bg);
+      }
+      .arrow { width: 70px; display: flex; align-items: center; justify-content: center; }
+      .arrow svg { width: 50px; height: 30px; }
+      .tagline { margin-top: 90px; font-size: 36px; font-weight: 600; text-align: center; }
+      .tagline em { font-style: normal; color: var(--teal-hi); }
+
+      /* ---------- scene 5: get started ---------- */
+      .term {
+        margin-top: 56px; width: 1640px; background: #070b0c; border: 2px solid var(--line);
+        border-radius: 20px; overflow: hidden;
+      }
+      .term .bar-top { height: 50px; display: flex; align-items: center; gap: 12px; padding: 0 22px; background: var(--panel); }
+      .term .bar-top i { width: 16px; height: 16px; border-radius: 50%; background: var(--line); }
+      .term .body { padding: 34px 40px 40px; font-family: var(--mono); font-size: 27px; line-height: 1.9; }
+      .ln { display: flex; white-space: nowrap; }
+      .ln .p { color: var(--teal-hi); margin-right: 18px; }
+      .ln .t { display: inline-block; overflow: hidden; width: 0; }
+      .out { color: var(--muted); }
+      .out b { color: var(--fg); font-weight: 600; }
+      .end { position: absolute; left: 140px; right: 140px; bottom: 90px; display: flex; align-items: center; gap: 26px; }
+      .end svg { width: 76px; height: 76px; }
+      .end .name { font-size: 46px; font-weight: 700; letter-spacing: -0.03em; }
+      .end .url { font-family: var(--mono); font-size: 30px; color: var(--muted); margin-left: auto; }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="19.5"
+      data-width="1920"
+      data-height="1080"
+    >
+      <!-- ============ SCENE 1 · title (0 – 3.2) ============ -->
+      <section id="s1" class="clip" data-start="0" data-duration="2.6" data-track-index="0">
+        <svg class="mark" viewBox="0 0 64 64">
+          <g fill="none" stroke="#12938A" stroke-width="7" stroke-linecap="round">
+            <path class="lp" pathLength="1" d="M32 55V43" />
+            <path class="lp" pathLength="1" d="M14 43h36" />
+            <path class="lp" pathLength="1" d="M14 43V15" />
+            <path class="lp" pathLength="1" d="M32 43V9" />
+            <path class="lp" pathLength="1" d="M50 43V15" />
+          </g>
+        </svg>
+        <div class="word">forkyard</div>
+        <div class="tag">Instant, disposable forks of <b>live EVM state</b><br />for AI agents that simulate before they spend.</div>
+      </section>
+
+      <!-- ============ SCENE 2 · problem -> solution (2.6 – 8.8) ============ -->
+      <section id="s2" class="clip" data-start="2.6" data-duration="6.2" data-track-index="0">
+<div class="hdr">
+  <div class="ph"><div class="kicker p">The problem</div><h2>One Anvil per agent doesn't scale.</h2><div class="sub">Each agent runs its own process with its own cache. Cold, each fetches the same state.</div></div>
+  <div class="sh"><div class="kicker s">How forkyard solves it</div><h2>One process. Many sessions.</h2><div class="sub">fork() is a pointer copy onto one shared, warm cache.</div></div>
+</div>
+
+<svg class="wires" width="1920" height="1080"><path class="pl" d="M470 690 C 640 690, 660 426, 820 426" /><path class="pl" d="M470 690 C 640 690, 660 544, 820 544" /><path class="pl" d="M470 690 C 640 690, 660 662, 820 662" /><path class="pl" d="M470 690 C 640 690, 660 780, 820 780" /><path class="pl" d="M470 690 C 640 690, 660 898, 820 898" /><path class="one" pathLength="1" d="M470 690 H820" style="stroke-dasharray:1; stroke-dashoffset:1" /></svg>
+<div class="box rpc"><b>Upstream RPC</b><span>metered · rate-limited</span></div>
+<div class="probs"><div class="box proc" style="left:820px; top:390px"><i></i>anvil #1<em>own process · own cache</em></div><div class="box proc" style="left:820px; top:508px"><i></i>anvil #2<em>own process · own cache</em></div><div class="box proc" style="left:820px; top:626px"><i></i>anvil #3<em>own process · own cache</em></div><div class="box proc" style="left:820px; top:744px"><i></i>anvil #4<em>own process · own cache</em></div><div class="box proc" style="left:820px; top:862px"><i></i>anvil #5<em>own process · own cache</em></div></div>
+<div class="box fybox"><div class="t">forkyard</div><div class="c">one warm cache</div><div class="sess" style="top:94px"><i></i>session 1</div><div class="sess" style="top:166px"><i></i>session 2</div><div class="sess" style="top:238px"><i></i>session 3</div><div class="sess" style="top:310px"><i></i>session 4</div><div class="sess" style="top:382px"><i></i>session 5</div></div>
+<div class="stats">
+  <div class="stat p" style="top:0"><b>1,291 MB</b><span>for 50 agents · 50 processes</span></div>
+  <div class="stat p" style="top:190px"><b>778 calls</b><span>upstream · 10 agents, cold cache</span></div>
+  <div class="stat p" style="top:380px"><b>1,409 ms</b><span>parallel what-if · respawn+replay</span></div>
+  <div class="stat s" style="top:0"><b>21 MB</b><span>50 agents · 1 process + cache</span></div>
+  <div class="stat s" style="top:190px"><b>37 calls</b><span>upstream · any agent count, cold</span></div>
+  <div class="stat s" style="top:380px"><b>0.6 ms</b><span>to branch a what-if</span></div>
+</div>
+
+</section>
+
+      <!-- ============ SCENE 3 · numbers (8.8 – 12.8) ============ -->
+      <section id="s3" class="clip scene" data-start="8.8" data-duration="4.0" data-track-index="0">
+        <div class="kicker s3-in">Measured</div>
+        <h2 class="s3-in">Fast where agents actually live.</h2>
+        <div class="legend s3-in">
+          <span><b style="background: var(--teal-hi)"></b>forkyard</span>
+          <span><b style="background: var(--anvil)"></b>Anvil</span>
+        </div>
+        <div class="rows">
+          <div class="row">
+            <div class="label">Acquire a fresh fork<small>single agent</small></div>
+            <div class="bars">
+              <div class="bar fy"><i style="width: 8px"></i><span>2 ms</span></div>
+              <div class="bar av"><i style="width: 1000px"></i><span>634 ms</span></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="label">10 agents × 10 forks<small>disposable forks</small></div>
+            <div class="bars">
+              <div class="bar fy"><i style="width: 311px"></i><span>4.3 s</span></div>
+              <div class="bar av"><i style="width: 1000px"></i><span>13.9 s</span></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="label">Explore 32 what-ifs<small>from one state</small></div>
+            <div class="bars">
+              <div class="bar fy"><i style="width: 180px"></i><span>0.44 s</span></div>
+              <div class="bar av"><i style="width: 1000px"></i><span>2.44 s</span></div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="label">50 agents, full workload<small>each with its own state</small></div>
+            <div class="bars">
+              <div class="bar fy"><i style="width: 460px"></i><span>1.10 s</span></div>
+              <div class="bar av"><i style="width: 1000px"></i><span>2.39 s</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="foot s3-foot">Medians of 5 warm runs, re-run 2026-09-30, Apple M3 Pro, mainnet archive RPC; see benchmark.md. For a single agent, Anvil is still the simpler choice.</div>
+      </section>
+
+      <!-- ============ SCENE 4 · architecture (12.8 – 16.2) ============ -->
+      <section id="s4" class="clip scene" data-start="12.8" data-duration="3.4" data-track-index="0">
+        <div class="kicker s4-in">Architecture</div>
+        <h2 class="s4-in">Rust, end to end.</h2>
+        <div class="arch">
+          <div class="col c4">
+            <h3>Three surfaces</h3>
+            <div class="chip">MCP · stdio</div>
+            <div class="chip">MCP · HTTP :8556</div>
+            <div class="chip">JSON-RPC :8555</div>
+          </div>
+          <div class="arrow a4"><svg viewBox="0 0 50 30"><path d="M2 15h40M32 5l12 10-12 10" fill="none" stroke="#34d3c3" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="col c4">
+            <h3>Sessions</h3>
+            <div class="crate">crates/session</div>
+            <p>TTL lifecycle, sharded over worker threads. Jobs park on upstream reads instead of blocking.</p>
+          </div>
+          <div class="arrow a4"><svg viewBox="0 0 50 30"><path d="M2 15h40M32 5l12 10-12 10" fill="none" stroke="#34d3c3" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="col c4">
+            <h3>Shared state + revm</h3>
+            <div class="crate">crates/engine</div>
+            <p>Structurally shared map, O(1) fork. revm embedded in-process.</p>
+          </div>
+          <div class="arrow a4"><svg viewBox="0 0 50 30"><path d="M2 15h40M32 5l12 10-12 10" fill="none" stroke="#34d3c3" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <div class="col c4">
+            <h3>Lazy fetch</h3>
+            <div class="crate">crates/fetch · ingest</div>
+            <p>Built on foundry-fork-db, plus forkyard's own batching. Warm disk cache when pinned, or follows the tip.</p>
+          </div>
+        </div>
+        <div class="tagline t4">One process. <em>One warm cache.</em> Many isolated sessions.</div>
+      </section>
+
+      <!-- ============ SCENE 5 · get started (16.2 – 19.5) ============ -->
+      <section id="s5" class="clip scene" data-start="16.2" data-duration="3.3" data-track-index="0">
+        <div class="kicker s5-in">Get started</div>
+        <h2 class="s5-in">Three lines.</h2>
+        <div class="term s5-in">
+          <div class="bar-top"><i></i><i></i><i></i></div>
+          <div class="body">
+            <div class="ln"><span class="p">$</span><span class="t" id="l1">curl -fsSL https://raw.githubusercontent.com/gabrielfior/forkyard/main/install.sh | bash</span></div>
+            <div class="ln"><span class="p">$</span><span class="t" id="l2">export RPC_URL=https://your-mainnet-rpc</span></div>
+            <div class="ln"><span class="p">$</span><span class="t" id="l3">forkyard</span></div>
+            <div class="ln out" id="o1">&nbsp;&nbsp;<b>✓</b>&nbsp;MCP stdio &nbsp;·&nbsp; MCP http://127.0.0.1:8556/mcp &nbsp;·&nbsp; JSON-RPC http://127.0.0.1:8555</div>
+          </div>
+        </div>
+        <div class="end">
+          <svg viewBox="0 0 64 64"><g fill="none" stroke="#12938A" stroke-width="7" stroke-linecap="round"><path d="M14 43h36"/><path d="M14 43V15"/><path d="M32 43V9"/><path d="M50 43V15"/><path d="M32 43v12"/></g></svg>
+          <div class="name">forkyard</div>
+          <div class="url">github.com/gabrielfior/forkyard</div>
+        </div>
+      </section>
+    </div>
+
+    <script>
+      const tl = gsap.timeline({ paused: true });
+      const E = "power3.out";
+
+      // ---- scene 1 ----
+      tl.to("#s1 .lp", { strokeDashoffset: 0, duration: 0.4, ease: "power2.inOut", stagger: 0.09 }, 0.02);
+      tl.fromTo("#s1 .word", { opacity: 0, y: 30 }, { opacity: 1, y: 0, duration: 0.6, ease: E }, 0.6);
+      tl.fromTo("#s1 .tag", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.6, ease: E }, 0.9);
+      tl.to("#s1", { opacity: 0, scale: 0.97, duration: 0.35, ease: "power2.in" }, 2.3);
+
+      // ---- scene 2 (problem -> solution), local time inside m ----
+      {
+      const m = gsap.timeline();
+      const T = 2.9; // problem -> solution handoff
+m.fromTo(".ph > *", { opacity:0, y:24 }, { opacity:1, y:0, duration:.5, ease:E, stagger:.1 }, .05);
+m.to(".ph", { opacity:0, y:-20, duration:.3, ease:"power2.in" }, T - .1);
+m.fromTo(".sh > *", { opacity:0, y:24 }, { opacity:1, y:0, duration:.5, ease:E, stagger:.1 }, T + .15);
+
+m.fromTo(".rpc", { opacity:0, x:-30 }, { opacity:1, x:0, duration:.45, ease:E }, .35);
+m.fromTo(".proc", { opacity:0, x:40 }, { opacity:1, x:0, duration:.4, ease:E, stagger:.1 }, .5);
+m.fromTo(".pl", { opacity:0 }, { opacity:.8, duration:.3, stagger:.1 }, .6);
+m.fromTo(".pl", { strokeDashoffset:0 }, { strokeDashoffset:-220, duration:2.4, ease:"none" }, .6);
+m.fromTo(".stat.p", { opacity:0, y:16 }, { opacity:1, y:0, duration:.4, ease:E, stagger:.3 }, 1.1);
+// handoff: processes collapse into one forkyard box
+m.to(".proc", { y:(i) => 100 - i*50, scale:.9, opacity:0, duration:.45, ease:"power2.in", stagger:.04 }, T - .1);
+m.to(".pl", { opacity:0, duration:.3 }, T - .1);
+m.to(".stat.p", { opacity:0, y:-12, duration:.25, stagger:.05 }, T);
+m.fromTo(".fybox", { opacity:0, scale:.94 }, { opacity:1, scale:1, duration:.45, ease:E }, T + .25);
+m.to(".one", { strokeDashoffset:0, duration:.4, ease:"power2.out" }, T + .35);
+m.fromTo(".sess", { opacity:0, x:-20 }, { opacity:1, x:0, duration:.35, ease:E, stagger:.08 }, T + .5);
+m.fromTo(".stat.s", { opacity:0, y:16 }, { opacity:1, y:0, duration:.4, ease:E, stagger:.2 }, T + .7);
+      m.to("#s2", { opacity: 0, duration: 0.3, ease: "power2.in" }, 5.9);
+      tl.add(m, 2.6);
+      }
+
+      // ---- scene 3 ----
+      const t3 = 8.8;
+      tl.fromTo(".s3-in", { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.55, ease: E, stagger: 0.1 }, t3 + 0.05);
+      tl.fromTo("#s3 .row", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.45, ease: E, stagger: 0.18 }, t3 + 0.4);
+      tl.fromTo("#s3 .bar.av i", { scaleX: 0 }, { scaleX: 1, duration: 0.9, ease: "power2.out", stagger: 0.18 }, t3 + 0.55);
+      tl.fromTo("#s3 .bar.fy i", { scaleX: 0 }, { scaleX: 1, duration: 0.15, stagger: 0.18 }, t3 + 0.55);
+      tl.fromTo("#s3 .bar span", { opacity: 0 }, { opacity: 1, duration: 0.3, stagger: 0.09 }, t3 + 0.8);
+      tl.fromTo(".s3-foot", { opacity: 0 }, { opacity: 1, duration: 0.5 }, t3 + 1.6);
+      tl.to("#s3", { opacity: 0, duration: 0.3, ease: "power2.in" }, t3 + 3.7);
+
+      // ---- scene 4 ----
+      const t4 = 12.8;
+      tl.fromTo(".s4-in", { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.55, ease: E, stagger: 0.1 }, t4 + 0.05);
+      tl.fromTo("#s4 .c4", { opacity: 0, y: 40 }, { opacity: 1, y: 0, duration: 0.5, ease: E, stagger: 0.22 }, t4 + 0.35);
+      tl.fromTo("#s4 .a4", { opacity: 0, x: -14 }, { opacity: 1, x: 0, duration: 0.35, ease: E, stagger: 0.22 }, t4 + 0.6);
+      tl.fromTo(".t4", { opacity: 0, y: 16 }, { opacity: 1, y: 0, duration: 0.5, ease: E }, t4 + 1.45);
+      tl.to("#s4", { opacity: 0, duration: 0.25, ease: "power2.in" }, t4 + 3.15);
+
+      // ---- scene 5 ----
+      const t5 = 16.2;
+      tl.fromTo(".s5-in", { opacity: 0, y: 24 }, { opacity: 1, y: 0, duration: 0.45, ease: E, stagger: 0.08 }, t5 + 0.02);
+      const type = (sel, chars, at, dur) =>
+        tl.fromTo(sel, { width: "0ch" }, { width: chars + "ch", duration: dur, ease: "steps(" + chars + ")" }, at);
+      type("#l1", 88, t5 + 0.4, 0.75);
+      type("#l2", 39, t5 + 1.25, 0.4);
+      type("#l3", 8, t5 + 1.75, 0.2);
+      tl.fromTo("#o1", { opacity: 0 }, { opacity: 1, duration: 0.3 }, t5 + 2.05);
+      tl.fromTo("#s5 .end", { opacity: 0, y: 20 }, { opacity: 1, y: 0, duration: 0.5, ease: E }, t5 + 2.2);
+
+      window.__timelines = window.__timelines || {};
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>
