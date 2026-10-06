@@ -15,3 +15,12 @@ publish = false
 # relying on remembering to match versions on every new crate.
 [workspace.dependencies]
 revm = "41.0.0"
+
+# Keep target/ lean: on macOS the default split-debuginfo = "unpacked" leaves
+# every .rcgu.o on disk, and each rebuild adds a fresh set (~10 GB observed).
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "off"
+
+[profile.dev.package."*"]
+debug = false
