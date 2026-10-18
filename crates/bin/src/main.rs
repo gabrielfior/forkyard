@@ -27,12 +27,22 @@ use forkyard_engine::persist::{default_cache_dir, default_snapshot_dir, CacheKey
 use forkyard_engine::BaseSnapshot;
 use forkyard_fetch::Fork;
 use forkyard_ingest::ChainTipFollower;
-use forkyard_session::{BlockForkFuture, SessionManager, DEFAULT_MAX_PINNED_BLOCKS};
+use forkyard_session::{
+    BlockForkFuture, Limits, SessionManager, DEFAULT_MAX_PINNED_BLOCKS, DEFAULT_MAX_SESSIONS,
+    DEFAULT_MAX_SESSION_ENTRIES, DEFAULT_MAX_TX_GAS_LIMIT,
+};
 use revm::context::BlockEnv;
 use tracing_subscriber::EnvFilter;
 
 fn env_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// A limit from the environment: unset means `default`, `0` means
+/// unbounded — the only way to turn one off, so it is a deliberate act.
+fn env_limit<T: std::str::FromStr + Default + PartialEq>(key: &str, default: T) -> Option<T> {
+    let value = env_or(key, default);
+    (value != T::default()).then_some(value)
 }
 
 /// Accepts what people actually type, not just `bool::from_str`:
@@ -143,6 +153,12 @@ async fn main() -> eyre::Result<()> {
     // — so this is a memory bound, not a tidy-up.
     let max_pinned_blocks: usize = env_or("FORKYARD_MAX_PINNED_BLOCKS", DEFAULT_MAX_PINNED_BLOCKS);
 
+    let limits = Limits {
+        max_sessions: env_limit("FORKYARD_MAX_SESSIONS", DEFAULT_MAX_SESSIONS),
+        max_tx_gas_limit: env_limit("FORKYARD_MAX_TX_GAS_LIMIT", DEFAULT_MAX_TX_GAS_LIMIT),
+        max_session_entries: env_limit("FORKYARD_MAX_SESSION_ENTRIES", DEFAULT_MAX_SESSION_ENTRIES),
+    };
+
     // `FORKYARD_CACHE_DISABLED` exists so a benchmark can still measure a
     // cold start: without it, every run after the first is warm.
     let cache = if env_flag("FORKYARD_CACHE_DISABLED") {
@@ -213,6 +229,7 @@ async fn main() -> eyre::Result<()> {
             max_pinned_blocks,
         )
         .with_snapshots(snapshots)
+        .with_limits(limits)
         // Whatever a speculative pass missed goes upstream as one JSON-RPC
         // batch rather than a request per key.
         .with_resolver(|fork: &Fork, keys: &[forkyard_session::StateKey]| fork.resolve(keys));
@@ -225,6 +242,7 @@ async fn main() -> eyre::Result<()> {
         num_workers,
         ttl_secs,
         max_pinned_blocks,
+        ?limits,
         snapshot_dir = %snapshot_dir.display(),
         "forked upstream chain, session manager ready"
     );

@@ -153,6 +153,50 @@ where
 /// a pass that finds nothing new missing is clean by definition.
 const MAX_SPECULATIVE_ROUNDS: u32 = 16;
 
+/// Bounds one process puts on what any caller can ask of it. Enforced in
+/// `SessionManager`, below every API surface, so MCP-stdio, MCP-HTTP and
+/// JSON-RPC all get the same ones. `None` means unbounded. The defaults
+/// (`Limits::default`) are generous enough that no benchmark or ordinary
+/// agent run in this repo reaches them; they exist to stop a runaway or
+/// hostile caller from taking the process — and every other agent's
+/// session — down with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Live sessions across all workers. Reaching it refuses `fork`,
+    /// `fork_at_block`, `fork_from` and `resume` until one is discarded or
+    /// reaped.
+    pub max_sessions: Option<usize>,
+    /// `gas_limit` of one `simulate`/`advance`/`call`/`estimate_gas`. The
+    /// EVM has no wall clock of its own, so gas is what bounds the work —
+    /// and the number of slots — a single call can do.
+    pub max_tx_gas_limit: Option<u64>,
+    /// Entries one session may hold (see `Session::entry_count`). Past it
+    /// the session refuses further calls that could grow it; it still
+    /// answers `snapshot`, `fork_from` is refused, and `discard` works.
+    pub max_session_entries: Option<usize>,
+}
+
+pub const DEFAULT_MAX_SESSIONS: usize = 10_000;
+/// The post-Fusaka per-transaction gas cap (EIP-7825), 2^24.
+pub const DEFAULT_MAX_TX_GAS_LIMIT: u64 = 16_777_216;
+pub const DEFAULT_MAX_SESSION_ENTRIES: usize = 1_000_000;
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_sessions: Some(DEFAULT_MAX_SESSIONS),
+            max_tx_gas_limit: Some(DEFAULT_MAX_TX_GAS_LIMIT),
+            max_session_entries: Some(DEFAULT_MAX_SESSION_ENTRIES),
+        }
+    }
+}
+
+impl Limits {
+    pub const fn unlimited() -> Self {
+        Self { max_sessions: None, max_tx_gas_limit: None, max_session_entries: None }
+    }
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     Unknown(SessionId),
@@ -178,6 +222,10 @@ pub enum SessionError {
     /// an unknown or malformed id, a file from another chain. Carries the
     /// store's own explanation, which already names the file.
     Snapshot(String),
+    /// A configured `Limits` bound refused the call. Carries the limit's
+    /// name, what was asked for, and the env var that raises it — a caller
+    /// that hit one can act on the message alone.
+    LimitExceeded(String),
 }
 
 impl fmt::Display for SessionError {
@@ -193,6 +241,7 @@ impl fmt::Display for SessionError {
                 write!(f, "cannot open a session at block {number}: {reason}")
             }
             Self::Snapshot(reason) => write!(f, "snapshot: {reason}"),
+            Self::LimitExceeded(reason) => write!(f, "limit exceeded: {reason}"),
         }
     }
 }
@@ -343,6 +392,39 @@ where
     /// Shared with every worker, so `with_resolver` can swap it after the
     /// workers are already running.
     resolver: Arc<RwLock<Resolver<F>>>,
+    limits: Limits,
+    /// Sessions live plus registrations in flight, the one number admission
+    /// is checked against. Incremented here under a compare-and-swap, so
+    /// concurrent forks can't all pass against the same count, and
+    /// decremented by the workers when a session is discarded or reaped.
+    /// `counts` stays the observability number; two counters that are each
+    /// updated at a different moment can't give an exact limit.
+    live: Arc<AtomicUsize>,
+    /// `limits.max_session_entries` for the workers, which are already
+    /// running by the time `with_limits` is called. 0 is unbounded.
+    max_entries: Arc<AtomicUsize>,
+}
+
+/// A reserved session slot. Dropped without `commit`, the registration
+/// failed and the slot goes back; committed, the session exists and its
+/// worker owns the slot from here (released on discard or reap).
+struct Admission<'a> {
+    live: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl Admission<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for Admission<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.live.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 impl<F: Fallback> SessionManager<F>
@@ -359,11 +441,21 @@ where
     pub fn new(fallback: F, block_env: BlockEnv, num_workers: usize, ttl: Duration) -> Self {
         let num_workers = num_workers.max(1);
         let resolver = Arc::new(RwLock::new(default_resolver::<F>()));
+        let limits = Limits::default();
+        let max_entries = Arc::new(AtomicUsize::new(limits.max_session_entries.unwrap_or(0)));
+        let live = Arc::new(AtomicUsize::new(0));
         let mut workers = Vec::with_capacity(num_workers);
         let mut counts = Vec::with_capacity(num_workers);
         for idx in 0..num_workers {
             let count = Arc::new(AtomicUsize::new(0));
-            workers.push(spawn_worker(idx, ttl, Arc::clone(&count), Arc::clone(&resolver)));
+            workers.push(spawn_worker(
+                idx,
+                ttl,
+                Arc::clone(&count),
+                Arc::clone(&resolver),
+                Arc::clone(&max_entries),
+                Arc::clone(&live),
+            ));
             counts.push(count);
         }
         Self {
@@ -381,6 +473,33 @@ where
             }),
             snapshots: None,
             resolver,
+            limits,
+            live,
+            max_entries,
+        }
+    }
+
+    /// Replace the default `Limits`. `Limits::unlimited()` restores the
+    /// behaviour from before limits existed.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.max_entries.store(limits.max_session_entries.unwrap_or(0), Ordering::Relaxed);
+        self.limits = limits;
+        self
+    }
+
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Reserve a session slot, or refuse with the limit's name and its knob.
+    fn admit(&self) -> Result<Admission<'_>, SessionError> {
+        let max = self.limits.max_sessions.unwrap_or(usize::MAX);
+        match self.live.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1)) {
+            Ok(_) => Ok(Admission { live: &self.live, committed: false }),
+            Err(live) => Err(SessionError::LimitExceeded(format!(
+                "{live} sessions are live and the limit is {max} (FORKYARD_MAX_SESSIONS); \
+                 discard sessions you are done with, or wait for idle ones to expire"
+            ))),
         }
     }
 
@@ -505,12 +624,14 @@ where
         block_env: BlockEnv,
         seed: Option<Box<SessionState>>,
     ) -> Result<SessionId, SessionError> {
+        let admission = self.admit()?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, rx) = oneshot::channel();
         self.worker_for(id)
             .send(Job::Fork { id, base, fallback, block_env, seed, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
+        admission.commit();
         Ok(id)
     }
 
@@ -635,6 +756,7 @@ where
     /// stays live, and neither sees the other's later writes.
     /// `SessionError::Unknown` if `parent` is gone or expired.
     pub async fn fork_from(&self, parent: SessionId) -> Result<SessionId, SessionError> {
+        let admission = self.admit()?;
         let (reply, rx) = oneshot::channel();
         self.worker_for(parent)
             .send(Job::Branch { parent, reply })
@@ -649,6 +771,7 @@ where
             .send(Job::Adopt { id, session, reply })
             .map_err(|_| SessionError::WorkerGone)?;
         rx.await.map_err(|_| SessionError::WorkerGone)?;
+        admission.commit();
         Ok(id)
     }
 
@@ -760,6 +883,15 @@ where
         commit: bool,
         disable_checks: bool,
     ) -> Result<ExecutionResult, SessionError> {
+        if let Some(max) = self.limits.max_tx_gas_limit {
+            if tx.gas_limit > max {
+                return Err(SessionError::LimitExceeded(format!(
+                    "gas_limit {} is above the per-transaction limit of {max} \
+                     (FORKYARD_MAX_TX_GAS_LIMIT)",
+                    tx.gas_limit
+                )));
+            }
+        }
         let (reply, rx) = oneshot::channel();
         let job = if commit {
             Job::Advance { id, tx: Box::new(tx), reply }
@@ -793,6 +925,8 @@ fn spawn_worker<F: Fallback>(
     ttl: Duration,
     count: Arc<AtomicUsize>,
     resolver: Arc<RwLock<Resolver<F>>>,
+    max_entries: Arc<AtomicUsize>,
+    live: Arc<AtomicUsize>,
 ) -> std_mpsc::Sender<Job<F>>
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
@@ -803,7 +937,15 @@ where
         .name(format!("forkyard-worker-{idx}"))
         .spawn(move || {
             let worker =
-                Worker { sessions: HashMap::new(), blocked: HashMap::new(), requeue, resolver, count: Arc::clone(&count) };
+                Worker {
+                    sessions: HashMap::new(),
+                    blocked: HashMap::new(),
+                    requeue,
+                    resolver,
+                    count: Arc::clone(&count),
+                    max_entries,
+                    live,
+                };
             worker_loop(worker, rx, ttl, count)
         })
         .expect("failed to spawn forkyard worker thread");
@@ -830,6 +972,24 @@ where
     /// before a fork or discard is answered, so a caller that just got its
     /// reply never reads the old count.
     count: Arc<AtomicUsize>,
+    /// `Limits::max_session_entries`; 0 is unbounded.
+    max_entries: Arc<AtomicUsize>,
+    /// The manager's admission counter: released here when a session goes.
+    live: Arc<AtomicUsize>,
+}
+
+/// `Err` when `session` already holds the most entries it may. Checked
+/// before a job runs rather than after, so a single call can overshoot by
+/// what one transaction writes — which `max_tx_gas_limit` bounds.
+fn check_entries<F: DatabaseRef>(id: SessionId, session: &Session<F>, max: usize) -> Result<(), SessionError> {
+    let held = session.entry_count();
+    if max != 0 && held >= max {
+        return Err(SessionError::LimitExceeded(format!(
+            "session {id} holds {held} entries and the limit is {max} (FORKYARD_MAX_SESSION_ENTRIES); \
+             snapshot it if the state matters, then discard it and start a new session"
+        )));
+    }
+    Ok(())
 }
 
 struct Blocked<F: DatabaseRef> {
@@ -866,6 +1026,7 @@ where
                 worker.sessions.retain(|_, (_, touched)| now.duration_since(*touched) < ttl);
                 let removed = before - worker.sessions.len();
                 if removed > 0 {
+                    worker.live.fetch_sub(removed, Ordering::AcqRel);
                     tracing::info!(removed, "reaped expired sessions");
                     count.store(worker.sessions.len(), Ordering::Relaxed);
                 }
@@ -945,6 +1106,7 @@ where
     /// comes back `Deferred` instead of waiting for it.
     fn handle(&mut self, job: Job<F>, blocking: bool) -> Outcome<F> {
         let sessions = &mut self.sessions;
+        let max_entries = self.max_entries.load(Ordering::Relaxed);
         match job {
             Job::Simulate { id, tx, disable_checks, reply } => {
                 let Some((session, touched)) = sessions.get_mut(&id) else {
@@ -952,6 +1114,10 @@ where
                     return Outcome::Done;
                 };
                 *touched = Instant::now();
+                if let Err(error) = check_entries(id, session, max_entries) {
+                    let _ = reply.send(Err(error));
+                    return Outcome::Done;
+                }
                 match execute(session, &tx, false, disable_checks, blocking) {
                     Ok(result) => {
                         let _ = reply.send(result);
@@ -965,6 +1131,10 @@ where
                     return Outcome::Done;
                 };
                 *touched = Instant::now();
+                if let Err(error) = check_entries(id, session, max_entries) {
+                    let _ = reply.send(Err(error));
+                    return Outcome::Done;
+                }
                 match execute(session, &tx, true, false, blocking) {
                     Ok(result) => {
                         let _ = reply.send(result);
@@ -978,6 +1148,10 @@ where
                     return Outcome::Done;
                 };
                 *touched = Instant::now();
+                if let Err(error) = check_entries(id, session, max_entries) {
+                    let _ = reply.send(Err(error));
+                    return Outcome::Done;
+                }
                 let read = attempt(session, blocking, |session| {
                     Database::storage(session, address, key).map_err(|e| SessionError::Execution(format!("{e}")))
                 });
@@ -994,6 +1168,10 @@ where
                     return Outcome::Done;
                 };
                 *touched = Instant::now();
+                if let Err(error) = check_entries(id, session, max_entries) {
+                    let _ = reply.send(Err(error));
+                    return Outcome::Done;
+                }
                 match attempt(session, blocking, |session| code_of(session, address)) {
                     Ok(result) => {
                         let _ = reply.send(result);
@@ -1007,6 +1185,10 @@ where
                     return Outcome::Done;
                 };
                 *touched = Instant::now();
+                if let Err(error) = check_entries(id, session, max_entries) {
+                    let _ = reply.send(Err(error));
+                    return Outcome::Done;
+                }
                 let read = attempt(session, blocking, |session| {
                     Database::basic(session, address).map_err(|e| SessionError::Execution(format!("{e}")))
                 });
@@ -1017,7 +1199,7 @@ where
                     Err(keys) => return Outcome::Deferred(Box::new(Job::Basic { id, address, reply }), keys),
                 }
             }
-            other => handle_job(sessions, &self.count, other),
+            other => handle_job(sessions, &self.count, &self.live, max_entries, other),
         }
         Outcome::Done
     }
@@ -1108,7 +1290,13 @@ fn code_of<F: Fallback>(session: &mut Session<F>, address: Address) -> Result<By
 }
 
 /// Every job that never reads upstream state, so never defers.
-fn handle_job<F: Fallback>(sessions: &mut HashMap<SessionId, (Session<F>, Instant)>, count: &AtomicUsize, job: Job<F>)
+fn handle_job<F: Fallback>(
+    sessions: &mut HashMap<SessionId, (Session<F>, Instant)>,
+    count: &AtomicUsize,
+    live: &AtomicUsize,
+    max_entries: usize,
+    job: Job<F>,
+)
 where
     F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
 {
@@ -1141,7 +1329,7 @@ where
                     // Branching counts as activity: a root that is only
                     // ever branched from must not be reaped mid-run.
                     *touched = Instant::now();
-                    Ok(Box::new(session.branch()))
+                    check_entries(parent, session, max_entries).map(|()| Box::new(session.branch()))
                 }
                 None => Err(SessionError::Unknown(parent)),
             };
@@ -1153,7 +1341,9 @@ where
             let _ = reply.send(());
         }
         Job::Discard { id, reply } => {
-            sessions.remove(&id);
+            if sessions.remove(&id).is_some() {
+                live.fetch_sub(1, Ordering::AcqRel);
+            }
             count.store(sessions.len(), Ordering::Relaxed);
             let _ = reply.send(());
         }
@@ -1173,8 +1363,7 @@ where
             let result = match sessions.get_mut(&id) {
                 Some((session, touched)) => {
                     *touched = Instant::now();
-                    session.set_account(address, info);
-                    Ok(())
+                    check_entries(id, session, max_entries).map(|()| session.set_account(address, info))
                 }
                 None => Err(SessionError::Unknown(id)),
             };
@@ -1184,8 +1373,7 @@ where
             let result = match sessions.get_mut(&id) {
                 Some((session, touched)) => {
                     *touched = Instant::now();
-                    session.set_storage(address, key, value);
-                    Ok(())
+                    check_entries(id, session, max_entries).map(|()| session.set_storage(address, key, value))
                 }
                 None => Err(SessionError::Unknown(id)),
             };
@@ -2299,5 +2487,133 @@ mod tests {
         // And the session keeps working afterwards.
         mgr.set_account(id, FUNDED, AccountInfo::default()).await.unwrap();
         assert_eq!(mgr.basic(id, FUNDED).await.unwrap().unwrap().balance, U256::ZERO);
+    }
+
+    // ---- Limits ----
+
+    fn limited(limits: Limits) -> SessionManager<FundedFallback> {
+        manager().with_limits(limits)
+    }
+
+    fn is_limit<T: fmt::Debug>(result: Result<T, SessionError>) -> bool {
+        matches!(result, Err(SessionError::LimitExceeded(_)))
+    }
+
+    #[tokio::test]
+    async fn max_sessions_refuses_the_next_fork_and_a_discard_frees_a_slot() {
+        let mgr = limited(Limits { max_sessions: Some(2), ..Limits::unlimited() });
+        let a = mgr.fork().await.unwrap();
+        let _b = mgr.fork().await.unwrap();
+        assert!(is_limit(mgr.fork().await), "third session must be refused");
+        assert!(is_limit(mgr.fork_from(a).await), "branching is a session too");
+        assert_eq!(mgr.active_session_count(), 2);
+
+        mgr.discard(a).await.unwrap();
+        mgr.fork().await.expect("a discard frees a slot");
+    }
+
+    #[tokio::test]
+    async fn max_sessions_holds_under_concurrent_forks() {
+        let mgr = Arc::new(limited(Limits { max_sessions: Some(5), ..Limits::unlimited() }));
+        let attempts: Vec<_> = (0..40)
+            .map(|_| {
+                let mgr = Arc::clone(&mgr);
+                tokio::spawn(async move { mgr.fork().await.is_ok() })
+            })
+            .collect();
+        let mut admitted = 0;
+        for attempt in attempts {
+            admitted += usize::from(attempt.await.unwrap());
+        }
+        assert_eq!(admitted, 5, "exactly the limit, however the forks interleave");
+        assert_eq!(mgr.active_session_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn expired_sessions_free_their_slots() {
+        // The manager's TTL is 200 ms and workers reap on a 1 s tick.
+        let mgr = limited(Limits { max_sessions: Some(1), ..Limits::unlimited() });
+        mgr.fork().await.unwrap();
+        assert!(is_limit(mgr.fork().await));
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        mgr.fork().await.expect("the idle session was reaped");
+    }
+
+    fn transfer(gas_limit: u64) -> TxEnv {
+        TxEnv::builder()
+            .caller(FUNDED)
+            .kind(TxKind::Call(Address::new([1u8; 20])))
+            .value(U256::from(1u64))
+            .gas_limit(gas_limit)
+            .gas_price(0)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn max_tx_gas_limit_refuses_an_oversized_call_on_every_entry_point() {
+        let mgr = limited(Limits { max_tx_gas_limit: Some(50_000), ..Limits::unlimited() });
+        let id = mgr.fork().await.unwrap();
+        assert!(is_limit(mgr.simulate(id, transfer(50_001)).await));
+        assert!(is_limit(mgr.advance(id, transfer(50_001)).await));
+        assert!(is_limit(mgr.call(id, transfer(50_001)).await));
+        assert!(is_limit(mgr.estimate_gas(id, transfer(u64::MAX)).await));
+        mgr.advance(id, transfer(50_000)).await.expect("at the limit is allowed");
+    }
+
+    #[tokio::test]
+    async fn max_session_entries_stops_writes_but_not_snapshot_or_discard() {
+        let mgr = limited(Limits { max_session_entries: Some(3), ..Limits::unlimited() });
+        let id = mgr.fork().await.unwrap();
+        for n in 0..3u8 {
+            mgr.set_storage(id, WATCHED, U256::from(n), U256::from(1u64)).await.unwrap();
+        }
+        assert!(is_limit(mgr.set_storage(id, WATCHED, U256::from(9u64), U256::from(1u64)).await));
+        assert!(is_limit(mgr.set_account(id, WATCHED, AccountInfo::default()).await));
+        assert!(is_limit(mgr.advance(id, transfer(21_000)).await));
+        assert!(is_limit(mgr.storage(id, WATCHED, U256::from(77u64)).await), "reads cache into the overlay too");
+        assert!(is_limit(mgr.fork_from(id).await));
+
+        // Overwriting a slot the session already holds adds no entry, but
+        // the check is before the write, so it is refused all the same:
+        // "full" means full.
+        assert!(is_limit(mgr.set_storage(id, WATCHED, U256::from(0u64), U256::from(2u64)).await));
+
+        let (_, state) = mgr.session_state(id).await.expect("state is still readable");
+        assert_eq!(state.storage.len(), 3);
+        mgr.discard(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn branching_cannot_reset_the_entry_allowance() {
+        let mgr = limited(Limits { max_session_entries: Some(4), ..Limits::unlimited() });
+        let parent = mgr.fork().await.unwrap();
+        for n in 0..3u8 {
+            mgr.set_storage(parent, WATCHED, U256::from(n), U256::from(1u64)).await.unwrap();
+        }
+        let child = mgr.fork_from(parent).await.unwrap();
+        // The child inherits 3 entries, so it has room for exactly one more.
+        mgr.set_storage(child, WATCHED, U256::from(10u64), U256::from(1u64)).await.unwrap();
+        assert!(is_limit(mgr.set_storage(child, WATCHED, U256::from(11u64), U256::from(1u64)).await));
+        assert!(is_limit(mgr.fork_from(child).await), "a full child cannot be branched into a fresh allowance");
+    }
+
+    #[tokio::test]
+    async fn unlimited_restores_the_old_behaviour() {
+        let mgr = limited(Limits::unlimited());
+        for _ in 0..50 {
+            mgr.fork().await.unwrap();
+        }
+        let id = mgr.fork().await.unwrap();
+        mgr.advance(id, transfer(u64::MAX / 2)).await.ok();
+    }
+
+    #[tokio::test]
+    async fn the_default_limits_are_the_documented_ones() {
+        let mgr = manager();
+        assert_eq!(mgr.limits(), Limits::default());
+        assert_eq!(Limits::default().max_sessions, Some(10_000));
+        assert_eq!(Limits::default().max_tx_gas_limit, Some(16_777_216));
+        assert_eq!(Limits::default().max_session_entries, Some(1_000_000));
     }
 }

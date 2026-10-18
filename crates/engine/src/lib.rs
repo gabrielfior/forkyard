@@ -236,6 +236,20 @@ impl<F: DatabaseRef> Session<F> {
         }
     }
 
+    /// Entries this session would write into a snapshot: its own overlay
+    /// (writes plus cached fallback reads) and everything inherited from
+    /// branching. What `Limits::max_session_entries` bounds — counting
+    /// `inherited` too, or repeated branching would reset the allowance
+    /// each generation.
+    pub fn entry_count(&self) -> usize {
+        self.overlay_accounts.len()
+            + self.overlay_code.len()
+            + self.overlay_storage.len()
+            + self.inherited.accounts.len()
+            + self.inherited.code.len()
+            + self.inherited.storage.len()
+    }
+
     /// The fallback this session reads through — so a caller can resolve,
     /// off this thread, what a speculative pass found missing.
     pub fn fallback(&self) -> &F {
