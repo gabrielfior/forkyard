@@ -542,6 +542,16 @@ impl SnapshotStore {
         if file.version != Some(SNAPSHOT_FORMAT_VERSION) {
             return Err(CacheError::VersionMismatch { path, found: file.version, expected: SNAPSHOT_FORMAT_VERSION });
         }
+        // The id is the file's own hash, so a file that no longer hashes to
+        // its name was edited, truncated, or planted — and `resume` would
+        // otherwise hand an agent state nobody ever snapshotted.
+        let actual = revm::primitives::hex::encode(&keccak256(&bytes)[..SNAPSHOT_ID_LEN / 2]);
+        if actual != id {
+            return Err(CacheError::Malformed(
+                path,
+                format!("content hashes to {actual}, not its id {id} — the file was modified after it was written"),
+            ));
+        }
         let (Some(chain_id), Some(block_number)) = (file.chain_id, file.block_number) else {
             return Err(CacheError::Malformed(path, "snapshot names no chain or block".to_string()));
         };
@@ -952,6 +962,26 @@ mod tests {
             );
         }
         assert!(store.load(&"a".repeat(SNAPSHOT_ID_LEN)).unwrap_err().is_missing());
+    }
+
+    #[test]
+    fn a_snapshot_whose_content_no_longer_matches_its_id_is_refused() {
+        let scratch = Scratch::new();
+        let store = SnapshotStore::new(&scratch.0, 1);
+        let info = store.store(KEY.block_number, &session_state()).unwrap();
+        let path = store.path_for(&info.id).unwrap();
+
+        // Same length, still valid JSON, still the right format: only the
+        // hash can tell it was touched.
+        let mut bytes = fs::read(&path).unwrap();
+        let at = bytes.iter().rposition(|b| b.is_ascii_digit()).unwrap();
+        bytes[at] = if bytes[at] == b'7' { b'8' } else { b'7' };
+        fs::write(&path, &bytes).unwrap();
+
+        match store.load(&info.id) {
+            Err(CacheError::Malformed(_, reason)) => assert!(reason.contains("modified"), "{reason}"),
+            other => panic!("a tampered snapshot loaded: {:?}", other.map(|(block, _)| block)),
+        }
     }
 
     #[test]

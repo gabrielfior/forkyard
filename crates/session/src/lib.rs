@@ -690,6 +690,17 @@ where
     /// manager is on, otherwise through `fork_at_block`'s pinned blocks
     /// (so a snapshot outlives the chain tip moving on).
     pub async fn restore(&self, block_number: u64, state: SessionState) -> Result<SessionId, SessionError> {
+        // A snapshot written under a looser limit (or hand-made) must not
+        // be a way past this one: the session would be born over it.
+        if let Some(max) = self.limits.max_session_entries {
+            let entries = state.accounts.len() + state.code.len() + state.storage.len();
+            if entries > max {
+                return Err(SessionError::LimitExceeded(format!(
+                    "the snapshot holds {entries} entries and a session may hold {max} \
+                     (FORKYARD_MAX_SESSION_ENTRIES)"
+                )));
+            }
+        }
         let seed = Some(Box::new(state));
         if u64::try_from(self.block_env().number).ok() == Some(block_number) {
             self.fork_seeded(seed).await

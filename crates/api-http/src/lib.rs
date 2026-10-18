@@ -69,6 +69,16 @@ const PRIORITY_FEE_WEI: u64 = 1_500_000_000;
 /// exactly the bug this constant used to have (30M vs. the real 16.7M cap).
 const ESTIMATE_GAS_LIMIT: u64 = 16_777_216;
 
+/// Gas for a call the client didn't give any: the EIP-7825 cap, unless the
+/// operator set `FORKYARD_MAX_TX_GAS_LIMIT` lower — a default the same
+/// process then refuses would turn every bare `eth_call` into an error.
+fn default_call_gas<F: Fallback>(state: &AppState<F>) -> u64
+where
+    F::Error: fmt::Debug + fmt::Display + Send + Sync + 'static,
+{
+    state.manager.limits().max_tx_gas_limit.map_or(ESTIMATE_GAS_LIMIT, |max| max.min(ESTIMATE_GAS_LIMIT))
+}
+
 #[derive(Clone, Default)]
 struct SessionRpcState {
     receipts: HashMap<String, Value>,
@@ -520,7 +530,7 @@ where
                 .map(|g| g.saturating_to::<u64>())
                 // Same EIP-7825 per-transaction cap `eth_estimateGas`'s
                 // dry run uses; a higher value fails validation outright.
-                .unwrap_or(ESTIMATE_GAS_LIMIT);
+                .unwrap_or_else(|| default_call_gas(state));
 
             let tx_env = TxEnv::builder()
                 .caller(from)
@@ -587,7 +597,7 @@ where
                 .kind(kind)
                 .value(value)
                 .data(Bytes::from(data))
-                .gas_limit(ESTIMATE_GAS_LIMIT)
+                .gas_limit(default_call_gas(state))
                 .gas_price(0) // don't require balance for the estimate itself
                 .nonce(nonce)
                 .build_fill();
