@@ -1266,6 +1266,48 @@ mod tests {
         );
     }
 
+    /// Found by the red-team pass: `forkyard_discard` is the only thing that
+    /// clears `rpc_state`, but most sessions end by idling out, which the
+    /// manager's workers handle without telling this crate. Every session
+    /// that ever sent a transaction then leaves its receipts behind for the
+    /// life of the process.
+    #[tokio::test]
+    #[ignore = "KNOWN: a session reaped by its idle TTL leaves its receipts and block counter in rpc_state forever"]
+    async fn an_expired_session_does_not_leave_rpc_side_state_behind() {
+        let state = AppState {
+            manager: Arc::new(SessionManager::new(
+                TestFallback::default(),
+                revm::context::BlockEnv::default(),
+                1,
+                Duration::from_millis(100),
+            )),
+            chain_id: 1,
+            rpc_state: Mutex::new(HashMap::new()),
+        };
+        let id = state.manager.fork().await.unwrap();
+        let sender = PrivateKeySigner::random();
+        dispatch(
+            &state,
+            id,
+            "forkyard_setBalance",
+            &[json!(sender.address().to_string()), json!("0xde0b6b3a7640000")],
+        )
+        .await
+        .unwrap();
+        let raw_hex = signed_transfer_hex(&sender, PrivateKeySigner::random().address(), 1, 20_000_000_000);
+        dispatch(&state, id, "eth_sendRawTransaction", &[json!(raw_hex)]).await.unwrap();
+        assert!(state.rpc_state.lock().unwrap().contains_key(&id), "setup: the transaction left a receipt");
+
+        // Workers reap on a one-second tick.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(state.manager.active_session_count(), 0, "setup: the session expired");
+
+        assert!(
+            !state.rpc_state.lock().unwrap().contains_key(&id),
+            "an expired session's receipts are still held"
+        );
+    }
+
     /// The counter contract the MCP surface's tests use: reverts with the
     /// word `0xbb` on empty calldata, otherwise stores the first calldata
     /// word in slot 0 and returns it.
